@@ -30,6 +30,28 @@ typedef struct {
     uint8_t semantic_content;
 } GTCell;
 
+typedef struct {
+    uint32_t image_id;
+    uint32_t placement_id;
+    int32_t viewport_col;
+    int32_t viewport_row;
+    uint32_t pixel_width;
+    uint32_t pixel_height;
+    uint32_t image_width;
+    uint32_t image_height;
+    uint32_t source_x;
+    uint32_t source_y;
+    uint32_t source_width;
+    uint32_t source_height;
+    uint32_t cell_offset_x;
+    uint32_t cell_offset_y;
+    int32_t layer;
+    int32_t z;
+    int32_t pixel_format;
+    const uint8_t *pixels;
+    size_t pixels_len;
+} GTImage;
+
 enum {
     GT_SEMANTIC_OUTPUT = 0,
     GT_SEMANTIC_INPUT = 1,
@@ -45,6 +67,8 @@ typedef struct {
     uint8_t cursor_r, cursor_g, cursor_b;
     const GTCell *cells;
     const uint8_t *row_semantics;
+    const GTImage *images;
+    size_t image_count;
     const char *title;
     const char *working_directory;
     uint64_t scroll_total;
@@ -66,6 +90,8 @@ bool gt_session_poll(GTSession *session);
 const GTFrame *gt_session_frame(GTSession *session);
 
 bool gt_session_write(GTSession *session, const uint8_t *bytes, size_t len);
+/** Feed synthetic terminal output directly into libghostty-vt. */
+bool gt_session_feed_output(GTSession *session, const uint8_t *bytes, size_t len);
 /** Mark frontend-observed shell input/output boundaries using OSC 133. */
 void gt_session_mark_input(GTSession *session);
 void gt_session_mark_output(GTSession *session);

@@ -20,6 +20,9 @@ typedef void *GhosttyTerminal;
 typedef void *GhosttyRenderState;
 typedef void *GhosttyRenderStateRowIterator;
 typedef void *GhosttyRenderStateRowCells;
+typedef void *GhosttyRenderStateImageIterator;
+typedef void *GhosttyKittyGraphics;
+typedef void *GhosttyKittyGraphicsImage;
 typedef int GhosttyResult;
 typedef uint64_t GhosttyCellRaw;
 typedef uint64_t GhosttyRowRaw;
@@ -68,6 +71,7 @@ enum {
     GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR = 4,
     GHOSTTY_RENDER_STATE_DATA_CURSOR = 18,
     GHOSTTY_RENDER_STATE_DATA_COLORS = 19,
+    GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR = 22,
     GHOSTTY_RENDER_STATE_ROW_DATA_CELLS = 3,
     GHOSTTY_RENDER_STATE_ROW_DATA_RAW = 2,
     GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW = 1,
@@ -77,9 +81,30 @@ enum {
     GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8 = 9,
     GHOSTTY_TERMINAL_DATA_TITLE = 12,
     GHOSTTY_TERMINAL_DATA_SCROLLBAR = 9,
+    GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS = 30,
     GHOSTTY_ROW_DATA_SEMANTIC_PROMPT = 6,
     GHOSTTY_TERMINAL_SCROLL_VIEWPORT_BOTTOM = 1,
     GHOSTTY_TERMINAL_SCROLL_VIEWPORT_DELTA = 2,
+    GHOSTTY_RENDER_STATE_IMAGE_DATA_PROTOCOL = 1,
+    GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_ID = 2,
+    GHOSTTY_RENDER_STATE_IMAGE_DATA_LAYER = 4,
+    GHOSTTY_RENDER_STATE_IMAGE_DATA_Z = 5,
+    GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_COL = 6,
+    GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_ROW = 7,
+    GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_X = 10,
+    GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_Y = 11,
+    GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_WIDTH = 12,
+    GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_HEIGHT = 13,
+    GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_X = 14,
+    GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_Y = 15,
+    GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_WIDTH = 16,
+    GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_HEIGHT = 17,
+    GHOSTTY_RENDER_STATE_IMAGE_DATA_KITTY_PLACEMENT_ID = 18,
+    GHOSTTY_IMAGE_PROTOCOL_KITTY = 0,
+    GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_WIDTH = 3,
+    GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_HEIGHT = 4,
+    GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_FORMAT = 5,
+    GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_PIXELS = 7,
 };
 
 typedef struct {
@@ -104,6 +129,14 @@ typedef struct {
     GhosttyResult (*cell_get)(GhosttyCellRaw, int, void *);
     GhosttyResult (*screen_row_get)(GhosttyRowRaw, int, void *);
     GhosttyResult (*terminal_scroll_viewport)(GhosttyTerminal, GhosttyTerminalScrollViewport);
+    GhosttyResult (*image_iter_new)(const void *, GhosttyRenderStateImageIterator *);
+    void (*image_iter_free)(GhosttyRenderStateImageIterator);
+    bool (*image_iter_next)(GhosttyRenderStateImageIterator);
+    GhosttyResult (*image_get_multi)(GhosttyRenderStateImageIterator, size_t,
+                                     const int *, void **, size_t *);
+    GhosttyKittyGraphicsImage (*kitty_image)(GhosttyKittyGraphics, uint32_t);
+    GhosttyResult (*kitty_image_get_multi)(GhosttyKittyGraphicsImage, size_t,
+                                           const int *, void **, size_t *);
 } GhosttyAPI;
 
 static GhosttyAPI api;
@@ -157,6 +190,12 @@ static void load_runtime(void) {
     LOAD(cell_get, "ghostty_cell_get");
     LOAD(screen_row_get, "ghostty_row_get");
     LOAD(terminal_scroll_viewport, "ghostty_terminal_scroll_viewport");
+    LOAD(image_iter_new, "ghostty_render_state_image_iterator_new");
+    LOAD(image_iter_free, "ghostty_render_state_image_iterator_free");
+    LOAD(image_iter_next, "ghostty_render_state_image_iterator_next");
+    LOAD(image_get_multi, "ghostty_render_state_image_get_multi");
+    LOAD(kitty_image, "ghostty_kitty_graphics_image");
+    LOAD(kitty_image_get_multi, "ghostty_kitty_graphics_image_get_multi");
 }
 
 const char *gt_runtime_error(void) {
@@ -174,10 +213,13 @@ struct GTSession {
     GhosttyRenderState render;
     GhosttyRenderStateRowIterator rows;
     GhosttyRenderStateRowCells cells;
+    GhosttyRenderStateImageIterator images;
     GTCell *cell_buffer;
     size_t cell_capacity;
     uint8_t *row_semantics;
     size_t row_capacity;
+    GTImage *image_buffer;
+    size_t image_capacity;
     uint8_t *command_output;
     size_t command_output_len;
     size_t command_output_capacity;
@@ -214,13 +256,14 @@ GTSession *gt_session_create(uint16_t cols, uint16_t rows, const char **error) {
     if (api.terminal_new(NULL, &s->terminal, cols, rows) != GHOSTTY_SUCCESS ||
         api.render_new(NULL, &s->render) != GHOSTTY_SUCCESS ||
         api.row_new(NULL, &s->rows) != GHOSTTY_SUCCESS ||
-        api.cells_new(NULL, &s->cells) != GHOSTTY_SUCCESS) {
+        api.cells_new(NULL, &s->cells) != GHOSTTY_SUCCESS ||
+        api.image_iter_new(NULL, &s->images) != GHOSTTY_SUCCESS) {
         set_error(error, "Could not initialize libghostty-vt.");
         gt_session_destroy(s);
         return NULL;
     }
-    GhosttyColorRgb foreground = {205, 211, 204};
-    GhosttyColorRgb background = {20, 23, 22};
+    GhosttyColorRgb foreground = {210, 225, 234};
+    GhosttyColorRgb background = {6, 17, 24};
     api.terminal_set(s->terminal, 12, &foreground);
     api.terminal_set(s->terminal, 13, &background);
     api.terminal_set(s->terminal, 14, &foreground);
@@ -263,11 +306,13 @@ void gt_session_destroy(GTSession *s) {
     if (s->master_fd >= 0) close(s->master_fd);
     if (s->running && s->child > 0) kill(s->child, SIGHUP);
     if (s->cells) api.cells_free(s->cells);
+    if (s->images) api.image_iter_free(s->images);
     if (s->rows) api.row_free(s->rows);
     if (s->render) api.render_free(s->render);
     if (s->terminal) api.terminal_free(s->terminal);
     free(s->cell_buffer);
     free(s->row_semantics);
+    free(s->image_buffer);
     free(s->command_output);
     free(s);
 }
@@ -318,8 +363,78 @@ bool gt_session_poll(GTSession *s) {
     return changed;
 }
 
-static GhosttyColorRgb fallback_fg(void) { return (GhosttyColorRgb){205, 211, 204}; }
-static GhosttyColorRgb fallback_bg(void) { return (GhosttyColorRgb){20, 23, 22}; }
+static GhosttyColorRgb fallback_fg(void) { return (GhosttyColorRgb){210, 225, 234}; }
+static GhosttyColorRgb fallback_bg(void) { return (GhosttyColorRgb){6, 17, 24}; }
+
+static size_t collect_images(GTSession *s) {
+    if (api.render_get(s->render, GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR,
+                       &s->images) != GHOSTTY_SUCCESS) return 0;
+    GhosttyKittyGraphics graphics = NULL;
+    if (api.terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS,
+                         &graphics) != GHOSTTY_SUCCESS || !graphics) return 0;
+
+    size_t count = 0;
+    while (api.image_iter_next(s->images)) {
+        int protocol = -1;
+        GTImage image = {0};
+        int placement_keys[] = {
+            GHOSTTY_RENDER_STATE_IMAGE_DATA_PROTOCOL,
+            GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_ID,
+            GHOSTTY_RENDER_STATE_IMAGE_DATA_KITTY_PLACEMENT_ID,
+            GHOSTTY_RENDER_STATE_IMAGE_DATA_LAYER,
+            GHOSTTY_RENDER_STATE_IMAGE_DATA_Z,
+            GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_COL,
+            GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_ROW,
+            GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_X,
+            GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_Y,
+            GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_WIDTH,
+            GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_HEIGHT,
+            GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_X,
+            GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_Y,
+            GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_WIDTH,
+            GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_HEIGHT,
+        };
+        void *placement_values[] = {
+            &protocol, &image.image_id, &image.placement_id, &image.layer,
+            &image.z, &image.viewport_col, &image.viewport_row,
+            &image.cell_offset_x, &image.cell_offset_y,
+            &image.pixel_width, &image.pixel_height,
+            &image.source_x, &image.source_y,
+            &image.source_width, &image.source_height,
+        };
+        size_t placement_count = sizeof(placement_keys) / sizeof(placement_keys[0]);
+        if (api.image_get_multi(s->images, placement_count, placement_keys,
+                                placement_values, NULL) != GHOSTTY_SUCCESS ||
+            protocol != GHOSTTY_IMAGE_PROTOCOL_KITTY) continue;
+
+        GhosttyKittyGraphicsImage handle = api.kitty_image(graphics, image.image_id);
+        if (!handle) continue;
+        GhosttyString pixels = {0};
+        int image_keys[] = {
+            GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_WIDTH,
+            GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_HEIGHT,
+            GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_FORMAT,
+            GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_PIXELS,
+        };
+        void *image_values[] = {
+            &image.image_width, &image.image_height, &image.pixel_format, &pixels,
+        };
+        if (api.kitty_image_get_multi(handle, 4, image_keys, image_values, NULL) !=
+                GHOSTTY_SUCCESS || !pixels.ptr || !pixels.len) continue;
+        image.pixels = pixels.ptr;
+        image.pixels_len = pixels.len;
+
+        if (count == s->image_capacity) {
+            size_t capacity = s->image_capacity ? s->image_capacity * 2 : 16;
+            GTImage *next = realloc(s->image_buffer, capacity * sizeof(GTImage));
+            if (!next) break;
+            s->image_buffer = next;
+            s->image_capacity = capacity;
+        }
+        s->image_buffer[count++] = image;
+    }
+    return count;
+}
 
 const GTFrame *gt_session_frame(GTSession *s) {
     if (!s) return NULL;
@@ -418,13 +533,15 @@ const GTFrame *gt_session_frame(GTSession *s) {
     GhosttyColorRgb cursor_color = colors.cursor_has_value ? colors.cursor : colors.foreground;
     GhosttyTerminalScrollbar scrollbar = {0};
     api.terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &scrollbar);
+    size_t image_count = collect_images(s);
     s->frame = (GTFrame){
         .cols = cols, .rows = rows,
         .cursor_x = cursor.viewport_has_value ? cursor.viewport_x : 0,
         .cursor_y = cursor.viewport_has_value ? cursor.viewport_y : 0,
         .cursor_visible = cursor.viewport_has_value && cursor.visible,
         .cursor_r = cursor_color.r, .cursor_g = cursor_color.g, .cursor_b = cursor_color.b,
-        .cells = s->cell_buffer, .row_semantics = s->row_semantics, .title = s->title,
+        .cells = s->cell_buffer, .row_semantics = s->row_semantics,
+        .images = s->image_buffer, .image_count = image_count, .title = s->title,
         .working_directory = s->working_directory,
         .scroll_total = scrollbar.total,
         .scroll_offset = scrollbar.offset,
@@ -442,6 +559,13 @@ bool gt_session_write(GTSession *s, const uint8_t *bytes, size_t len) {
         if (count > 0) sent += (size_t)count;
         else if (errno != EINTR) return false;
     }
+    return true;
+}
+
+bool gt_session_feed_output(GTSession *s, const uint8_t *bytes, size_t len) {
+    if (!s || !s->terminal || !bytes) return false;
+    api.terminal_write(s->terminal, bytes, len);
+    s->dirty = true;
     return true;
 }
 

@@ -22,6 +22,11 @@ final class TerminalNSView: NSView {
         let workingDirectory: String
     }
 
+    private struct ImageHitTarget: Equatable {
+        let placementID: UInt32
+        let rect: NSRect
+    }
+
     var session: TerminalSession
     private let font = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
     private let boldFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .semibold)
@@ -31,7 +36,10 @@ final class TerminalNSView: NSView {
     private var lastGrid = (cols: UInt16(0), rows: UInt16(0))
     private var windowKeyObserver: NSObjectProtocol?
     private var contextBlock: BlockContents?
+    private var contextGraphicalItem: GraphicalFileItem?
     private var selectedBlockHistoryRow: UInt64?
+    private var imageHitTargets: [ImageHitTarget] = []
+    private var imageCache: [UInt32: CGImage] = [:]
 
     init(session: TerminalSession) {
         self.session = session
@@ -41,7 +49,7 @@ final class TerminalNSView: NSView {
         cellWidth = ceil(("M" as NSString).size(withAttributes: [.font: font]).width)
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.backgroundColor = NSColor(red: 0.075, green: 0.086, blue: 0.082, alpha: 1).cgColor
+        layer?.backgroundColor = NSColor(red: 0.024, green: 0.067, blue: 0.094, alpha: 1).cgColor
     }
 
     @available(*, unavailable)
@@ -82,7 +90,7 @@ final class TerminalNSView: NSView {
 
     override func layout() {
         super.layout()
-        let cols = UInt16(max(1, min(Int(UInt16.max), Int(bounds.width / cellWidth))))
+        let cols = UInt16(max(1, min(Int(UInt16.max), Int((bounds.width - 20) / cellWidth))))
         let rows = UInt16(max(1, min(Int(UInt16.max), Int(bounds.height / cellHeight))))
         if (cols, rows) != lastGrid {
             lastGrid = (cols, rows)
@@ -94,7 +102,21 @@ final class TerminalNSView: NSView {
     override func mouseDown(with event: NSEvent) {
         focusTerminal()
         let point = convert(event.locationInWindow, from: nil)
+        if let target = imageHitTargets.last(where: { $0.rect.contains(point) }),
+           let item = session.graphicalItem(for: target.placementID) {
+            if session.graphicalItemIsDirectory(item) || event.clickCount >= 2 {
+                session.activateGraphicalItem(item)
+            }
+            return
+        }
         selectBlock(at: Int(point.y / cellHeight))
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        for target in imageHitTargets {
+            addCursorRect(target.rect, cursor: .pointingHand)
+        }
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -114,6 +136,25 @@ final class TerminalNSView: NSView {
     override func menu(for event: NSEvent) -> NSMenu? {
         focusTerminal()
         let point = convert(event.locationInWindow, from: nil)
+        if let target = imageHitTargets.last(where: { $0.rect.contains(point) }),
+           let item = session.graphicalItem(for: target.placementID) {
+            contextGraphicalItem = item
+            contextBlock = nil
+            let menu = NSMenu()
+            menu.addItem(menuItem("Open", action: #selector(openGraphicalItem), enabled: true))
+            menu.addItem(menuItem("Copy", action: #selector(copyGraphicalItem), enabled: true))
+            menu.addItem(menuItem(
+                "Paste",
+                action: #selector(pasteGraphicalItem),
+                enabled: NSPasteboard.general.canReadObject(
+                    forClasses: [NSURL.self],
+                    options: [.urlReadingFileURLsOnly: true]
+                )
+            ))
+            return menu
+        }
+
+        contextGraphicalItem = nil
         contextBlock = blockContents(at: Int(point.y / cellHeight))
 
         let menu = NSMenu()
@@ -160,18 +201,18 @@ final class TerminalNSView: NSView {
         let frame = framePointer.pointee
         guard let cells = frame.cells else { return }
         let context = NSGraphicsContext.current?.cgContext
-        context?.setFillColor(NSColor(red: 0.075, green: 0.086, blue: 0.082, alpha: 1).cgColor)
+        context?.setFillColor(NSColor(red: 0.024, green: 0.067, blue: 0.094, alpha: 1).cgColor)
         context?.fill(bounds)
 
         let ranges = blockRanges(frame: frame, cells: cells)
-        let blockFill = NSColor(red: 0.105, green: 0.12, blue: 0.115, alpha: 1)
-        let blockStroke = NSColor(red: 0.22, green: 0.25, blue: 0.235, alpha: 0.78)
-        let selectedFill = NSColor(red: 0.135, green: 0.155, blue: 0.148, alpha: 1)
-        let selectedStroke = NSColor(red: 0.39, green: 0.44, blue: 0.415, alpha: 0.9)
+        let blockFill = NSColor(red: 0.035, green: 0.094, blue: 0.122, alpha: 1)
+        let blockStroke = NSColor(red: 0.20, green: 0.55, blue: 0.62, alpha: 0.58)
+        let selectedFill = NSColor(red: 0.050, green: 0.135, blue: 0.165, alpha: 1)
+        let selectedStroke = NSColor(red: 0.32, green: 0.84, blue: 0.88, alpha: 0.82)
         for range in ranges {
-            let rect = NSRect(x: 2, y: CGFloat(range.lowerBound) * cellHeight + 1,
+            let rect = NSRect(x: 2, y: CGFloat(range.lowerBound) * cellHeight + 5,
                               width: max(0, bounds.width - 4),
-                              height: CGFloat(range.count) * cellHeight - 2)
+                              height: max(1, CGFloat(range.count) * cellHeight - 10))
             let path = NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7)
             let isSelected = frame.scroll_offset + UInt64(range.lowerBound) == selectedBlockHistoryRow
             (isSelected ? selectedFill : blockFill).setFill()
@@ -181,16 +222,21 @@ final class TerminalNSView: NSView {
             path.stroke()
         }
 
+        drawImages(frame, blockRanges: ranges)
+
         for y in 0..<Int(frame.rows) {
             let isInBlock = ranges.contains { $0.contains(y) }
             for x in 0..<Int(frame.cols) {
                 let cell = cells[y * Int(frame.cols) + x]
-                let rect = NSRect(x: CGFloat(x) * cellWidth, y: CGFloat(y) * cellHeight,
+                let contentInset: CGFloat = isInBlock ? 10 : 0
+                let rect = NSRect(x: CGFloat(x) * cellWidth + contentInset,
+                                  y: CGFloat(y) * cellHeight,
                                   width: cellWidth + 0.5, height: cellHeight)
-                let hasDefaultBackground = cell.bg_r == 20 && cell.bg_g == 23 && cell.bg_b == 22
+                let hasDefaultBackground = cell.bg_r == 6 && cell.bg_g == 17 && cell.bg_b == 24
                 if !isInBlock || !hasDefaultBackground {
                     color(cell.bg_r, cell.bg_g, cell.bg_b).setFill()
-                    rect.fill()
+                    NSRect(x: CGFloat(x) * cellWidth, y: CGFloat(y) * cellHeight,
+                           width: cellWidth + 0.5, height: cellHeight).fill()
                 }
                 guard cell.text_len > 0, cell.style & UInt16(GT_STYLE_INVISIBLE) == 0 else { continue }
                 let text = withUnsafeBytes(of: cell.text) { raw -> String in
@@ -216,7 +262,8 @@ final class TerminalNSView: NSView {
         }
 
         if frame.cursor_visible {
-            let cursor = NSRect(x: CGFloat(frame.cursor_x) * cellWidth,
+            let cursorInset: CGFloat = ranges.contains { $0.contains(Int(frame.cursor_y)) } ? 10 : 0
+            let cursor = NSRect(x: CGFloat(frame.cursor_x) * cellWidth + cursorInset,
                                 y: CGFloat(frame.cursor_y) * cellHeight,
                                 width: cellWidth, height: cellHeight)
             color(frame.cursor_r, frame.cursor_g, frame.cursor_b).withAlphaComponent(0.72).setFill()
@@ -228,6 +275,85 @@ final class TerminalNSView: NSView {
             drawBadge("Process exited with status \(status)")
         }
         drawScrollbar(frame)
+    }
+
+    private func drawImages(_ frame: GTFrame, blockRanges: [Range<Int>]) {
+        let previousTargets = imageHitTargets
+        var nextTargets: [ImageHitTarget] = []
+        guard let images = frame.images, frame.image_count > 0 else {
+            imageHitTargets = []
+            invalidateCursorRectsIfChanged(from: previousTargets)
+            return
+        }
+        for index in 0..<Int(frame.image_count) {
+            let placement = images[index]
+            guard let cgImage = cachedImage(for: placement) else { continue }
+
+            let rect = NSRect(
+                x: CGFloat(placement.viewport_col) * cellWidth
+                    + CGFloat(placement.cell_offset_x)
+                    + (blockRanges.contains { $0.contains(Int(placement.viewport_row)) } ? 10 : 0),
+                y: CGFloat(placement.viewport_row) * cellHeight + CGFloat(placement.cell_offset_y),
+                width: CGFloat(placement.pixel_width),
+                height: CGFloat(placement.pixel_height)
+            )
+            NSImage(cgImage: cgImage, size: rect.size).draw(
+                in: rect,
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1,
+                respectFlipped: true,
+                hints: [.interpolation: NSImageInterpolation.none]
+            )
+            if placement.placement_id != 0 {
+                let layout = session.graphicalItemHitLayout(for: placement.placement_id)
+                let tileStartX = max(0, rect.minX - cellWidth * CGFloat(layout.0))
+                let tileRect = NSRect(
+                    x: tileStartX,
+                    y: rect.minY,
+                    width: min(cellWidth * CGFloat(layout.1), bounds.maxX - tileStartX),
+                    height: cellHeight * CGFloat(layout.2)
+                )
+                nextTargets.append(.init(placementID: placement.placement_id, rect: tileRect))
+            }
+        }
+        imageHitTargets = nextTargets
+        invalidateCursorRectsIfChanged(from: previousTargets)
+    }
+
+    private func cachedImage(for placement: GTImage) -> CGImage? {
+        if let cached = imageCache[placement.image_id] { return cached }
+        guard placement.pixel_format == 1,
+              let pixels = placement.pixels,
+              placement.image_width > 0,
+              placement.image_height > 0 else { return nil }
+        let required = Int(placement.image_width * placement.image_height * 4)
+        guard placement.pixels_len >= required else { return nil }
+        let data = Data(bytes: pixels, count: required) as CFData
+        guard let provider = CGDataProvider(data: data),
+              let image = CGImage(
+                width: Int(placement.image_width),
+                height: Int(placement.image_height),
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: Int(placement.image_width) * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ) else { return nil }
+        imageCache[placement.image_id] = image
+        return image
+    }
+
+    private func invalidateCursorRectsIfChanged(from previousTargets: [ImageHitTarget]) {
+        guard previousTargets != imageHitTargets else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let window = self.window else { return }
+            window.invalidateCursorRects(for: self)
+        }
     }
 
     private func color(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> NSColor {
@@ -271,6 +397,21 @@ final class TerminalNSView: NSView {
     @objc private func copyOutput() { copyToPasteboard(contextBlock?.output) }
     @objc private func copyCommand() { copyToPasteboard(contextBlock?.command) }
     @objc private func copyWorkingDirectory() { copyToPasteboard(contextBlock?.workingDirectory) }
+
+    @objc private func openGraphicalItem() {
+        guard let contextGraphicalItem else { return }
+        session.activateGraphicalItem(contextGraphicalItem)
+    }
+
+    @objc private func copyGraphicalItem() {
+        guard let contextGraphicalItem else { return }
+        session.copyGraphicalItem(contextGraphicalItem)
+    }
+
+    @objc private func pasteGraphicalItem() {
+        guard let contextGraphicalItem else { return }
+        if !session.pasteGraphicalItems(onto: contextGraphicalItem) { NSSound.beep() }
+    }
 
     @objc private func attachOutputToAI() {
         guard let block = contextBlock else { return }
@@ -368,7 +509,7 @@ final class TerminalNSView: NSView {
     }
 
     private func drawMessage(_ message: String) {
-        NSColor(red: 0.075, green: 0.086, blue: 0.082, alpha: 1).setFill()
+        NSColor(red: 0.024, green: 0.067, blue: 0.094, alpha: 1).setFill()
         bounds.fill()
         let paragraph = NSMutableParagraphStyle(); paragraph.alignment = .center
         (message as NSString).draw(in: bounds.insetBy(dx: 40, dy: 80), withAttributes: [
@@ -386,7 +527,7 @@ final class TerminalNSView: NSView {
         let size = (message as NSString).size(withAttributes: attributes)
         let rect = NSRect(x: bounds.maxX - size.width - 28, y: bounds.maxY - size.height - 20,
                           width: size.width + 16, height: size.height + 8)
-        NSColor(red: 0.13, green: 0.15, blue: 0.14, alpha: 0.96).setFill()
+        NSColor(red: 0.035, green: 0.094, blue: 0.122, alpha: 0.96).setFill()
         NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
         (message as NSString).draw(at: NSPoint(x: rect.minX + 8, y: rect.minY + 4), withAttributes: attributes)
     }

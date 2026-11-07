@@ -4,6 +4,8 @@ A small native macOS terminal with independent shell tabs. Each tab owns a PTY a
 
 Tabs can be organized into named, collapsible groups and displayed horizontally or in a vertical sidebar. Each tab follows the shell's current directory, even when the shell does not emit OSC 7. Double-click a tab name to rename it. Tab orientation and visibility are available from the gear menu and persist across launches.
 
+Enable **Graphical mode** from the checkbox above the terminal to immediately render the current directory as inline Kitty Graphics placements. Every listing includes a clickable `..` entry for its parent directory. Plain `ls` uses the compact grid, `ls -a` adds hidden entries, and `ll` or `ls -l` switches to a vertical layout with permissions, link count, owner, group, byte size, modification time, icons, and filenames. Graphical results remain part of normal terminal output and scrollback. Other common listing commands and aliases are also recognized, including `la`, `gls`, `lsd`, `eza`, `exa`, `tree`, `dir`, and `vdir`. Click a directory to silently run `cd` and refresh the listing, or double-click a file to open it with its default macOS app. Right-click an item for **Open**, **Copy**, and **Paste** actions. Paste targets a selected folder directly; for a selected file, it targets the current directory and uses collision-safe copy names.
+
 ## Run
 
 You need macOS 14+, Swift 6, Git, and the Zig version required by the pinned Ghostty revision.

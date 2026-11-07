@@ -38,6 +38,221 @@ final class TerminalTabsTests: XCTestCase {
         XCTAssertFalse(session.title.isEmpty)
     }
 
+    func testGraphicalDirectoryListingClassifiesItems() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("terminal-tabs-graphical-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let folder = root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        let file = root.appendingPathComponent("README.md")
+        XCTAssertTrue(FileManager.default.createFile(atPath: file.path, contents: Data("hello".utf8)))
+        let link = root.appendingPathComponent("docs")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: folder)
+
+        let listing = TerminalSession.directoryListing(at: root.path)
+        XCTAssertNil(listing.error)
+        XCTAssertEqual(listing.items.first?.name, "..")
+        XCTAssertEqual(listing.items.first?.path, root.deletingLastPathComponent().path)
+        XCTAssertEqual(listing.items.first(where: { $0.name == "project" })?.kind, .directory)
+        XCTAssertEqual(listing.items.first(where: { $0.name == "README.md" })?.kind, .file)
+        XCTAssertEqual(listing.items.first(where: { $0.name == "docs" })?.kind, .symbolicLink)
+        XCTAssertEqual(listing.items.first(where: { $0.name == "project" })?.permissions.count, 10)
+    }
+
+    func testGraphicalDirectoryShellQuotesPaths() {
+        XCTAssertEqual(
+            TerminalSession.shellQuoted("/tmp/it's here"),
+            "'/tmp/it'\\''s here'"
+        )
+    }
+
+    func testGraphicalLabelsWrapAndPreserveFileType() {
+        XCTAssertEqual(
+            TerminalSession.graphicalLabelLines(name: "README.md", maxWidth: 14),
+            ["README.md"]
+        )
+        let wrapped = TerminalSession.graphicalLabelLines(
+            name: "an-extremely-long-filename-for-testing.swift",
+            maxWidth: 14
+        )
+        XCTAssertLessThanOrEqual(wrapped.count, 2)
+        XCTAssertTrue(wrapped.allSatisfy { $0.count <= 14 })
+        XCTAssertTrue(wrapped.joined().hasSuffix("…g.swift"))
+    }
+
+    func testGraphicalLabelsPreserveLastCharacterWithoutFileType() {
+        let wrapped = TerminalSession.graphicalLabelLines(
+            name: "a-very-long-directory-name",
+            maxWidth: 10
+        )
+        XCTAssertEqual(wrapped.count, 2)
+        XCTAssertTrue(wrapped.joined().hasSuffix("…e"))
+    }
+
+    func testGraphicalPasteDestinationDoesNotOverwriteExistingFile() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("terminal-tabs-paste-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("note.txt")
+        let firstCopy = root.appendingPathComponent("note copy.txt")
+        try Data("one".utf8).write(to: source)
+        try Data("two".utf8).write(to: firstCopy)
+
+        let destination = TerminalSession.availablePasteDestination(for: source, in: root)
+        XCTAssertEqual(destination.lastPathComponent, "note copy 2.txt")
+    }
+
+    @MainActor
+    func testGraphicalCopyAndPasteCopiesFolderContents() throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("terminal-tabs-copy-\(UUID().uuidString)", isDirectory: true)
+        let source = root.appendingPathComponent("Source", isDirectory: true)
+        let destination = root.appendingPathComponent("Destination", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        try Data("contents".utf8).write(to: source.appendingPathComponent("file.txt"))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let pasteboard = NSPasteboard(name: .init("TerminalTabsTests.\(UUID().uuidString)"))
+        defer { pasteboard.clearContents() }
+        let session = TerminalSession(cols: 20, rows: 8)
+        session.copyGraphicalItem(
+            GraphicalFileItem(path: source.path, name: "Source", kind: .directory),
+            pasteboard: pasteboard
+        )
+        let pasted = session.pasteGraphicalItems(
+            onto: GraphicalFileItem(
+                path: destination.path,
+                name: "Destination",
+                kind: .directory
+            ),
+            pasteboard: pasteboard
+        )
+
+        XCTAssertTrue(pasted)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("Source/file.txt").path
+        ))
+    }
+
+    @MainActor
+    func testActivatingGraphicalDirectoryRunsCD() async throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let session = TerminalSession(cols: 40, rows: 10)
+        for _ in 0..<50 {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+        }
+        session.setGraphicalMode(true)
+        var imageCount = 0
+        for _ in 0..<100 where imageCount == 0 {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+            imageCount = gt_session_frame(try XCTUnwrap(session.handle)).map {
+                Int($0.pointee.image_count)
+            } ?? 0
+        }
+        let target = FileManager.default.currentDirectoryPath + "/Scripts"
+        session.activateGraphicalItem(
+            GraphicalFileItem(path: target, name: "Scripts", kind: .directory)
+        )
+        for _ in 0..<100 where session.workingDirectory != target {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+        }
+        XCTAssertEqual(session.workingDirectory, target)
+    }
+
+    @MainActor
+    func testEnablingGraphicalModeImmediatelyShowsCurrentDirectory() async throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let session = TerminalSession(cols: 80, rows: 24)
+        for _ in 0..<30 {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+        }
+        session.setGraphicalMode(true)
+        var imageCount = 0
+        for _ in 0..<100 where imageCount == 0 {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+            imageCount = gt_session_frame(try XCTUnwrap(session.handle)).map {
+                Int($0.pointee.image_count)
+            } ?? 0
+        }
+        XCTAssertGreaterThan(imageCount, 0)
+    }
+
+    @MainActor
+    func testGraphicalModeInterceptsLS() async throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let session = TerminalSession(cols: 40, rows: 10)
+        session.graphicalMode = true
+        for _ in 0..<50 {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+        }
+        session.sendUserInput(Data("ls".utf8))
+        session.sendUserInput(Data([0x0D]))
+        var imageCount = 0
+        for _ in 0..<100 where imageCount == 0 {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+            imageCount = gt_session_frame(try XCTUnwrap(session.handle)).map {
+                Int($0.pointee.image_count)
+            } ?? 0
+        }
+        XCTAssertGreaterThan(imageCount, 0)
+    }
+
+    func testGraphicalModeRecognizesFileListingCommands() {
+        let cwd = FileManager.default.currentDirectoryPath
+        XCTAssertEqual(TerminalSession.fileListingPath(for: "ls -la", workingDirectory: cwd), cwd)
+        XCTAssertEqual(TerminalSession.fileListingPath(for: "ll", workingDirectory: cwd), cwd)
+        XCTAssertEqual(TerminalSession.fileListingPath(for: "eza --icons", workingDirectory: cwd), cwd)
+        XCTAssertEqual(TerminalSession.fileListingPath(for: "ez a", workingDirectory: cwd), cwd)
+        XCTAssertEqual(TerminalSession.fileListingPath(for: "lsd -la", workingDirectory: cwd), cwd)
+        XCTAssertEqual(
+            TerminalSession.fileListingPath(for: "tree Scripts", workingDirectory: cwd),
+            URL(fileURLWithPath: cwd).appendingPathComponent("Scripts").path
+        )
+        XCTAssertNil(TerminalSession.fileListingPath(for: "printf hello", workingDirectory: cwd))
+    }
+
+    func testGraphicalListingPreservesCommandLayoutOptions() throws {
+        let cwd = FileManager.default.currentDirectoryPath
+        let plain = try XCTUnwrap(TerminalSession.fileListingRequest(
+            for: "ls",
+            workingDirectory: cwd
+        ))
+        XCTAssertFalse(plain.showsHidden)
+        XCTAssertFalse(plain.detailed)
+
+        let all = try XCTUnwrap(TerminalSession.fileListingRequest(
+            for: "ls -a",
+            workingDirectory: cwd
+        ))
+        XCTAssertTrue(all.showsHidden)
+        XCTAssertFalse(all.detailed)
+
+        let long = try XCTUnwrap(TerminalSession.fileListingRequest(
+            for: "ll",
+            workingDirectory: cwd
+        ))
+        XCTAssertFalse(long.showsHidden)
+        XCTAssertTrue(long.detailed)
+
+        let longAll = try XCTUnwrap(TerminalSession.fileListingRequest(
+            for: "ls -la",
+            workingDirectory: cwd
+        ))
+        XCTAssertTrue(longAll.showsHidden)
+        XCTAssertTrue(longAll.detailed)
+    }
+
     @MainActor
     func testWorkingDirectoryTracksShellChanges() throws {
         if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
@@ -53,7 +268,7 @@ final class TerminalTabsTests: XCTestCase {
             usleep(20_000)
             session.poll()
         }
-        XCTAssertTrue(expected.contains(session.workingDirectory))
+        XCTAssertTrue(expected.contains(session.workingDirectory), "actual cwd: \(session.workingDirectory)")
     }
 
     func testCommandLineTrackerHandlesTypingAndBackspace() {

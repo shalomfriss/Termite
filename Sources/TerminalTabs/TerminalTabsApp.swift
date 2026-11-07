@@ -101,7 +101,7 @@ struct TerminalWindow: View {
                 }
             }
         }
-        .background(Color(red: 0.075, green: 0.086, blue: 0.082))
+        .background(TerminalTheme.backdrop)
         .onAppear {
             NSRunningApplication.current.activate(options: .activateAllWindows)
         }
@@ -120,8 +120,8 @@ struct TerminalWindow: View {
     @ViewBuilder
     private var terminal: some View {
         if let selected = store.selected {
-            TerminalWorkspace(session: selected, settings: store.aiSettings)
-            .padding(10)
+            TerminalWorkspace(session: selected, store: store, settings: store.aiSettings)
+                .padding(10)
         }
     }
 
@@ -134,17 +134,39 @@ struct TerminalWindow: View {
 
 struct TerminalWorkspace: View {
     @ObservedObject var session: TerminalSession
+    @ObservedObject var store: TerminalStore
     @ObservedObject var settings: AISettings
 
     var body: some View {
         VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                Toggle(isOn: Binding(
+                    get: { store.graphicalMode },
+                    set: { store.setGraphicalMode($0) }
+                )) {
+                    Label("Graphical mode", systemImage: "square.grid.2x2")
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .toggleStyle(.checkbox)
+                .help("Show the current directory as clickable inline graphics")
+                Spacer()
+            }
+            .padding(.horizontal, 4)
+
             TerminalCanvas(session: session)
                 .id(session.id)
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(TerminalTheme.cyan.opacity(0.46), lineWidth: 1.25)
+            }
+            .shadow(color: TerminalTheme.cyan.opacity(0.12), radius: 14)
             if session.isAIChatVisible {
                 AIConversationPanel(session: session, settings: settings)
             }
         }
     }
+
 }
 
 struct HorizontalTabBar: View {
@@ -200,11 +222,11 @@ struct HorizontalTabBar: View {
                 }
                 .frame(height: 44)
                 .overlay(alignment: .bottom) {
-                    Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
+                    Rectangle().fill(TerminalTheme.cyan.opacity(0.22)).frame(height: 1)
                 }
             }
         }
-        .background(Color(red: 0.105, green: 0.118, blue: 0.112))
+        .background(TerminalTheme.surface)
     }
 }
 
@@ -280,9 +302,9 @@ struct VerticalTabSidebar: View {
             }
         }
         .frame(width: 238)
-        .background(Color(red: 0.105, green: 0.118, blue: 0.112))
+        .background(TerminalTheme.surface)
         .overlay(alignment: .trailing) {
-            Rectangle().fill(Color.white.opacity(0.07)).frame(width: 1)
+            Rectangle().fill(TerminalTheme.cyan.opacity(0.22)).frame(width: 1)
         }
     }
 }
@@ -297,7 +319,7 @@ struct CompactTitleBar: View {
             Spacer().frame(width: 8)
         }
         .frame(height: 38)
-        .background(Color(red: 0.105, green: 0.118, blue: 0.112))
+        .background(TerminalTheme.surface)
     }
 }
 
@@ -325,9 +347,15 @@ struct GroupButton: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background(selected ? Color.white.opacity(0.08) : Color.clear)
+        .background(selected ? TerminalTheme.cyan.opacity(0.12) : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .foregroundStyle(selected ? .primary : .secondary)
+        .foregroundStyle(selected ? TerminalTheme.text : TerminalTheme.mutedText)
+        .overlay {
+            if selected {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(TerminalTheme.cyan.opacity(0.34), lineWidth: 1)
+            }
+        }
         .help(group.isCollapsed ? "Expand \(group.name)" : "Collapse \(group.name)")
         .contextMenu {
             Button(group.isCollapsed ? "Expand Group" : "Collapse Group", action: toggleCollapsed)
@@ -349,7 +377,7 @@ struct TabSettingsMenu: View {
         }
         .buttonStyle(.plain)
         .frame(width: 28)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(TerminalTheme.cyanMuted)
         .help("Settings")
     }
 }
@@ -367,7 +395,7 @@ struct SmallIconButton: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(TerminalTheme.cyanMuted)
         .help(help)
     }
 }
@@ -421,13 +449,19 @@ struct TerminalTabButton: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
         }
-        .foregroundStyle(selected ? Color.white.opacity(0.92) : Color.white.opacity(0.52))
+        .foregroundStyle(selected ? TerminalTheme.text : TerminalTheme.mutedText)
         .padding(.leading, 12)
         .padding(.trailing, 8)
         .frame(width: vertical ? nil : 196, height: 38)
         .frame(maxWidth: vertical ? .infinity : nil)
-        .background(selected ? Color.white.opacity(0.075) : Color.clear)
+        .background(selected ? TerminalTheme.cyan.opacity(0.105) : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .overlay {
+            if selected {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(TerminalTheme.cyan.opacity(0.34), lineWidth: 1)
+            }
+        }
         .contentShape(Rectangle())
         .onTapGesture(perform: select)
         .contextMenu {

@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import Darwin
 import Foundation
 import GhosttyBridge
 
@@ -7,6 +8,45 @@ struct TerminalCommandBlock: Equatable {
     let command: String
     let workingDirectory: String
     var output: String = ""
+}
+
+struct GraphicalFileItem: Identifiable, Equatable, Sendable {
+    enum Kind: Hashable, Sendable {
+        case directory
+        case file
+        case executable
+        case symbolicLink
+    }
+
+    let path: String
+    let name: String
+    let kind: Kind
+    var permissions = "----------"
+    var linkCount: UInt64 = 1
+    var owner = "-"
+    var group = "-"
+    var size: UInt64 = 0
+    var modified = Date.distantPast
+    var id: String { path }
+}
+
+struct FileListingRequest: Equatable, Sendable {
+    let path: String
+    let showsHidden: Bool
+    let detailed: Bool
+}
+
+private struct GraphicalHitLayout {
+    let leadingColumns: Int
+    let widthColumns: Int
+    let rowHeight: Int
+}
+
+struct GraphicalDirectoryListing: Equatable, Sendable {
+    let path: String
+    var items: [GraphicalFileItem]
+    var error: String?
+    var isLoading: Bool
 }
 
 struct CommandLineTracker {
@@ -46,12 +86,19 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published var aiAttachment: TerminalBlockAttachment?
     @Published var isAIResponding = false
     @Published var aiError: String?
+    @Published var graphicalMode = false
     let error: String?
     private var terminalTitle = "Shell"
     private var customTitle: String?
+    private var shellWorkingDirectory = FileManager.default.currentDirectoryPath
     private(set) var commandBlocks: [TerminalCommandBlock] = []
     private var commandLine = CommandLineTracker()
     private var isMarkingInput = false
+    private var terminalColumns = 100
+    private var nextGraphicalImageID: UInt32 = 10_000
+    private var nextGraphicalPlacementID: UInt32 = 1
+    private var graphicalItemsByPlacementID: [UInt32: GraphicalFileItem] = [:]
+    private var graphicalHitLayoutsByPlacementID: [UInt32: GraphicalHitLayout] = [:]
 
     init(cols: UInt16 = 100, rows: UInt16 = 32) {
         var message: UnsafePointer<CChar>?
@@ -77,6 +124,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func refreshFrame() {
         guard let handle, let frame = gt_session_frame(handle) else { return }
+        terminalColumns = Int(frame.pointee.cols)
         if let pointer = frame.pointee.title {
             let value = String(cString: pointer).unicodeScalars.filter { scalar in
                 !CharacterSet.controlCharacters.contains(scalar)
@@ -91,10 +139,11 @@ final class TerminalSession: ObservableObject, Identifiable {
             if !value.isEmpty {
                 let decoded = value.removingPercentEncoding ?? value
                 if let url = URL(string: decoded), url.isFileURL {
-                    workingDirectory = url.path
+                    shellWorkingDirectory = url.path
                 } else {
-                    workingDirectory = decoded
+                    shellWorkingDirectory = decoded
                 }
+                workingDirectory = shellWorkingDirectory
             }
         }
     }
@@ -147,12 +196,639 @@ final class TerminalSession: ObservableObject, Identifiable {
             let command = commandLine.submit()
             if !command.isEmpty {
                 commandBlocks.append(.init(command: command, workingDirectory: workingDirectory))
+                if let target = Self.directoryChangePath(
+                    for: command,
+                    workingDirectory: workingDirectory
+                ) {
+                    workingDirectory = target
+                }
             }
             gt_session_mark_output(handle)
             revision &+= 1
+            if graphicalMode,
+               let request = Self.fileListingRequest(for: command, workingDirectory: workingDirectory),
+               renderInlineFileListing(command: command, request: request, handle: handle) {
+                isMarkingInput = false
+                write(Data([byte]))
+                return
+            }
         }
         isMarkingInput = false
         write(Data([byte]))
+    }
+
+    func activateGraphicalItem(_ item: GraphicalFileItem) {
+        var isDirectory = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: item.path, isDirectory: &isDirectory) else { return }
+        if isDirectory.boolValue {
+            let target = URL(fileURLWithPath: item.path, isDirectory: true).standardizedFileURL.path
+            workingDirectory = target
+            revision &+= 1
+            Task { @MainActor [weak self] in
+                await self?.navigateGraphically(to: target)
+            }
+        } else {
+            NSWorkspace.shared.open(URL(fileURLWithPath: item.path))
+        }
+    }
+
+    func graphicalItemIsDirectory(_ item: GraphicalFileItem) -> Bool {
+        var isDirectory = ObjCBool(false)
+        return FileManager.default.fileExists(atPath: item.path, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+    }
+
+    func copyGraphicalItem(
+        _ item: GraphicalFileItem,
+        pasteboard: NSPasteboard = .general
+    ) {
+        let url = URL(fileURLWithPath: item.path)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        pasteboard.clearContents()
+        pasteboard.writeObjects([url as NSURL])
+    }
+
+    @discardableResult
+    func pasteGraphicalItems(
+        onto item: GraphicalFileItem,
+        pasteboard: NSPasteboard = .general
+    ) -> Bool {
+        let urls = pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL] ?? []
+        guard !urls.isEmpty else { return false }
+
+        let destinationDirectory: URL
+        if graphicalItemIsDirectory(item) {
+            destinationDirectory = URL(fileURLWithPath: item.path, isDirectory: true)
+        } else {
+            destinationDirectory = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+        }
+
+        let manager = FileManager.default
+        let standardizedDestination = destinationDirectory.standardizedFileURL
+        var copiedAny = false
+        for source in urls {
+            let standardizedSource = source.standardizedFileURL
+            var sourceIsDirectory = ObjCBool(false)
+            guard manager.fileExists(atPath: standardizedSource.path, isDirectory: &sourceIsDirectory) else {
+                continue
+            }
+            if sourceIsDirectory.boolValue,
+               standardizedDestination.path.hasPrefix(standardizedSource.path + "/") {
+                continue
+            }
+            let destination = Self.availablePasteDestination(
+                for: standardizedSource,
+                in: standardizedDestination,
+                fileManager: manager
+            )
+            do {
+                try manager.copyItem(at: standardizedSource, to: destination)
+                copiedAny = true
+            } catch {
+                continue
+            }
+        }
+
+        if copiedAny, standardizedDestination.path == URL(
+            fileURLWithPath: workingDirectory,
+            isDirectory: true
+        ).standardizedFileURL.path, graphicalMode {
+            showCurrentDirectoryGraphically()
+        }
+        return copiedAny
+    }
+
+    nonisolated static func availablePasteDestination(
+        for source: URL,
+        in directory: URL,
+        fileManager: FileManager = .default
+    ) -> URL {
+        let original = directory.appendingPathComponent(source.lastPathComponent)
+        guard fileManager.fileExists(atPath: original.path) else { return original }
+        let extensionName = source.pathExtension
+        let stem = extensionName.isEmpty
+            ? source.lastPathComponent
+            : source.deletingPathExtension().lastPathComponent
+        var copyNumber = 1
+        while true {
+            let suffix = copyNumber == 1 ? " copy" : " copy \(copyNumber)"
+            let name = extensionName.isEmpty
+                ? stem + suffix
+                : stem + suffix + "." + extensionName
+            let candidate = directory.appendingPathComponent(name)
+            if !fileManager.fileExists(atPath: candidate.path) { return candidate }
+            copyNumber += 1
+        }
+    }
+
+    func setGraphicalMode(_ enabled: Bool) {
+        graphicalMode = enabled
+        guard enabled else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(80))
+            guard let self, self.graphicalMode else { return }
+            self.showCurrentDirectoryGraphically()
+        }
+    }
+
+    func showCurrentDirectoryGraphically() {
+        guard graphicalMode, let handle else { return }
+        // Remove the idle prompt, replace it with the directory view, then ask
+        // the shell for a fresh prompt below the injected terminal output.
+        write(Data([0x15]))
+        usleep(8_000)
+        if gt_session_poll(handle) { refreshFrame() }
+        feedTerminalOutput("\r\u{1B}[2K", handle: handle)
+        let request = FileListingRequest(path: workingDirectory, showsHidden: true, detailed: false)
+        if renderInlineFileListing(command: nil, request: request, handle: handle,
+                                   clearShellInput: false) {
+            write(Data([0x0D]))
+        }
+    }
+
+    private func navigateGraphically(to target: String) async {
+        guard graphicalMode, let handle else { return }
+        // Execute in the real shell so its process state remains authoritative.
+        // This bypasses semantic command capture because navigation is a window
+        // action rather than a command the user typed.
+        write(Data([0x15]))
+        write(Data(("cd -- \(Self.shellQuoted(target))\r").utf8))
+        for _ in 0..<20 {
+            try? await Task.sleep(for: .milliseconds(15))
+            if gt_session_poll(handle) { refreshFrame() }
+            if URL(fileURLWithPath: shellWorkingDirectory).standardizedFileURL.path == target { break }
+        }
+
+        // Clear the transient echoed cd and prompt, then silently render the
+        // equivalent ls result and restore one clean prompt underneath it.
+        feedTerminalOutput("\r\u{1B}[2K\u{1B}[1A\r\u{1B}[2K", handle: handle)
+        let request = FileListingRequest(path: target, showsHidden: true, detailed: false)
+        if renderInlineFileListing(command: nil, request: request, handle: handle,
+                                   clearShellInput: false) {
+            write(Data([0x0D]))
+        }
+    }
+
+    func graphicalItem(for placementID: UInt32) -> GraphicalFileItem? {
+        graphicalItemsByPlacementID[placementID]
+    }
+
+    func graphicalItemHitLayout(for placementID: UInt32) -> (Int, Int, Int) {
+        let layout = graphicalHitLayoutsByPlacementID[placementID]
+            ?? GraphicalHitLayout(leadingColumns: 0, widthColumns: 16, rowHeight: 2)
+        return (layout.leadingColumns, layout.widthColumns, layout.rowHeight)
+    }
+
+    nonisolated static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    nonisolated static func graphicalLabelLines(name: String, maxWidth: Int) -> [String] {
+        guard maxWidth > 0 else { return [] }
+        let cleanName = name.unicodeScalars.filter {
+            !CharacterSet.controlCharacters.contains($0)
+        }.map(String.init).joined()
+        guard !cleanName.isEmpty else { return [""] }
+
+        let maximumCharacters = maxWidth * 2
+        let characters = Array(truncatedGraphicalName(cleanName, maximumCharacters: maximumCharacters))
+        if characters.count <= maxWidth { return [String(characters)] }
+        let firstCount = min(maxWidth, (characters.count + 1) / 2)
+        return [
+            String(characters.prefix(firstCount)),
+            String(characters.dropFirst(firstCount).prefix(maxWidth)),
+        ]
+    }
+
+    nonisolated static func truncatedGraphicalName(
+        _ name: String,
+        maximumCharacters: Int
+    ) -> String {
+        guard maximumCharacters > 0 else { return "" }
+        var characters = Array(name)
+        if characters.count > maximumCharacters {
+            let dotIndex = characters.lastIndex(of: ".")
+            let hasExtension = dotIndex.map { $0 > characters.startIndex && $0 < characters.index(before: characters.endIndex) } ?? false
+            let suffix: [Character]
+            if hasExtension, let dotIndex {
+                let baseLast = characters[characters.index(before: dotIndex)]
+                suffix = Array("…\(baseLast)" + String(characters[dotIndex...]))
+            } else {
+                suffix = Array("…\(characters.last!)")
+            }
+            let visibleSuffix = suffix.count < maximumCharacters
+                ? suffix
+                : ["…"] + Array(suffix.suffix(maximumCharacters - 1))
+            let prefixCount = max(0, maximumCharacters - visibleSuffix.count)
+            characters = Array(characters.prefix(prefixCount)) + visibleSuffix
+        }
+        return String(characters)
+    }
+
+    nonisolated static func directoryChangePath(
+        for command: String,
+        workingDirectory: String
+    ) -> String? {
+        guard var words = shellWords(command), words.first == "cd" else { return nil }
+        words.removeFirst()
+        if words.first == "--" { words.removeFirst() }
+        guard words.count <= 1 else { return nil }
+        let rawPath = words.first ?? "~"
+        let expanded: String
+        if rawPath == "~" {
+            expanded = FileManager.default.homeDirectoryForCurrentUser.path
+        } else if rawPath.hasPrefix("~/") {
+            expanded = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(String(rawPath.dropFirst(2))).path
+        } else if rawPath.hasPrefix("/") {
+            expanded = rawPath
+        } else {
+            expanded = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+                .appendingPathComponent(rawPath).path
+        }
+        var isDirectory = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: expanded, isDirectory: &isDirectory),
+              isDirectory.boolValue else { return nil }
+        return URL(fileURLWithPath: expanded).standardizedFileURL.path
+    }
+
+    nonisolated static func fileListingPath(
+        for command: String,
+        workingDirectory: String
+    ) -> String? {
+        fileListingRequest(for: command, workingDirectory: workingDirectory)?.path
+    }
+
+    nonisolated static func fileListingRequest(
+        for command: String,
+        workingDirectory: String
+    ) -> FileListingRequest? {
+        guard var words = shellWords(command), !words.isEmpty else { return nil }
+        if words.first == "command" { words.removeFirst() }
+        guard let executable = words.first else { return nil }
+        let name = URL(fileURLWithPath: executable).lastPathComponent
+        let listingCommands: Set<String> = [
+            "ls", "ll", "la", "l", "lt", "gls", "colorls", "lsd",
+            "eza", "exa", "tree", "dir", "vdir",
+        ]
+        let splitEza = name == "ez" && words.dropFirst().first == "a"
+        guard listingCommands.contains(name) || splitEza else { return nil }
+        if splitEza { words.remove(at: 1) }
+
+        var paths: [String] = []
+        var optionCharacters = ""
+        var optionsEnded = false
+        for word in words.dropFirst() {
+            if !optionsEnded && word == "--" {
+                optionsEnded = true
+            } else if !optionsEnded && word.hasPrefix("-") {
+                optionCharacters += word.dropFirst().filter { $0.isLetter }
+                continue
+            } else {
+                paths.append(word)
+            }
+        }
+        guard paths.count <= 1 else { return nil }
+        let rawPath = paths.first ?? workingDirectory
+        let expanded: String
+        if rawPath == "~" {
+            expanded = FileManager.default.homeDirectoryForCurrentUser.path
+        } else if rawPath.hasPrefix("~/") {
+            expanded = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(String(rawPath.dropFirst(2))).path
+        } else if rawPath.hasPrefix("/") {
+            expanded = rawPath
+        } else {
+            expanded = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+                .appendingPathComponent(rawPath).path
+        }
+        var isDirectory = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: expanded, isDirectory: &isDirectory),
+              isDirectory.boolValue else { return nil }
+        let standardizedPath = URL(fileURLWithPath: expanded).standardizedFileURL.path
+        let aliasIsDetailed = ["ll", "la", "lt"].contains(name)
+        let aliasShowsHidden = name == "la"
+        return FileListingRequest(
+            path: standardizedPath,
+            showsHidden: aliasShowsHidden || optionCharacters.contains("a") || optionCharacters.contains("A"),
+            detailed: aliasIsDetailed || optionCharacters.contains("l")
+        )
+    }
+
+    nonisolated static func shellWords(_ command: String) -> [String]? {
+        enum Quote { case none, single, double }
+        var quote = Quote.none
+        var escaping = false
+        var current = ""
+        var words: [String] = []
+        func finishWord() {
+            if !current.isEmpty {
+                words.append(current)
+                current = ""
+            }
+        }
+        for character in command {
+            if escaping {
+                current.append(character)
+                escaping = false
+                continue
+            }
+            switch quote {
+            case .single:
+                if character == "'" { quote = .none } else { current.append(character) }
+            case .double:
+                if character == "\"" { quote = .none }
+                else if character == "\\" { escaping = true }
+                else { current.append(character) }
+            case .none:
+                if character == "'" { quote = .single }
+                else if character == "\"" { quote = .double }
+                else if character == "\\" { escaping = true }
+                else if character.isWhitespace { finishWord() }
+                else if "|;&><`".contains(character) { return nil }
+                else { current.append(character) }
+            }
+        }
+        guard quote == .none, !escaping else { return nil }
+        finishWord()
+        return words
+    }
+
+    private func renderInlineFileListing(
+        command: String?,
+        request: FileListingRequest,
+        handle: OpaquePointer,
+        clearShellInput: Bool = true
+    ) -> Bool {
+        let listing = Self.directoryListing(at: request.path)
+        guard listing.error == nil else { return false }
+        let items = listing.items.filter { request.showsHidden || !$0.name.hasPrefix(".") || $0.name == ".." }
+
+        // Clear the command buffered by the interactive shell. The app renders
+        // the equivalent output into libghostty-vt, then submits a blank line so
+        // the shell produces its next prompt in the normal order.
+        if clearShellInput {
+            write(Data([0x15]))
+            usleep(8_000)
+            if gt_session_poll(handle) { refreshFrame() }
+        }
+
+        let tileWidth = 14
+        let labelWidth = 12
+        let outerMarginColumns = 1
+        let usableColumns = max(tileWidth, terminalColumns - outerMarginColumns * 2)
+        let itemsPerRow = max(1, usableColumns / tileWidth)
+        var imageIDs: [GraphicalFileItem.Kind: UInt32] = [:]
+        for kind in Set(items.map(\.kind)) {
+            imageIDs[kind] = nextGraphicalImageID
+            nextGraphicalImageID &+= 1
+        }
+
+        var output = Data()
+        func append(_ value: String) { output.append(contentsOf: value.utf8) }
+        if let command { append(command + "\r\n") }
+        for (kind, imageID) in imageIDs {
+            let pixels = Self.iconPixels(for: kind)
+            append("\u{1B}_Ga=t,f=32,s=16,v=16,i=\(imageID),q=2;")
+            append(pixels.base64EncodedString())
+            append("\u{1B}\\")
+        }
+
+        if request.detailed {
+            renderDetailedListing(items, imageIDs: imageIDs, append: append)
+        } else {
+            for rowStart in stride(from: 0, to: items.count, by: itemsPerRow) {
+                let rowItems = Array(items[rowStart..<min(rowStart + itemsPerRow, items.count)])
+                let labels = rowItems.map {
+                    Self.graphicalLabelLines(name: $0.name, maxWidth: labelWidth)
+                }
+                let labelRowCount = min(2, labels.map(\.count).max() ?? 1)
+                for (index, item) in rowItems.enumerated() {
+                    guard let imageID = imageIDs[item.kind] else { continue }
+                    let placementID = nextGraphicalPlacementID
+                    nextGraphicalPlacementID &+= 1
+                    graphicalItemsByPlacementID[placementID] = item
+                    graphicalHitLayoutsByPlacementID[placementID] = GraphicalHitLayout(
+                        leadingColumns: 6,
+                        widthColumns: tileWidth,
+                        rowHeight: 1 + labelRowCount
+                    )
+                    let tileStart = outerMarginColumns + index * tileWidth
+                    let iconColumn = tileStart + (tileWidth - 2) / 2
+                    append("\u{1B}[\(iconColumn + 1)G")
+                    append("\u{1B}_Ga=p,i=\(imageID),p=\(placementID),c=2,r=1,C=1,q=2\u{1B}\\")
+                }
+                append("\r\n")
+                for labelRow in 0..<labelRowCount {
+                    for (index, item) in rowItems.enumerated() where labelRow < labels[index].count {
+                        let line = labels[index][labelRow]
+                        let tileStart = outerMarginColumns + index * tileWidth
+                        let centeredColumn = tileStart + max(0, (tileWidth - line.count) / 2)
+                        append("\u{1B}[\(centeredColumn + 1)G")
+                        append(Self.labelColor(for: item.kind) + line + "\u{1B}[0m")
+                    }
+                    append("\r\n")
+                }
+                append("\r\n")
+            }
+        }
+        if items.isEmpty { append("(empty directory)\r\n") }
+
+        feedTerminalOutput(output, handle: handle)
+        return true
+    }
+
+    private func renderDetailedListing(
+        _ items: [GraphicalFileItem],
+        imageIDs: [GraphicalFileItem.Kind: UInt32],
+        append: (String) -> Void
+    ) {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "MMM dd HH:mm"
+        let iconColumn = 1
+        let textColumn = 4
+
+        for item in items {
+            guard let imageID = imageIDs[item.kind] else { continue }
+            let placementID = nextGraphicalPlacementID
+            nextGraphicalPlacementID &+= 1
+            graphicalItemsByPlacementID[placementID] = item
+            graphicalHitLayoutsByPlacementID[placementID] = GraphicalHitLayout(
+                leadingColumns: 0,
+                widthColumns: max(1, terminalColumns - 2),
+                rowHeight: 1
+            )
+            append("\u{1B}[\(iconColumn + 1)G")
+            append("\u{1B}_Ga=p,i=\(imageID),p=\(placementID),c=2,r=1,C=1,q=2\u{1B}\\")
+
+            let owner = Self.padded(item.owner, width: 8)
+            let group = Self.padded(item.group, width: 8)
+            let links = Self.padded(String(item.linkCount), width: 3, rightAligned: true)
+            let size = Self.padded(String(item.size), width: 9, rightAligned: true)
+            let date = formatter.string(from: item.modified)
+            let metadata = "\(item.permissions) \(links) \(owner) \(group) \(size) \(date) "
+            let nameWidth = max(4, terminalColumns - textColumn - metadata.count - 1)
+            let name = Self.truncatedGraphicalName(item.name, maximumCharacters: nameWidth)
+            append("\u{1B}[\(textColumn + 1)G")
+            append(metadata + Self.labelColor(for: item.kind) + name + "\u{1B}[0m\r\n\r\n")
+        }
+    }
+
+    nonisolated static func padded(
+        _ value: String,
+        width: Int,
+        rightAligned: Bool = false
+    ) -> String {
+        let clipped = String(value.prefix(width))
+        let padding = String(repeating: " ", count: max(0, width - clipped.count))
+        return rightAligned ? padding + clipped : clipped + padding
+    }
+
+    private func feedTerminalOutput(_ value: String, handle: OpaquePointer) {
+        feedTerminalOutput(Data(value.utf8), handle: handle)
+    }
+
+    private func feedTerminalOutput(_ output: Data, handle: OpaquePointer) {
+        output.withUnsafeBytes { bytes in
+            guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return }
+            _ = gt_session_feed_output(handle, base, output.count)
+        }
+        revision &+= 1
+    }
+
+    nonisolated static func labelColor(for kind: GraphicalFileItem.Kind) -> String {
+        switch kind {
+        case .directory: "\u{1B}[38;2;255;184;30m"
+        case .executable: "\u{1B}[38;2;89;209;99m"
+        case .symbolicLink: "\u{1B}[38;2;82;214;224m"
+        case .file: "\u{1B}[38;2;210;225;234m"
+        }
+    }
+
+    nonisolated static func iconPixels(for kind: GraphicalFileItem.Kind) -> Data {
+        let size = 16
+        var pixels = [UInt8](repeating: 0, count: size * size * 4)
+        func fill(_ x: Range<Int>, _ y: Range<Int>, _ color: (UInt8, UInt8, UInt8, UInt8)) {
+            for row in y where row >= 0 && row < size {
+                for column in x where column >= 0 && column < size {
+                    let offset = (row * size + column) * 4
+                    pixels[offset] = color.0
+                    pixels[offset + 1] = color.1
+                    pixels[offset + 2] = color.2
+                    pixels[offset + 3] = color.3
+                }
+            }
+        }
+        switch kind {
+        case .directory:
+            fill(2..<8, 2..<5, (255, 193, 45, 255))
+            fill(1..<15, 4..<14, (255, 174, 20, 255))
+            fill(2..<14, 6..<13, (255, 190, 36, 255))
+        case .file:
+            fill(3..<13, 1..<15, (190, 205, 216, 255))
+            fill(9..<13, 1..<5, (232, 240, 245, 255))
+            fill(5..<11, 7..<8, (91, 113, 128, 255))
+            fill(5..<11, 10..<11, (91, 113, 128, 255))
+        case .executable:
+            fill(3..<13, 1..<15, (105, 195, 112, 255))
+            fill(5..<11, 7..<8, (28, 92, 48, 255))
+            fill(5..<11, 10..<11, (28, 92, 48, 255))
+        case .symbolicLink:
+            fill(2..<9, 4..<7, (72, 196, 220, 255))
+            fill(7..<14, 9..<12, (72, 196, 220, 255))
+            fill(6..<10, 7..<9, (72, 196, 220, 255))
+        }
+        return Data(pixels)
+    }
+
+    nonisolated static func directoryListing(at path: String) -> GraphicalDirectoryListing {
+        let manager = FileManager.default
+        do {
+            let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
+            let directoryURL = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+            let urls = try manager.contentsOfDirectory(
+                at: directoryURL,
+                includingPropertiesForKeys: Array(keys),
+                options: []
+            )
+            var items = urls.map { url -> GraphicalFileItem in
+                let values = try? url.resourceValues(forKeys: keys)
+                let kind: GraphicalFileItem.Kind
+                if values?.isSymbolicLink == true {
+                    kind = .symbolicLink
+                } else if values?.isDirectory == true {
+                    kind = .directory
+                } else if manager.isExecutableFile(atPath: url.path) {
+                    kind = .executable
+                } else {
+                    kind = .file
+                }
+                return graphicalFileItem(url: url, name: url.lastPathComponent, kind: kind)
+            }
+            let parentURL = directoryURL.deletingLastPathComponent().standardizedFileURL
+            items.append(graphicalFileItem(url: parentURL, name: "..", kind: .directory))
+            items.sort {
+                if $0.name == ".." { return true }
+                if $1.name == ".." { return false }
+                let leftDirectory = $0.kind == .directory
+                let rightDirectory = $1.kind == .directory
+                if leftDirectory != rightDirectory { return leftDirectory }
+                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
+            return GraphicalDirectoryListing(path: path, items: items, error: nil, isLoading: false)
+        } catch {
+            return GraphicalDirectoryListing(
+                path: path,
+                items: [],
+                error: error.localizedDescription,
+                isLoading: false
+            )
+        }
+    }
+
+    nonisolated static func graphicalFileItem(
+        url: URL,
+        name: String,
+        kind: GraphicalFileItem.Kind
+    ) -> GraphicalFileItem {
+        var info = stat()
+        let didStat = url.path.withCString { lstat($0, &info) } == 0
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return GraphicalFileItem(
+            path: url.path,
+            name: name,
+            kind: kind,
+            permissions: didStat ? permissionString(mode: info.st_mode, kind: kind) : "----------",
+            linkCount: didStat ? UInt64(info.st_nlink) : 1,
+            owner: attributes?[.ownerAccountName] as? String ?? "-",
+            group: attributes?[.groupOwnerAccountName] as? String ?? "-",
+            size: didStat ? UInt64(max(0, info.st_size)) : 0,
+            modified: didStat
+                ? Date(timeIntervalSince1970: TimeInterval(info.st_mtimespec.tv_sec))
+                : .distantPast
+        )
+    }
+
+    nonisolated static func permissionString(
+        mode: mode_t,
+        kind: GraphicalFileItem.Kind
+    ) -> String {
+        let prefix: Character
+        switch kind {
+        case .directory: prefix = "d"
+        case .symbolicLink: prefix = "l"
+        case .file, .executable: prefix = "-"
+        }
+        let masks: [(mode_t, Character)] = [
+            (S_IRUSR, "r"), (S_IWUSR, "w"), (S_IXUSR, "x"),
+            (S_IRGRP, "r"), (S_IWGRP, "w"), (S_IXGRP, "x"),
+            (S_IROTH, "r"), (S_IWOTH, "w"), (S_IXOTH, "x"),
+        ]
+        return String(prefix) + String(masks.map { mode & $0.0 != 0 ? $0.1 : "-" })
     }
 
     func workingDirectory(for command: String) -> String {
@@ -304,6 +980,7 @@ struct TerminalTabGroup: Identifiable {
 final class TerminalStore: ObservableObject {
     private static let orientationKey = "tabOrientation"
     private static let tabBarVisibilityKey = "isTabBarVisible"
+    private static let graphicalModeKey = "graphicalMode"
 
     @Published var groups: [TerminalTabGroup] = []
     let aiSettings = AISettings()
@@ -316,6 +993,14 @@ final class TerminalStore: ObservableObject {
     @Published var isTabBarVisible: Bool {
         didSet { UserDefaults.standard.set(isTabBarVisible, forKey: Self.tabBarVisibilityKey) }
     }
+    @Published var graphicalMode: Bool {
+        didSet {
+            UserDefaults.standard.set(graphicalMode, forKey: Self.graphicalModeKey)
+            for tab in groups.lazy.flatMap(\.tabs) {
+                tab.setGraphicalMode(graphicalMode)
+            }
+        }
+    }
     private var timer: Timer?
 
     init() {
@@ -327,6 +1012,7 @@ final class TerminalStore: ObservableObject {
         } else {
             isTabBarVisible = UserDefaults.standard.bool(forKey: Self.tabBarVisibilityKey)
         }
+        graphicalMode = UserDefaults.standard.bool(forKey: Self.graphicalModeKey)
         newGroup()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
@@ -345,6 +1031,10 @@ final class TerminalStore: ObservableObject {
         groups.lazy.flatMap(\.tabs).first { $0.id == selectedID }
     }
 
+    func setGraphicalMode(_ enabled: Bool) {
+        graphicalMode = enabled
+    }
+
     func newGroup() {
         let usedNumbers = Set(groups.compactMap { group -> Int? in
             guard group.name.hasPrefix("Group ") else { return nil }
@@ -352,6 +1042,7 @@ final class TerminalStore: ObservableObject {
         })
         let number = (1...).first { !usedNumbers.contains($0) } ?? groups.count + 1
         let tab = TerminalSession()
+        tab.setGraphicalMode(graphicalMode)
         let group = TerminalTabGroup(name: "Group \(number)", tabs: [tab])
         groups.append(group)
         selectedGroupID = group.id
@@ -364,6 +1055,7 @@ final class TerminalStore: ObservableObject {
             return
         }
         let tab = TerminalSession()
+        tab.setGraphicalMode(graphicalMode)
         groups[index].tabs.append(tab)
         groups[index].isCollapsed = false
         selectedGroupID = groups[index].id
@@ -393,6 +1085,7 @@ final class TerminalStore: ObservableObject {
         if groups[groupIndex].tabs.isEmpty {
             if groups.count == 1 {
                 let replacement = TerminalSession()
+                replacement.setGraphicalMode(graphicalMode)
                 groups[groupIndex].tabs = [replacement]
                 selectedGroupID = groups[groupIndex].id
                 selectedID = replacement.id

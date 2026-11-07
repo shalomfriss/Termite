@@ -124,7 +124,7 @@ struct AIConversationPanel: View {
             .padding(10)
         }
         .frame(minHeight: 180, idealHeight: 250, maxHeight: 310)
-        .background(Color(red: 0.092, green: 0.105, blue: 0.10))
+        .background(TerminalTheme.surface)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -224,6 +224,7 @@ struct AppSettingsView: View {
         }
         .padding(22)
         .frame(width: 500, height: 500)
+        .background(TerminalTheme.backdrop)
         .task { await settings.refreshLoginStatus() }
     }
 
