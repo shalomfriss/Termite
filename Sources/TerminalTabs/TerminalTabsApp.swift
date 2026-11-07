@@ -61,10 +61,6 @@ struct TerminalTabsApp: App {
                 Button("Vertical Tabs") { store.tabOrientation = .vertical }
             }
         }
-
-        Settings {
-            TabSettingsView(store: store)
-        }
     }
 }
 
@@ -135,7 +131,8 @@ struct HorizontalTabBar: View {
                             GroupButton(
                                 group: group,
                                 selected: group.id == store.selectedGroupID,
-                                select: { store.selectGroup(group.id) },
+                                select: { store.selectAndToggleGroup(group.id) },
+                                toggleCollapsed: { store.toggleGroupCollapsed(group.id) },
                                 rename: { rename(group) },
                                 close: { store.closeGroup(group.id) }
                             )
@@ -145,34 +142,36 @@ struct HorizontalTabBar: View {
                 SmallIconButton(systemName: "folder.badge.plus", help: "New tab group") {
                     store.newGroup()
                 }
-                TabLayoutMenu(store: store)
+                SmallIconButton(systemName: "plus", help: "New tab (Command-T)") {
+                    store.newTab()
+                }
+                TabSettingsMenu(store: store)
                 Spacer(minLength: 8)
             }
             .frame(height: 38)
 
-            HStack(spacing: 0) {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 4) {
-                        ForEach(store.tabs) { tab in
-                            TerminalTabButton(
-                                tab: tab,
-                                selected: tab.id == store.selectedID,
-                                vertical: false,
-                                select: { store.selectedID = tab.id },
-                                close: { store.close(tab.id) }
-                            )
+            if store.selectedGroup?.isCollapsed == false {
+                HStack(spacing: 0) {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 4) {
+                            ForEach(store.tabs) { tab in
+                                TerminalTabButton(
+                                    tab: tab,
+                                    selected: tab.id == store.selectedID,
+                                    vertical: false,
+                                    select: { store.selectedID = tab.id },
+                                    close: { store.close(tab.id) }
+                                )
+                            }
                         }
+                        .padding(.horizontal, 6)
                     }
-                    .padding(.horizontal, 6)
+                    Spacer(minLength: 8)
                 }
-                SmallIconButton(systemName: "plus", help: "New tab (Command-T)") {
-                    store.newTab()
+                .frame(height: 44)
+                .overlay(alignment: .bottom) {
+                    Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
                 }
-                Spacer(minLength: 8)
-            }
-            .frame(height: 44)
-            .overlay(alignment: .bottom) {
-                Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
             }
         }
         .background(Color(red: 0.105, green: 0.118, blue: 0.112))
@@ -190,7 +189,7 @@ struct VerticalTabSidebar: View {
                 SmallIconButton(systemName: "folder.badge.plus", help: "New tab group") {
                     store.newGroup()
                 }
-                TabLayoutMenu(store: store)
+                TabSettingsMenu(store: store)
             }
             .padding(.trailing, 8)
             .frame(height: 42)
@@ -201,36 +200,48 @@ struct VerticalTabSidebar: View {
                         VStack(spacing: 4) {
                             HStack(spacing: 6) {
                                 Button {
-                                    store.selectGroup(group.id)
+                                    store.selectAndToggleGroup(group.id)
                                 } label: {
-                                    Label(group.name, systemImage: "folder")
+                                    HStack(spacing: 7) {
+                                        Image(systemName: group.isCollapsed ? "chevron.right" : "chevron.down")
+                                            .font(.system(size: 9, weight: .semibold))
+                                            .frame(width: 12)
+                                        Image(systemName: group.id == store.selectedGroupID ? "folder.fill" : "folder")
+                                        Text(group.name).lineLimit(1)
+                                    }
                                         .font(.system(size: 11, weight: .semibold))
-                                        .lineLimit(1)
                                         .frame(maxWidth: .infinity, alignment: .leading)
+                                        .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
                                 .foregroundStyle(group.id == store.selectedGroupID ? .primary : .secondary)
+                                .help(group.isCollapsed ? "Expand \(group.name)" : "Collapse \(group.name)")
                                 SmallIconButton(systemName: "plus", help: "New tab in \(group.name)") {
                                     store.newTab(in: group.id)
                                 }
                             }
                             .padding(.horizontal, 10)
                             .contextMenu {
+                                Button(group.isCollapsed ? "Expand Group" : "Collapse Group") {
+                                    store.toggleGroupCollapsed(group.id)
+                                }
                                 Button("Rename Group") { rename(group) }
                                 Button("Close Group", role: .destructive) { store.closeGroup(group.id) }
                             }
 
-                            ForEach(group.tabs) { tab in
-                                TerminalTabButton(
-                                    tab: tab,
-                                    selected: tab.id == store.selectedID,
-                                    vertical: true,
-                                    select: {
-                                        store.selectGroup(group.id)
-                                        store.selectedID = tab.id
-                                    },
-                                    close: { store.close(tab.id) }
-                                )
+                            if !group.isCollapsed {
+                                ForEach(group.tabs) { tab in
+                                    TerminalTabButton(
+                                        tab: tab,
+                                        selected: tab.id == store.selectedID,
+                                        vertical: true,
+                                        select: {
+                                            store.selectGroup(group.id)
+                                            store.selectedID = tab.id
+                                        },
+                                        close: { store.close(tab.id) }
+                                    )
+                                }
                             }
                         }
                     }
@@ -252,12 +263,7 @@ struct CompactTitleBar: View {
     var body: some View {
         HStack {
             Spacer()
-            SmallIconButton(
-                systemName: "rectangle.topthird.inset.filled",
-                help: "Show tab bar (Command-Shift-B)"
-            ) {
-                store.isTabBarVisible = true
-            }
+            TabSettingsMenu(store: store)
             Spacer().frame(width: 8)
         }
         .frame(height: 38)
@@ -269,32 +275,39 @@ struct GroupButton: View {
     let group: TerminalTabGroup
     let selected: Bool
     let select: () -> Void
+    let toggleCollapsed: () -> Void
     let rename: () -> Void
     let close: () -> Void
 
     var body: some View {
         Button(action: select) {
-            HStack(spacing: 6) {
+            HStack(spacing: 7) {
+                Image(systemName: group.isCollapsed ? "chevron.right" : "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .frame(width: 12)
                 Image(systemName: selected ? "folder.fill" : "folder")
                 Text(group.name).lineLimit(1)
                 Text("\(group.tabs.count)").foregroundStyle(.tertiary)
             }
             .font(.system(size: 11, weight: .medium))
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 8)
             .frame(height: 26)
-            .background(selected ? Color.white.opacity(0.08) : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .background(selected ? Color.white.opacity(0.08) : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         .foregroundStyle(selected ? .primary : .secondary)
+        .help(group.isCollapsed ? "Expand \(group.name)" : "Collapse \(group.name)")
         .contextMenu {
+            Button(group.isCollapsed ? "Expand Group" : "Collapse Group", action: toggleCollapsed)
             Button("Rename Group", action: rename)
             Button("Close Group", role: .destructive, action: close)
         }
     }
 }
 
-struct TabLayoutMenu: View {
+struct TabSettingsMenu: View {
     @ObservedObject var store: TerminalStore
 
     var body: some View {
@@ -304,17 +317,16 @@ struct TabLayoutMenu: View {
                 Label("Vertical", systemImage: "rectangle.split.1x2").tag(TabOrientation.vertical)
             }
             Divider()
-            Button("Hide Tab Bar") { store.isTabBarVisible = false }
-            SettingsLink { Text("Tab Settings...") }
+            Toggle("Show tab bar", isOn: $store.isTabBarVisible)
         } label: {
-            Image(systemName: "rectangle.split.1x2")
+            Image(systemName: "gearshape")
                 .frame(width: 28, height: 28)
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .frame(width: 28)
         .foregroundStyle(.secondary)
-        .help("Tab layout")
+        .help("Tab settings")
     }
 }
 
@@ -391,22 +403,3 @@ struct TerminalTabButton: View {
     }
 }
 
-struct TabSettingsView: View {
-    @ObservedObject var store: TerminalStore
-
-    var body: some View {
-        Form {
-            Section("Tabs") {
-                Picker("Orientation", selection: $store.tabOrientation) {
-                    Text("Horizontal").tag(TabOrientation.horizontal)
-                    Text("Vertical").tag(TabOrientation.vertical)
-                }
-                .pickerStyle(.segmented)
-                Toggle("Show tab bar", isOn: $store.isTabBarVisible)
-            }
-        }
-        .formStyle(.grouped)
-        .padding(12)
-        .frame(width: 420, height: 190)
-    }
-}

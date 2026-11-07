@@ -82,11 +82,18 @@ struct TerminalTabGroup: Identifiable {
     let id: UUID
     var name: String
     var tabs: [TerminalSession]
+    var isCollapsed: Bool
 
-    init(id: UUID = UUID(), name: String, tabs: [TerminalSession] = []) {
+    init(
+        id: UUID = UUID(),
+        name: String,
+        tabs: [TerminalSession] = [],
+        isCollapsed: Bool = false
+    ) {
         self.id = id
         self.name = name
         self.tabs = tabs
+        self.isCollapsed = isCollapsed
     }
 }
 
@@ -153,6 +160,7 @@ final class TerminalStore: ObservableObject {
         }
         let tab = TerminalSession()
         groups[index].tabs.append(tab)
+        groups[index].isCollapsed = false
         selectedGroupID = groups[index].id
         selectedID = tab.id
     }
@@ -163,6 +171,11 @@ final class TerminalStore: ObservableObject {
         if !groups[index].tabs.contains(where: { $0.id == selectedID }) {
             selectedID = groups[index].tabs.first?.id
         }
+    }
+
+    func selectAndToggleGroup(_ id: UUID) {
+        selectGroup(id)
+        toggleGroupCollapsed(id)
     }
 
     func close(_ id: UUID? = nil) {
@@ -208,6 +221,11 @@ final class TerminalStore: ObservableObject {
         let cleaned = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return }
         groups[index].name = cleaned
+    }
+
+    func toggleGroupCollapsed(_ id: UUID) {
+        guard let index = groupIndex(for: id) else { return }
+        groups[index].isCollapsed.toggle()
     }
 
     func select(_ index: Int) {

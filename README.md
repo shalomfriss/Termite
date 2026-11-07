@@ -2,7 +2,7 @@
 
 A small native macOS terminal with independent shell tabs. Each tab owns a PTY and a [`GhosttyTerminal`](https://lib.ghostty.org/vt/). libghostty-vt handles VT parsing, screen state, colors, styles, cursor state, and title updates. AppKit handles rendering and input.
 
-Tabs can be organized into named groups and displayed horizontally or in a vertical sidebar. Each tab shows its current directory, updated from the shell through OSC 7. Tab orientation and visibility are available from the layout menu or Settings (Command-,) and persist across launches.
+Tabs can be organized into named, collapsible groups and displayed horizontally or in a vertical sidebar. Each tab shows its current directory, updated from the shell through OSC 7. Tab orientation and visibility are available from the gear menu and persist across launches.
 
 ## Run
 
@@ -28,10 +28,9 @@ LIBGHOSTTY_VT_PATH=/path/to/libghostty-vt.dylib swift run TerminalTabs
 | Select tab | Command-1 through Command-9 |
 | Previous / next tab | Command-Shift-[ / Command-Shift-] |
 | Show / hide tab bar | Command-Shift-B |
-| Open Settings | Command-, |
 | Paste | Command-V |
 
-Right-click a group to rename or close it. Closing the final tab or group creates a fresh one, so the window always remains usable. Resizing the window updates both the PTY and the corresponding Ghostty terminal grid.
+Use the chevron beside a group to fold or unfold its tabs. Right-click a group to collapse, expand, rename, or close it. Closing the final tab or group creates a fresh one, so the window always remains usable. Resizing the window updates both the PTY and the corresponding Ghostty terminal grid.
 
 ## Structure
 
