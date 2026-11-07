@@ -32,6 +32,10 @@ struct TerminalTabsApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") { store.isSettingsVisible = true }
+                    .keyboardShortcut(",", modifiers: .command)
+            }
             CommandGroup(replacing: .newItem) {
                 Button("New Tab") { store.newTab() }
                     .keyboardShortcut("t", modifiers: .command)
@@ -59,6 +63,15 @@ struct TerminalTabsApp: App {
                 Divider()
                 Button("Horizontal Tabs") { store.tabOrientation = .horizontal }
                 Button("Vertical Tabs") { store.tabOrientation = .vertical }
+            }
+            CommandMenu("AI") {
+                Button("Open AI Chat") {
+                    store.selected?.isAIChatVisible = true
+                }
+                .keyboardShortcut("i", modifiers: [.command, .shift])
+                Button("Clear AI Conversation") {
+                    store.selected?.clearAIConversation()
+                }
             }
         }
     }
@@ -99,14 +112,16 @@ struct TerminalWindow: View {
                 if let renameGroupID { store.renameGroup(renameGroupID, to: groupNameDraft) }
             }
         }
+        .sheet(isPresented: $store.isSettingsVisible) {
+            AppSettingsView(store: store, settings: store.aiSettings)
+        }
     }
 
     @ViewBuilder
     private var terminal: some View {
         if let selected = store.selected {
-            TerminalCanvas(session: selected)
-                .id(selected.id)
-                .padding(10)
+            TerminalWorkspace(session: selected, settings: store.aiSettings)
+            .padding(10)
         }
     }
 
@@ -114,6 +129,21 @@ struct TerminalWindow: View {
         renameGroupID = group.id
         groupNameDraft = group.name
         isRenamingGroup = true
+    }
+}
+
+struct TerminalWorkspace: View {
+    @ObservedObject var session: TerminalSession
+    @ObservedObject var settings: AISettings
+
+    var body: some View {
+        VStack(spacing: 8) {
+            TerminalCanvas(session: session)
+                .id(session.id)
+            if session.isAIChatVisible {
+                AIConversationPanel(session: session, settings: settings)
+            }
+        }
     }
 }
 
@@ -311,22 +341,16 @@ struct TabSettingsMenu: View {
     @ObservedObject var store: TerminalStore
 
     var body: some View {
-        Menu {
-            Picker("Tab orientation", selection: $store.tabOrientation) {
-                Label("Horizontal", systemImage: "rectangle.split.3x1").tag(TabOrientation.horizontal)
-                Label("Vertical", systemImage: "rectangle.split.1x2").tag(TabOrientation.vertical)
-            }
-            Divider()
-            Toggle("Show tab bar", isOn: $store.isTabBarVisible)
+        Button {
+            store.isSettingsVisible = true
         } label: {
             Image(systemName: "gearshape")
                 .frame(width: 28, height: 28)
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
         .frame(width: 28)
         .foregroundStyle(.secondary)
-        .help("Tab settings")
+        .help("Settings")
     }
 }
 
@@ -350,6 +374,9 @@ struct SmallIconButton: View {
 
 struct TerminalTabButton: View {
     @ObservedObject var tab: TerminalSession
+    @State private var isRenaming = false
+    @State private var titleDraft = ""
+    @FocusState private var isTitleFocused: Bool
     let selected: Bool
     let vertical: Bool
     let select: () -> Void
@@ -358,10 +385,26 @@ struct TerminalTabButton: View {
     var body: some View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 1) {
-                Text(tab.title)
-                    .font(.system(size: 12, weight: selected ? .medium : .regular))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                if isRenaming {
+                    TextField("Tab name", text: $titleDraft)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12, weight: selected ? .medium : .regular))
+                        .focused($isTitleFocused)
+                        .onSubmit { finishRename() }
+                        .onExitCommand { cancelRename() }
+                        .onChange(of: isTitleFocused) {
+                            if !isTitleFocused && isRenaming { finishRename() }
+                        }
+                } else {
+                    Text(tab.title)
+                        .font(.system(size: 12, weight: selected ? .medium : .regular))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .highPriorityGesture(
+                            TapGesture(count: 2).onEnded { beginRename() }
+                        )
+                        .help("Double-click to rename")
+                }
                 Text(displayDirectory)
                     .font(.system(size: 9, weight: .regular, design: .monospaced))
                     .foregroundStyle(.tertiary)
@@ -388,9 +431,31 @@ struct TerminalTabButton: View {
         .contentShape(Rectangle())
         .onTapGesture(perform: select)
         .contextMenu {
+            Button("Rename Tab", action: beginRename)
             Button("Close Tab", action: close)
         }
         .padding(.horizontal, vertical ? 6 : 0)
+    }
+
+    private func beginRename() {
+        select()
+        titleDraft = tab.title
+        isRenaming = true
+        Task { @MainActor in
+            await Task.yield()
+            isTitleFocused = true
+        }
+    }
+
+    private func finishRename() {
+        guard isRenaming else { return }
+        tab.rename(to: titleDraft)
+        isRenaming = false
+    }
+
+    private func cancelRename() {
+        isRenaming = false
+        isTitleFocused = false
     }
 
     private var displayDirectory: String {

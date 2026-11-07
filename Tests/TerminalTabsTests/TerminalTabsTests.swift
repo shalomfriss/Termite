@@ -3,6 +3,59 @@ import GhosttyBridge
 @testable import TerminalTabs
 
 final class TerminalTabsTests: XCTestCase {
+    func testAIBlockAttachmentIncludesTerminalContext() {
+        let attachment = TerminalBlockAttachment(
+            command: "swift test",
+            output: "2 failures",
+            workingDirectory: "/tmp/project"
+        )
+        XCTAssertTrue(attachment.promptContent.contains("swift test"))
+        XCTAssertTrue(attachment.promptContent.contains("2 failures"))
+        XCTAssertTrue(attachment.promptContent.contains("/tmp/project"))
+    }
+
+    @MainActor
+    func testCapturedTerminalOutputRemovesANSIAndPrompt() {
+        let raw = Data("\r\n\u{001B}[31mfailed\u{001B}[0m\r\nuser@host % ".utf8)
+        XCTAssertEqual(TerminalSession.cleanTerminalOutput(raw), "failed")
+    }
+
+    @MainActor
+    func testAttachingBlockOpensAIChat() {
+        let session = TerminalSession(cols: 40, rows: 10)
+        session.attachToAI(command: "ls", output: "Package.swift", workingDirectory: "/tmp")
+        XCTAssertTrue(session.isAIChatVisible)
+        XCTAssertEqual(session.aiAttachment?.command, "ls")
+        XCTAssertEqual(session.aiAttachment?.output, "Package.swift")
+    }
+
+    @MainActor
+    func testTabCanBeRenamedAndReset() {
+        let session = TerminalSession(cols: 40, rows: 10)
+        session.rename(to: "Server")
+        XCTAssertEqual(session.title, "Server")
+        session.rename(to: "  ")
+        XCTAssertFalse(session.title.isEmpty)
+    }
+
+    @MainActor
+    func testWorkingDirectoryTracksShellChanges() throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let session = TerminalSession(cols: 40, rows: 10)
+        for _ in 0..<50 {
+            usleep(20_000)
+            session.poll()
+        }
+        session.sendUserInput(Data("cd /tmp".utf8))
+        session.sendUserInput(Data([0x0D]))
+        let expected = Set(["/tmp", "/private/tmp"])
+        for _ in 0..<100 where !expected.contains(session.workingDirectory) {
+            usleep(20_000)
+            session.poll()
+        }
+        XCTAssertTrue(expected.contains(session.workingDirectory))
+    }
+
     func testCommandLineTrackerHandlesTypingAndBackspace() {
         var tracker = CommandLineTracker()
         tracker.append(Data("pww".utf8))

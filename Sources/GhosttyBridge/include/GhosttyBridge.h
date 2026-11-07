@@ -69,6 +69,8 @@ bool gt_session_write(GTSession *session, const uint8_t *bytes, size_t len);
 /** Mark frontend-observed shell input/output boundaries using OSC 133. */
 void gt_session_mark_input(GTSession *session);
 void gt_session_mark_output(GTSession *session);
+/** Copy raw PTY output captured since the latest command began. */
+size_t gt_session_command_output(GTSession *session, uint8_t *buffer, size_t capacity);
 bool gt_session_scroll(GTSession *session, intptr_t rows);
 bool gt_session_scroll_to_bottom(GTSession *session);
 bool gt_session_resize(GTSession *session, uint16_t cols, uint16_t rows,

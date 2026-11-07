@@ -3,6 +3,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <libproc.h>
 #include <pthread.h>
 #include <poll.h>
 #include <signal.h>
@@ -177,6 +178,10 @@ struct GTSession {
     size_t cell_capacity;
     uint8_t *row_semantics;
     size_t row_capacity;
+    uint8_t *command_output;
+    size_t command_output_len;
+    size_t command_output_capacity;
+    bool capturing_command_output;
     char title[256];
     char working_directory[1024];
     GTFrame frame;
@@ -263,6 +268,7 @@ void gt_session_destroy(GTSession *s) {
     if (s->terminal) api.terminal_free(s->terminal);
     free(s->cell_buffer);
     free(s->row_semantics);
+    free(s->command_output);
     free(s);
 }
 
@@ -273,6 +279,22 @@ bool gt_session_poll(GTSession *s) {
     for (;;) {
         ssize_t count = read(s->master_fd, buffer, sizeof(buffer));
         if (count > 0) {
+            if (s->capturing_command_output) {
+                size_t needed = s->command_output_len + (size_t)count;
+                if (needed > s->command_output_capacity) {
+                    size_t capacity = s->command_output_capacity ? s->command_output_capacity : 32768;
+                    while (capacity < needed) capacity *= 2;
+                    uint8_t *next = realloc(s->command_output, capacity);
+                    if (next) {
+                        s->command_output = next;
+                        s->command_output_capacity = capacity;
+                    }
+                }
+                if (needed <= s->command_output_capacity) {
+                    memcpy(s->command_output + s->command_output_len, buffer, (size_t)count);
+                    s->command_output_len = needed;
+                }
+            }
             api.terminal_write(s->terminal, buffer, (size_t)count);
             changed = true;
             continue;
@@ -376,14 +398,22 @@ const GTFrame *gt_session_frame(GTSession *s) {
     } else {
         strcpy(s->title, "Shell");
     }
-    GhosttyString working_directory = {0};
-    if (api.terminal_get(s->terminal, 13, &working_directory) == GHOSTTY_SUCCESS && working_directory.ptr) {
-        size_t count = working_directory.len < sizeof(s->working_directory) - 1
-            ? working_directory.len : sizeof(s->working_directory) - 1;
-        memcpy(s->working_directory, working_directory.ptr, count);
-        s->working_directory[count] = 0;
+    struct proc_vnodepathinfo path_info = {0};
+    int path_info_size = proc_pidinfo(s->child, PROC_PIDVNODEPATHINFO, 0,
+                                     &path_info, sizeof(path_info));
+    if (path_info_size == sizeof(path_info) && path_info.pvi_cdir.vip_path[0]) {
+        snprintf(s->working_directory, sizeof(s->working_directory), "%s",
+                 path_info.pvi_cdir.vip_path);
     } else {
-        s->working_directory[0] = 0;
+        GhosttyString working_directory = {0};
+        if (api.terminal_get(s->terminal, 13, &working_directory) == GHOSTTY_SUCCESS && working_directory.ptr) {
+            size_t count = working_directory.len < sizeof(s->working_directory) - 1
+                ? working_directory.len : sizeof(s->working_directory) - 1;
+            memcpy(s->working_directory, working_directory.ptr, count);
+            s->working_directory[count] = 0;
+        } else {
+            s->working_directory[0] = 0;
+        }
     }
     GhosttyColorRgb cursor_color = colors.cursor_has_value ? colors.cursor : colors.foreground;
     GhosttyTerminalScrollbar scrollbar = {0};
@@ -422,6 +452,7 @@ static void write_semantic_marker(GTSession *s, const char *marker) {
 }
 
 void gt_session_mark_input(GTSession *s) {
+    if (s) s->capturing_command_output = false;
     /* P marks the prompt at the current cursor. A would request a fresh line,
        which is only appropriate when emitted by the shell before its prompt. */
     write_semantic_marker(s, "\033]133;D\007\033]133;P\007\033]133;B\007");
@@ -437,7 +468,20 @@ void gt_session_mark_output(GTSession *s) {
             gt_session_poll(s);
         }
     }
+    if (s) {
+        s->command_output_len = 0;
+        s->capturing_command_output = true;
+    }
     write_semantic_marker(s, "\033]133;C\007");
+}
+
+size_t gt_session_command_output(GTSession *s, uint8_t *buffer, size_t capacity) {
+    if (!s) return 0;
+    if (buffer && capacity) {
+        size_t count = s->command_output_len < capacity ? s->command_output_len : capacity;
+        memcpy(buffer, s->command_output, count);
+    }
+    return s->command_output_len;
 }
 
 bool gt_session_scroll(GTSession *s, intptr_t rows) {

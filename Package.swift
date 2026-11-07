@@ -16,7 +16,8 @@ let package = Package(
         .executableTarget(
             name: "TerminalTabs",
             dependencies: ["GhosttyBridge"],
-            path: "Sources/TerminalTabs"
+            path: "Sources/TerminalTabs",
+            linkerSettings: [.linkedFramework("Security")]
         ),
         .testTarget(
             name: "TerminalTabsTests",

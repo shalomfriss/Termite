@@ -2,7 +2,7 @@
 
 A small native macOS terminal with independent shell tabs. Each tab owns a PTY and a [`GhosttyTerminal`](https://lib.ghostty.org/vt/). libghostty-vt handles VT parsing, screen state, colors, styles, cursor state, and title updates. AppKit handles rendering and input.
 
-Tabs can be organized into named, collapsible groups and displayed horizontally or in a vertical sidebar. Each tab shows its current directory, updated from the shell through OSC 7. Tab orientation and visibility are available from the gear menu and persist across launches.
+Tabs can be organized into named, collapsible groups and displayed horizontally or in a vertical sidebar. Each tab follows the shell's current directory, even when the shell does not emit OSC 7. Double-click a tab name to rename it. Tab orientation and visibility are available from the gear menu and persist across launches.
 
 ## Run
 
@@ -28,9 +28,16 @@ LIBGHOSTTY_VT_PATH=/path/to/libghostty-vt.dylib swift run TerminalTabs
 | Select tab | Command-1 through Command-9 |
 | Previous / next tab | Command-Shift-[ / Command-Shift-] |
 | Show / hide tab bar | Command-Shift-B |
+| Open AI chat | Command-Shift-I |
 | Paste | Command-V |
 
 Use the chevron beside a group to fold or unfold its tabs. Right-click a group to collapse, expand, rename, or close it. Closing the final tab or group creates a fresh one, so the window always remains usable. Resizing the window updates both the PTY and the corresponding Ghostty terminal grid.
+
+## AI chat
+
+Open the gear settings panel (or press Command-,) to connect ChatGPT or Claude. Sign-in mode delegates browser authentication and credential storage to the official Codex and Claude Code CLIs. API-key mode is also available; keys are stored in macOS Keychain and model identifiers can be changed as providers release new models. Open the per-tab conversation with Command-Shift-I. Right-click a command block and choose **Attach Output to AI Chat** to send its command, working directory, and full captured output with your next question.
+
+Sign-in mode requires the corresponding official CLI to be installed. API-key billing is separate from consumer ChatGPT and Claude subscriptions.
 
 ## Structure
 

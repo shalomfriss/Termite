@@ -121,6 +121,8 @@ final class TerminalNSView: NSView {
         menu.addItem(menuItem("Copy Command", action: #selector(copyCommand), enabled: contextBlock != nil))
         menu.addItem(menuItem("Copy Working Directory", action: #selector(copyWorkingDirectory), enabled: contextBlock != nil))
         menu.addItem(.separator())
+        menu.addItem(menuItem("Attach Output to AI Chat", action: #selector(attachOutputToAI), enabled: contextBlock != nil))
+        menu.addItem(.separator())
         menu.addItem(menuItem("Paste", action: #selector(pasteIntoTerminal),
                               enabled: NSPasteboard.general.string(forType: .string) != nil))
         return menu
@@ -269,6 +271,15 @@ final class TerminalNSView: NSView {
     @objc private func copyOutput() { copyToPasteboard(contextBlock?.output) }
     @objc private func copyCommand() { copyToPasteboard(contextBlock?.command) }
     @objc private func copyWorkingDirectory() { copyToPasteboard(contextBlock?.workingDirectory) }
+
+    @objc private func attachOutputToAI() {
+        guard let block = contextBlock else { return }
+        session.attachToAI(
+            command: block.command,
+            output: session.fullOutput(for: block.command) ?? block.output,
+            workingDirectory: block.workingDirectory
+        )
+    }
 
     @objc private func pasteIntoTerminal() {
         guard let value = NSPasteboard.general.string(forType: .string) else { return }

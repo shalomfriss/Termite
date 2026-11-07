@@ -6,6 +6,7 @@ import GhosttyBridge
 struct TerminalCommandBlock: Equatable {
     let command: String
     let workingDirectory: String
+    var output: String = ""
 }
 
 struct CommandLineTracker {
@@ -39,7 +40,15 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published var workingDirectory = FileManager.default.currentDirectoryPath
     @Published var isRunning = true
     @Published var revision: UInt = 0
+    @Published var isAIChatVisible = false
+    @Published var aiDraft = ""
+    @Published var aiMessages: [AIChatMessage] = []
+    @Published var aiAttachment: TerminalBlockAttachment?
+    @Published var isAIResponding = false
+    @Published var aiError: String?
     let error: String?
+    private var terminalTitle = "Shell"
+    private var customTitle: String?
     private(set) var commandBlocks: [TerminalCommandBlock] = []
     private var commandLine = CommandLineTracker()
     private var isMarkingInput = false
@@ -61,6 +70,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         if gt_session_poll(handle) {
             revision &+= 1
             refreshFrame()
+            refreshCapturedCommandOutput()
         }
         isRunning = gt_session_is_running(handle)
     }
@@ -73,7 +83,8 @@ final class TerminalSession: ObservableObject, Identifiable {
                     && !(0x202A...0x202E).contains(scalar.value)
                     && !(0x2066...0x2069).contains(scalar.value)
             }.map(String.init).joined()
-            title = value.isEmpty ? "Shell" : value
+            terminalTitle = value.isEmpty ? "Shell" : value
+            if customTitle == nil { title = terminalTitle }
         }
         if let pointer = frame.pointee.working_directory {
             let value = String(cString: pointer)
@@ -86,6 +97,12 @@ final class TerminalSession: ObservableObject, Identifiable {
                 }
             }
         }
+    }
+
+    func rename(to value: String) {
+        let cleaned = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        customTitle = cleaned.isEmpty ? nil : cleaned
+        title = customTitle ?? terminalTitle
     }
 
     func write(_ data: Data) {
@@ -144,12 +161,112 @@ final class TerminalSession: ObservableObject, Identifiable {
             ?? workingDirectory
     }
 
+    func fullOutput(for command: String) -> String? {
+        let normalized = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        return commandBlocks.last(where: { $0.command == normalized && !$0.output.isEmpty })?.output
+    }
+
+    private func refreshCapturedCommandOutput() {
+        guard let handle, !commandBlocks.isEmpty else { return }
+        let count = gt_session_command_output(handle, nil, 0)
+        guard count > 0 else { return }
+        var data = Data(count: count)
+        data.withUnsafeMutableBytes { bytes in
+            guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return }
+            _ = gt_session_command_output(handle, base, count)
+        }
+        commandBlocks[commandBlocks.count - 1].output = Self.cleanTerminalOutput(data)
+    }
+
+    static func cleanTerminalOutput(_ data: Data) -> String {
+        var value = String(decoding: data, as: UTF8.self)
+        value = value.replacingOccurrences(
+            of: "\\u001B\\][^\\u0007]*(?:\\u0007|\\u001B\\\\)",
+            with: "",
+            options: .regularExpression
+        )
+        value = value.replacingOccurrences(
+            of: "\\u001B\\[[0-?]*[ -/]*[@-~]",
+            with: "",
+            options: .regularExpression
+        )
+        value = value.replacingOccurrences(of: "\r\n", with: "\n")
+        value = value.replacingOccurrences(of: "\r", with: "\n")
+        var lines = value.components(separatedBy: "\n")
+        while lines.first?.isEmpty == true { lines.removeFirst() }
+        if !value.hasSuffix("\n"), !lines.isEmpty { lines.removeLast() }
+        while lines.last?.isEmpty == true { lines.removeLast() }
+        return lines.joined(separator: "\n")
+    }
+
     func scroll(rows: Int) {
         guard let handle, rows != 0 else { return }
         if gt_session_scroll(handle, rows) {
             revision &+= 1
             refreshFrame()
         }
+    }
+
+    func attachToAI(command: String, output: String, workingDirectory: String) {
+        aiAttachment = TerminalBlockAttachment(
+            command: command,
+            output: output,
+            workingDirectory: workingDirectory
+        )
+        isAIChatVisible = true
+        aiError = nil
+    }
+
+    func sendAIMessage(using settings: AISettings) {
+        let question = aiDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty, !isAIResponding else { return }
+        let provider = settings.provider
+        let connectionMode = settings.connectionMode(for: provider)
+        let apiKey: String
+        if connectionMode == .apiKey {
+            guard let savedKey = settings.apiKey(for: provider) else {
+                aiError = "Connect \(provider.title) from Settings first."
+                return
+            }
+            apiKey = savedKey
+        } else {
+            apiKey = ""
+        }
+
+        let message = AIChatMessage(role: .user, text: question, attachment: aiAttachment)
+        aiMessages.append(message)
+        aiDraft = ""
+        aiAttachment = nil
+        aiError = nil
+        isAIResponding = true
+        let history = aiMessages
+        let model = settings.selectedModel
+
+        Task { [weak self] in
+            do {
+                let answer = try await AIClient.send(
+                    provider: provider,
+                    connectionMode: connectionMode,
+                    model: model,
+                    apiKey: apiKey,
+                    messages: history,
+                    workingDirectory: self?.workingDirectory ?? FileManager.default.currentDirectoryPath
+                )
+                guard let self else { return }
+                self.aiMessages.append(AIChatMessage(role: .assistant, text: answer))
+                self.isAIResponding = false
+            } catch {
+                guard let self else { return }
+                self.aiError = error.localizedDescription
+                self.isAIResponding = false
+            }
+        }
+    }
+
+    func clearAIConversation() {
+        aiMessages.removeAll()
+        aiAttachment = nil
+        aiError = nil
     }
 
     func resize(cols: UInt16, rows: UInt16, cellWidth: UInt32, cellHeight: UInt32) {
@@ -189,6 +306,8 @@ final class TerminalStore: ObservableObject {
     private static let tabBarVisibilityKey = "isTabBarVisible"
 
     @Published var groups: [TerminalTabGroup] = []
+    let aiSettings = AISettings()
+    @Published var isSettingsVisible = false
     @Published var selectedGroupID: UUID?
     @Published var selectedID: UUID?
     @Published var tabOrientation: TabOrientation {
