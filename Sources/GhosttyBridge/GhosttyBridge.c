@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,8 @@ typedef void *GhosttyRenderState;
 typedef void *GhosttyRenderStateRowIterator;
 typedef void *GhosttyRenderStateRowCells;
 typedef int GhosttyResult;
+typedef uint64_t GhosttyCellRaw;
+typedef uint64_t GhosttyRowRaw;
 
 typedef struct { uint8_t r, g, b; } GhosttyColorRgb;
 typedef struct { uint8_t tag; union { uint8_t palette; GhosttyColorRgb rgb; } value; } GhosttyStyleColor;
@@ -31,6 +34,17 @@ typedef struct {
 } GhosttyStyle;
 typedef struct { uint8_t *ptr; size_t cap, len; } GhosttyBuffer;
 typedef struct { const uint8_t *ptr; size_t len; } GhosttyString;
+typedef struct { uint64_t total, offset, len; } GhosttyTerminalScrollbar;
+typedef union {
+    intptr_t delta;
+    size_t row;
+    intptr_t delta_prompt;
+    uint64_t padding[2];
+} GhosttyTerminalScrollViewportValue;
+typedef struct {
+    int tag;
+    GhosttyTerminalScrollViewportValue value;
+} GhosttyTerminalScrollViewport;
 typedef struct {
     size_t size;
     bool viewport_has_value;
@@ -54,11 +68,17 @@ enum {
     GHOSTTY_RENDER_STATE_DATA_CURSOR = 18,
     GHOSTTY_RENDER_STATE_DATA_COLORS = 19,
     GHOSTTY_RENDER_STATE_ROW_DATA_CELLS = 3,
+    GHOSTTY_RENDER_STATE_ROW_DATA_RAW = 2,
+    GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW = 1,
     GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE = 2,
     GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR = 5,
     GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR = 6,
     GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8 = 9,
     GHOSTTY_TERMINAL_DATA_TITLE = 12,
+    GHOSTTY_TERMINAL_DATA_SCROLLBAR = 9,
+    GHOSTTY_ROW_DATA_SEMANTIC_PROMPT = 6,
+    GHOSTTY_TERMINAL_SCROLL_VIEWPORT_BOTTOM = 1,
+    GHOSTTY_TERMINAL_SCROLL_VIEWPORT_DELTA = 2,
 };
 
 typedef struct {
@@ -80,6 +100,9 @@ typedef struct {
     void (*cells_free)(GhosttyRenderStateRowCells);
     bool (*cells_next)(GhosttyRenderStateRowCells);
     GhosttyResult (*cells_get)(GhosttyRenderStateRowCells, int, void *);
+    GhosttyResult (*cell_get)(GhosttyCellRaw, int, void *);
+    GhosttyResult (*screen_row_get)(GhosttyRowRaw, int, void *);
+    GhosttyResult (*terminal_scroll_viewport)(GhosttyTerminal, GhosttyTerminalScrollViewport);
 } GhosttyAPI;
 
 static GhosttyAPI api;
@@ -130,6 +153,9 @@ static void load_runtime(void) {
     LOAD(cells_free, "ghostty_render_state_row_cells_free");
     LOAD(cells_next, "ghostty_render_state_row_cells_next");
     LOAD(cells_get, "ghostty_render_state_row_cells_get");
+    LOAD(cell_get, "ghostty_cell_get");
+    LOAD(screen_row_get, "ghostty_row_get");
+    LOAD(terminal_scroll_viewport, "ghostty_terminal_scroll_viewport");
 }
 
 const char *gt_runtime_error(void) {
@@ -149,6 +175,8 @@ struct GTSession {
     GhosttyRenderStateRowCells cells;
     GTCell *cell_buffer;
     size_t cell_capacity;
+    uint8_t *row_semantics;
+    size_t row_capacity;
     char title[256];
     char working_directory[1024];
     GTFrame frame;
@@ -191,6 +219,10 @@ GTSession *gt_session_create(uint16_t cols, uint16_t rows, const char **error) {
     api.terminal_set(s->terminal, 12, &foreground);
     api.terminal_set(s->terminal, 13, &background);
     api.terminal_set(s->terminal, 14, &foreground);
+    size_t scrollback_bytes = 64 * 1024 * 1024;
+    size_t scrollback_lines = 100000;
+    api.terminal_set(s->terminal, 28, &scrollback_bytes);
+    api.terminal_set(s->terminal, 29, &scrollback_lines);
 
     struct winsize ws = {.ws_row = rows, .ws_col = cols, .ws_xpixel = 0, .ws_ypixel = 0};
     s->child = forkpty(&s->master_fd, NULL, NULL, &ws);
@@ -230,6 +262,7 @@ void gt_session_destroy(GTSession *s) {
     if (s->render) api.render_free(s->render);
     if (s->terminal) api.terminal_free(s->terminal);
     free(s->cell_buffer);
+    free(s->row_semantics);
     free(s);
 }
 
@@ -289,9 +322,23 @@ const GTFrame *gt_session_frame(GTSession *s) {
         s->cell_capacity = needed;
     }
     memset(s->cell_buffer, 0, needed * sizeof(GTCell));
+    if (rows > s->row_capacity) {
+        uint8_t *next = realloc(s->row_semantics, rows);
+        if (!next) return NULL;
+        s->row_semantics = next;
+        s->row_capacity = rows;
+    }
+    memset(s->row_semantics, 0, rows);
     if (api.render_get(s->render, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &s->rows) != GHOSTTY_SUCCESS) return NULL;
     uint16_t y = 0;
     while (y < rows && api.row_next(s->rows)) {
+        GhosttyRowRaw raw_row = 0;
+        if (api.row_get(s->rows, GHOSTTY_RENDER_STATE_ROW_DATA_RAW, &raw_row) == GHOSTTY_SUCCESS) {
+            int semantic = 0;
+            if (api.screen_row_get(raw_row, GHOSTTY_ROW_DATA_SEMANTIC_PROMPT, &semantic) == GHOSTTY_SUCCESS) {
+                s->row_semantics[y] = (uint8_t)semantic;
+            }
+        }
         if (api.row_get(s->rows, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &s->cells) != GHOSTTY_SUCCESS) { y++; continue; }
         uint16_t x = 0;
         while (x < cols && api.cells_next(s->cells)) {
@@ -299,8 +346,15 @@ const GTFrame *gt_session_frame(GTSession *s) {
             GhosttyBuffer text = {.ptr = out->text, .cap = sizeof(out->text), .len = 0};
             GhosttyStyle style = {0};
             GhosttyColorRgb fg = colors.foreground, bg = colors.background;
+            GhosttyCellRaw raw = 0;
             api.cells_get(s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &text);
             api.cells_get(s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style);
+            if (api.cells_get(s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw) == GHOSTTY_SUCCESS) {
+                int semantic = 0;
+                if (api.cell_get(raw, 9, &semantic) == GHOSTTY_SUCCESS) {
+                    out->semantic_content = (uint8_t)semantic;
+                }
+            }
             if (api.cells_get(s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, &fg) == GHOSTTY_NO_VALUE) fg = colors.foreground;
             if (api.cells_get(s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &bg) == GHOSTTY_NO_VALUE) bg = colors.background;
             if (style.flags & GT_STYLE_INVERSE) {
@@ -332,14 +386,19 @@ const GTFrame *gt_session_frame(GTSession *s) {
         s->working_directory[0] = 0;
     }
     GhosttyColorRgb cursor_color = colors.cursor_has_value ? colors.cursor : colors.foreground;
+    GhosttyTerminalScrollbar scrollbar = {0};
+    api.terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &scrollbar);
     s->frame = (GTFrame){
         .cols = cols, .rows = rows,
         .cursor_x = cursor.viewport_has_value ? cursor.viewport_x : 0,
         .cursor_y = cursor.viewport_has_value ? cursor.viewport_y : 0,
         .cursor_visible = cursor.viewport_has_value && cursor.visible,
         .cursor_r = cursor_color.r, .cursor_g = cursor_color.g, .cursor_b = cursor_color.b,
-        .cells = s->cell_buffer, .title = s->title,
+        .cells = s->cell_buffer, .row_semantics = s->row_semantics, .title = s->title,
         .working_directory = s->working_directory,
+        .scroll_total = scrollbar.total,
+        .scroll_offset = scrollbar.offset,
+        .scroll_length = scrollbar.len,
     };
     s->dirty = false;
     return &s->frame;
@@ -354,6 +413,53 @@ bool gt_session_write(GTSession *s, const uint8_t *bytes, size_t len) {
         else if (errno != EINTR) return false;
     }
     return true;
+}
+
+static void write_semantic_marker(GTSession *s, const char *marker) {
+    if (!s || !s->terminal || !marker) return;
+    api.terminal_write(s->terminal, (const uint8_t *)marker, strlen(marker));
+    s->dirty = true;
+}
+
+void gt_session_mark_input(GTSession *s) {
+    /* P marks the prompt at the current cursor. A would request a fresh line,
+       which is only appropriate when emitted by the shell before its prompt. */
+    write_semantic_marker(s, "\033]133;D\007\033]133;P\007\033]133;B\007");
+}
+
+void gt_session_mark_output(GTSession *s) {
+    /* The marker is injected directly into the parser while typed characters
+       are echoed asynchronously by the PTY. Drain that echo before changing
+       semantic state so the command remains tagged as input. */
+    if (s && s->master_fd >= 0) {
+        struct pollfd descriptor = {.fd = s->master_fd, .events = POLLIN};
+        if (poll(&descriptor, 1, 12) > 0 && (descriptor.revents & POLLIN)) {
+            gt_session_poll(s);
+        }
+    }
+    write_semantic_marker(s, "\033]133;C\007");
+}
+
+bool gt_session_scroll(GTSession *s, intptr_t rows) {
+    if (!s || !rows) return false;
+    GhosttyTerminalScrollViewport behavior = {
+        .tag = GHOSTTY_TERMINAL_SCROLL_VIEWPORT_DELTA,
+        .value = {.delta = rows},
+    };
+    bool ok = api.terminal_scroll_viewport(s->terminal, behavior) == GHOSTTY_SUCCESS;
+    s->dirty |= ok;
+    return ok;
+}
+
+bool gt_session_scroll_to_bottom(GTSession *s) {
+    if (!s) return false;
+    GhosttyTerminalScrollViewport behavior = {
+        .tag = GHOSTTY_TERMINAL_SCROLL_VIEWPORT_BOTTOM,
+        .value = {.delta = 0},
+    };
+    bool ok = api.terminal_scroll_viewport(s->terminal, behavior) == GHOSTTY_SUCCESS;
+    s->dirty |= ok;
+    return ok;
 }
 
 bool gt_session_resize(GTSession *s, uint16_t cols, uint16_t rows, uint32_t cw, uint32_t ch) {

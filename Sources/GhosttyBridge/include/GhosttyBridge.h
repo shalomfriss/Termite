@@ -27,7 +27,14 @@ typedef struct {
     uint8_t fg_r, fg_g, fg_b;
     uint8_t bg_r, bg_g, bg_b;
     uint16_t style;
+    uint8_t semantic_content;
 } GTCell;
+
+enum {
+    GT_SEMANTIC_OUTPUT = 0,
+    GT_SEMANTIC_INPUT = 1,
+    GT_SEMANTIC_PROMPT = 2,
+};
 
 typedef struct {
     uint16_t cols;
@@ -37,8 +44,12 @@ typedef struct {
     bool cursor_visible;
     uint8_t cursor_r, cursor_g, cursor_b;
     const GTCell *cells;
+    const uint8_t *row_semantics;
     const char *title;
     const char *working_directory;
+    uint64_t scroll_total;
+    uint64_t scroll_offset;
+    uint64_t scroll_length;
 } GTFrame;
 
 /** Load libghostty-vt. Returns NULL when available, otherwise an error string. */
@@ -55,6 +66,11 @@ bool gt_session_poll(GTSession *session);
 const GTFrame *gt_session_frame(GTSession *session);
 
 bool gt_session_write(GTSession *session, const uint8_t *bytes, size_t len);
+/** Mark frontend-observed shell input/output boundaries using OSC 133. */
+void gt_session_mark_input(GTSession *session);
+void gt_session_mark_output(GTSession *session);
+bool gt_session_scroll(GTSession *session, intptr_t rows);
+bool gt_session_scroll_to_bottom(GTSession *session);
 bool gt_session_resize(GTSession *session, uint16_t cols, uint16_t rows,
                        uint32_t cell_width_px, uint32_t cell_height_px);
 bool gt_session_is_running(GTSession *session);

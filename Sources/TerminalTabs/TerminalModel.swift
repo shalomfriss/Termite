@@ -3,6 +3,33 @@ import Combine
 import Foundation
 import GhosttyBridge
 
+struct TerminalCommandBlock: Equatable {
+    let command: String
+    let workingDirectory: String
+}
+
+struct CommandLineTracker {
+    private(set) var text = ""
+
+    mutating func append(_ data: Data) {
+        for byte in data {
+            switch byte {
+            case 0x7F, 0x08:
+                if !text.isEmpty { text.removeLast() }
+            case 0x20...0x7E:
+                text.append(Character(UnicodeScalar(byte)))
+            default:
+                break
+            }
+        }
+    }
+
+    mutating func submit() -> String {
+        defer { text = "" }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 @MainActor
 final class TerminalSession: ObservableObject, Identifiable {
     let id = UUID()
@@ -13,6 +40,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published var isRunning = true
     @Published var revision: UInt = 0
     let error: String?
+    private(set) var commandBlocks: [TerminalCommandBlock] = []
+    private var commandLine = CommandLineTracker()
+    private var isMarkingInput = false
 
     init(cols: UInt16 = 100, rows: UInt16 = 32) {
         var message: UnsafePointer<CChar>?
@@ -63,6 +93,62 @@ final class TerminalSession: ObservableObject, Identifiable {
         data.withUnsafeBytes { bytes in
             guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return }
             _ = gt_session_write(handle, base, data.count)
+        }
+    }
+
+    func sendUserInput(_ data: Data) {
+        guard let handle else { return }
+        _ = gt_session_scroll_to_bottom(handle)
+        var pending = Data()
+        for byte in data {
+            if byte == 0x0D || byte == 0x0A {
+                sendPendingInput(pending, handle: handle)
+                pending.removeAll(keepingCapacity: true)
+                submitCommand(byte, handle: handle)
+            } else {
+                pending.append(byte)
+            }
+        }
+        sendPendingInput(pending, handle: handle)
+    }
+
+    private func sendPendingInput(_ data: Data, handle: OpaquePointer) {
+        guard !data.isEmpty else { return }
+        if !isMarkingInput {
+            gt_session_mark_input(handle)
+            isMarkingInput = true
+            revision &+= 1
+        }
+        commandLine.append(data)
+        write(data)
+    }
+
+    private func submitCommand(_ byte: UInt8, handle: OpaquePointer) {
+        if isMarkingInput {
+            // Drain the PTY first so the shell's echoed command remains tagged as input.
+            if gt_session_poll(handle) { refreshFrame() }
+            let command = commandLine.submit()
+            if !command.isEmpty {
+                commandBlocks.append(.init(command: command, workingDirectory: workingDirectory))
+            }
+            gt_session_mark_output(handle)
+            revision &+= 1
+        }
+        isMarkingInput = false
+        write(Data([byte]))
+    }
+
+    func workingDirectory(for command: String) -> String {
+        let normalized = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        return commandBlocks.last(where: { $0.command == normalized })?.workingDirectory
+            ?? workingDirectory
+    }
+
+    func scroll(rows: Int) {
+        guard let handle, rows != 0 else { return }
+        if gt_session_scroll(handle, rows) {
+            revision &+= 1
+            refreshFrame()
         }
     }
 
