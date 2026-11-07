@@ -79,14 +79,12 @@ struct TerminalWindow: View {
             if store.isTabBarVisible && store.tabOrientation == .vertical {
                 HStack(spacing: 0) {
                     VerticalTabSidebar(store: store, rename: beginRename)
-                    Color.clear.frame(width: 20)
                     terminal
                 }
             } else {
                 VStack(spacing: 0) {
                     if store.isTabBarVisible {
                         HorizontalTabBar(store: store, rename: beginRename)
-                        Color.clear.frame(height: 20)
                     } else {
                         CompactTitleBar(store: store)
                     }
@@ -112,6 +110,7 @@ struct TerminalWindow: View {
         if let selected = store.selected {
             TerminalCanvas(session: selected)
                 .id(selected.id)
+                .padding(10)
         }
     }
 
