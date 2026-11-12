@@ -205,6 +205,23 @@ final class TerminalTabsTests: XCTestCase {
             } ?? 0
         }
         XCTAssertGreaterThan(navigatedImageCount, 0)
+
+        for _ in 0..<20 {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+        }
+        let frame = try XCTUnwrap(gt_session_frame(try XCTUnwrap(session.handle))).pointee
+        let visibleRows = (0..<Int(frame.rows)).map {
+            rowText(frame: frame, row: $0).trimmingCharacters(in: .whitespacesAndNewlines)
+        }.filter {
+            !$0.isEmpty
+        }
+        XCTAssertGreaterThanOrEqual(visibleRows.count, 2)
+        XCTAssertNotEqual(
+            visibleRows.last,
+            visibleRows.dropLast().last,
+            "Graphical navigation should not render duplicate prompt rows"
+        )
     }
 
     @MainActor
@@ -558,6 +575,16 @@ final class TerminalTabsTests: XCTestCase {
         }
         let after = try XCTUnwrap(gt_session_frame(handle)).pointee.cursor_y
         XCTAssertEqual(after, before)
+    }
+
+    private func rowText(frame: GTFrame, row: Int) -> String {
+        guard let cells = frame.cells, row >= 0, row < Int(frame.rows) else { return "" }
+        return (0..<Int(frame.cols)).map { column in
+            let cell = cells[row * Int(frame.cols) + column]
+            return withUnsafeBytes(of: cell.text) { raw in
+                String(decoding: raw.prefix(Int(cell.text_len)), as: UTF8.self)
+            }
+        }.joined()
     }
 
 }

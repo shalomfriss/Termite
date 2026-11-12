@@ -393,6 +393,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             if gt_session_poll(handle) { refreshFrame() }
             if URL(fileURLWithPath: shellWorkingDirectory).standardizedFileURL.path == target { break }
         }
+        await drainShellOutput(handle: handle)
 
         // Clear the transient echoed cd and prompt, then silently render the
         // equivalent ls result and restore one clean prompt underneath it.
@@ -401,6 +402,20 @@ final class TerminalSession: ObservableObject, Identifiable {
         if renderInlineFileListing(command: nil, request: request, handle: handle,
                                    clearShellInput: false) {
             write(Data([0x0D]))
+        }
+    }
+
+    private func drainShellOutput(handle: OpaquePointer) async {
+        var quietPolls = 0
+        for _ in 0..<20 {
+            try? await Task.sleep(for: .milliseconds(10))
+            if gt_session_poll(handle) {
+                quietPolls = 0
+                refreshFrame()
+            } else {
+                quietPolls += 1
+                if quietPolls >= 3 { return }
+            }
         }
     }
 
