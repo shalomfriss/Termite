@@ -278,6 +278,7 @@ final class TerminalTabsTests: XCTestCase {
         XCTAssertEqual(TerminalSession.fileListingPath(for: "ll", workingDirectory: cwd), cwd)
         XCTAssertEqual(TerminalSession.fileListingPath(for: "eza --icons", workingDirectory: cwd), cwd)
         XCTAssertEqual(TerminalSession.fileListingPath(for: "ez a", workingDirectory: cwd), cwd)
+        XCTAssertEqual(TerminalSession.fileListingPath(for: "lstr", workingDirectory: cwd), cwd)
         XCTAssertEqual(TerminalSession.fileListingPath(for: "lsd -la", workingDirectory: cwd), cwd)
         XCTAssertEqual(
             TerminalSession.fileListingPath(for: "tree Scripts", workingDirectory: cwd),
@@ -348,6 +349,37 @@ final class TerminalTabsTests: XCTestCase {
         XCTAssertEqual(executable?.path, "/bin/ls")
     }
 
+    func testLstrArgumentsPreserveListingLayoutOptions() {
+        let request = FileListingRequest(path: "/tmp/project", showsHidden: true, detailed: true)
+
+        let terminalArguments = TerminalSession.lstrArguments(
+            for: request,
+            terminalOutput: true
+        )
+        XCTAssertTrue(terminalArguments.contains("--permissions"))
+        XCTAssertTrue(terminalArguments.contains("--size"))
+        XCTAssertTrue(terminalArguments.contains("--all"))
+        XCTAssertFalse(terminalArguments.contains("json"))
+        XCTAssertEqual(terminalArguments.suffix(2), ["--", "/tmp/project"])
+
+        let graphicalArguments = TerminalSession.lstrArguments(
+            for: request,
+            terminalOutput: false
+        )
+        XCTAssertTrue(graphicalArguments.contains("--output"))
+        XCTAssertTrue(graphicalArguments.contains("json"))
+        XCTAssertTrue(graphicalArguments.contains("--dirs-first"))
+        XCTAssertTrue(graphicalArguments.contains("--natural-sort"))
+    }
+
+    func testLstrExecutableUsesConfiguredPath() {
+        let executable = TerminalSession.lstrExecutableURL(
+            environment: ["TERMINAL_TABS_LSTR_PATH": "/bin/ls", "PATH": ""],
+            currentDirectoryPath: "/tmp"
+        )
+        XCTAssertEqual(executable?.path, "/bin/ls")
+    }
+
     func testBundledEzaOrdersGraphicalDirectoryListing() throws {
         let executableURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appending(path: ".build/bin/eza")
@@ -380,6 +412,45 @@ final class TerminalTabsTests: XCTestCase {
         XCTAssertEqual(visible.items.map(\.name), ["..", "Sources", "Package.swift"])
 
         let all = try XCTUnwrap(TerminalSession.ezaDirectoryListing(
+            at: root.path,
+            showsHidden: true,
+            executableURL: executableURL
+        ))
+        XCTAssertTrue(all.items.contains(where: { $0.name == ".hidden" }))
+    }
+
+    func testBundledLstrOrdersGraphicalDirectoryListing() throws {
+        let executableURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appending(path: ".build/bin/lstr")
+        guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
+            throw XCTSkip("The bundled lstr executable has not been built.")
+        }
+
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "terminal-tabs-lstr-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appending(path: "Sources"),
+            withIntermediateDirectories: false
+        )
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: root.appending(path: "Package.swift").path,
+            contents: Data()
+        ))
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: root.appending(path: ".hidden").path,
+            contents: Data()
+        ))
+
+        let visible = try XCTUnwrap(TerminalSession.lstrDirectoryListing(
+            at: root.path,
+            showsHidden: false,
+            executableURL: executableURL
+        ))
+        XCTAssertEqual(visible.items.map(\.name), ["..", "Sources", "Package.swift"])
+
+        let all = try XCTUnwrap(TerminalSession.lstrDirectoryListing(
             at: root.path,
             showsHidden: true,
             executableURL: executableURL
@@ -492,6 +563,18 @@ final class TerminalTabsTests: XCTestCase {
         store.tabOrientation = .horizontal
         store.isTabBarVisible = true
         store.graphicalViewMode = .icons
+    }
+
+    @MainActor
+    func testListingBackendPropagatesToExistingAndNewTabs() {
+        let store = TerminalStore()
+        let originalBackend = store.listingBackend
+        defer { store.listingBackend = originalBackend }
+
+        store.listingBackend = .lstr
+        XCTAssertEqual(store.selected?.listingBackend, .lstr)
+        store.newTab()
+        XCTAssertEqual(store.selected?.listingBackend, .lstr)
     }
 
     @MainActor

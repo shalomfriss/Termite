@@ -49,6 +49,11 @@ struct GraphicalDirectoryListing: Equatable, Sendable {
     var isLoading: Bool
 }
 
+private struct LstrJSONNode: Decodable {
+    let name: String?
+    let contents: [LstrJSONNode]?
+}
+
 struct CommandLineTracker {
     private(set) var text = ""
 
@@ -89,6 +94,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published var graphicalMode = false
     @Published var tabAccentColor: NSColor?
     var graphicalViewMode: GraphicalViewMode = .icons
+    var listingBackend: ListingBackend = .eza
     let error: String?
     private var terminalTitle = "Shell"
     private var customTitle: String?
@@ -218,7 +224,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 let renderedListing = if graphicalMode {
                     renderInlineFileListing(command: command, request: request, handle: handle)
                 } else {
-                    renderEzaFileListing(command: command, request: request, handle: handle)
+                    renderFileListing(command: command, request: request, handle: handle)
                 }
                 if renderedListing {
                     isMarkingInput = false
@@ -361,6 +367,12 @@ final class TerminalSession: ObservableObject, Identifiable {
     func setGraphicalViewMode(_ mode: GraphicalViewMode, refresh: Bool = true) {
         guard graphicalViewMode != mode else { return }
         graphicalViewMode = mode
+        if refresh, graphicalMode { showCurrentDirectoryGraphically() }
+    }
+
+    func setListingBackend(_ backend: ListingBackend, refresh: Bool = true) {
+        guard listingBackend != backend else { return }
+        listingBackend = backend
         if refresh, graphicalMode { showCurrentDirectoryGraphically() }
     }
 
@@ -519,7 +531,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         let name = URL(fileURLWithPath: executable).lastPathComponent
         let listingCommands: Set<String> = [
             "ls", "ll", "la", "l", "lt", "gls", "colorls", "lsd",
-            "eza", "exa", "tree", "dir", "vdir",
+            "eza", "exa", "lstr", "tree", "dir", "vdir",
         ]
         let splitEza = name == "ez" && words.dropFirst().first == "a"
         guard listingCommands.contains(name) || splitEza else { return nil }
@@ -610,10 +622,13 @@ final class TerminalSession: ObservableObject, Identifiable {
         handle: OpaquePointer,
         clearShellInput: Bool = true
     ) -> Bool {
-        let listing = Self.ezaDirectoryListing(
-            at: request.path,
-            showsHidden: request.showsHidden
-        ) ?? Self.directoryListing(at: request.path)
+        let backendListing: GraphicalDirectoryListing? = switch listingBackend {
+        case .eza:
+            Self.ezaDirectoryListing(at: request.path, showsHidden: request.showsHidden)
+        case .lstr:
+            Self.lstrDirectoryListing(at: request.path, showsHidden: request.showsHidden)
+        }
+        let listing = backendListing ?? Self.directoryListing(at: request.path)
         guard listing.error == nil else {
             currentGraphicalListing = nil
             return false
@@ -670,15 +685,15 @@ final class TerminalSession: ObservableObject, Identifiable {
         return true
     }
 
-    private func renderEzaFileListing(
+    private func renderFileListing(
         command: String,
         request: FileListingRequest,
         handle: OpaquePointer
     ) -> Bool {
-        guard let output = Self.ezaOutput(
+        guard let output = Self.listingOutput(
             for: request,
             terminalColumns: terminalColumns,
-            terminalOutput: true
+            backend: listingBackend
         ) else { return false }
 
         write(Data([0x15]))
@@ -1002,22 +1017,90 @@ final class TerminalSession: ObservableObject, Identifiable {
         )
     }
 
+    nonisolated static func lstrDirectoryListing(
+        at path: String,
+        showsHidden: Bool,
+        executableURL: URL? = lstrExecutableURL()
+    ) -> GraphicalDirectoryListing? {
+        guard let executableURL else { return nil }
+        let request = FileListingRequest(path: path, showsHidden: showsHidden, detailed: false)
+        guard let output = lstrOutput(
+            for: request,
+            terminalOutput: false,
+            executableURL: executableURL
+        ), let root = try? JSONDecoder().decode(LstrJSONNode.self, from: output) else {
+            return nil
+        }
+
+        let fallback = directoryListing(at: path)
+        guard fallback.error == nil else { return fallback }
+        let visibleItems = fallback.items.filter {
+            showsHidden || !$0.name.hasPrefix(".") || $0.name == ".."
+        }
+        var itemsByName = Dictionary(uniqueKeysWithValues: visibleItems.map { ($0.name, $0) })
+        var orderedItems: [GraphicalFileItem] = []
+        if let parent = itemsByName.removeValue(forKey: "..") {
+            orderedItems.append(parent)
+        }
+        for node in root.contents ?? [] {
+            guard let name = node.name, let item = itemsByName.removeValue(forKey: name) else {
+                continue
+            }
+            orderedItems.append(item)
+        }
+        orderedItems.append(contentsOf: itemsByName.values.sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        })
+        return GraphicalDirectoryListing(
+            path: fallback.path,
+            items: orderedItems,
+            error: nil,
+            isLoading: false
+        )
+    }
+
     nonisolated static func ezaExecutableURL(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         currentDirectoryPath: String = FileManager.default.currentDirectoryPath
     ) -> URL? {
+        executableURL(
+            named: "eza",
+            configuredBy: "TERMINAL_TABS_EZA_PATH",
+            environment: environment,
+            currentDirectoryPath: currentDirectoryPath
+        )
+    }
+
+    nonisolated static func lstrExecutableURL(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        currentDirectoryPath: String = FileManager.default.currentDirectoryPath
+    ) -> URL? {
+        executableURL(
+            named: "lstr",
+            configuredBy: "TERMINAL_TABS_LSTR_PATH",
+            environment: environment,
+            currentDirectoryPath: currentDirectoryPath
+        )
+    }
+
+    nonisolated private static func executableURL(
+        named executableName: String,
+        configuredBy environmentKey: String,
+        environment: [String: String],
+        currentDirectoryPath: String
+    ) -> URL? {
         var candidates: [URL] = []
-        if let configuredPath = environment["TERMINAL_TABS_EZA_PATH"],
+        if let configuredPath = environment[environmentKey],
            !configuredPath.isEmpty {
             candidates.append(URL(fileURLWithPath: configuredPath))
         }
         candidates.append(
             URL(fileURLWithPath: currentDirectoryPath, isDirectory: true)
-                .appending(path: ".build/bin/eza")
+                .appending(path: ".build/bin/\(executableName)")
         )
         if let path = environment["PATH"] {
             candidates.append(contentsOf: path.split(separator: ":").map {
-                URL(fileURLWithPath: String($0), isDirectory: true).appending(path: "eza")
+                URL(fileURLWithPath: String($0), isDirectory: true).appending(path: executableName)
             })
         }
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
@@ -1036,6 +1119,42 @@ final class TerminalSession: ObservableObject, Identifiable {
             terminalOutput: terminalOutput
         )
 
+        return executableOutput(at: executableURL, arguments: arguments)
+    }
+
+    nonisolated static func lstrOutput(
+        for request: FileListingRequest,
+        terminalOutput: Bool,
+        executableURL: URL? = lstrExecutableURL()
+    ) -> Data? {
+        guard let executableURL else { return nil }
+        return executableOutput(
+            at: executableURL,
+            arguments: lstrArguments(for: request, terminalOutput: terminalOutput)
+        )
+    }
+
+    nonisolated static func listingOutput(
+        for request: FileListingRequest,
+        terminalColumns: Int,
+        backend: ListingBackend
+    ) -> Data? {
+        switch backend {
+        case .eza:
+            ezaOutput(
+                for: request,
+                terminalColumns: terminalColumns,
+                terminalOutput: true
+            )
+        case .lstr:
+            lstrOutput(for: request, terminalOutput: true)
+        }
+    }
+
+    nonisolated private static func executableOutput(
+        at executableURL: URL,
+        arguments: [String]
+    ) -> Data? {
         let process = Process()
         let output = Pipe()
         process.executableURL = executableURL
@@ -1068,6 +1187,27 @@ final class TerminalSession: ObservableObject, Identifiable {
             arguments.append("--width=\(max(1, terminalColumns))")
         } else {
             arguments.append(contentsOf: ["--oneline", "--absolute=on", "--no-quotes"])
+        }
+        if request.showsHidden { arguments.append("--all") }
+        arguments.append(contentsOf: ["--", request.path])
+        return arguments
+    }
+
+    nonisolated static func lstrArguments(
+        for request: FileListingRequest,
+        terminalOutput: Bool
+    ) -> [String] {
+        var arguments = [
+            "--color", terminalOutput ? "always" : "never",
+            "--dirs-first",
+            "--natural-sort",
+            "--level", "1",
+        ]
+        if terminalOutput, request.detailed {
+            arguments.append(contentsOf: ["--permissions", "--size"])
+        }
+        if !terminalOutput {
+            arguments.append(contentsOf: ["--output", "json"])
         }
         if request.showsHidden { arguments.append("--all") }
         arguments.append(contentsOf: ["--", request.path])
@@ -1293,6 +1433,7 @@ final class TerminalStore: ObservableObject {
     private static let tabBarVisibilityKey = "isTabBarVisible"
     private static let graphicalModeKey = "graphicalMode"
     private static let graphicalViewModeKey = "graphicalViewMode"
+    private static let listingBackendKey = "listingBackend"
     private static let autocolorTabsKey = "autocolorTabs"
     private static let automaticTabColors = [
         NSColor(srgbRed: 0.55, green: 0.39, blue: 0.48, alpha: 1),
@@ -1333,6 +1474,14 @@ final class TerminalStore: ObservableObject {
             }
         }
     }
+    @Published var listingBackend: ListingBackend {
+        didSet {
+            UserDefaults.standard.set(listingBackend.rawValue, forKey: Self.listingBackendKey)
+            for tab in groups.lazy.flatMap(\.tabs) {
+                tab.setListingBackend(listingBackend)
+            }
+        }
+    }
     private var timer: Timer?
     private var lastAutomaticTabColorIndex: Int?
 
@@ -1354,6 +1503,9 @@ final class TerminalStore: ObservableObject {
         graphicalViewMode = GraphicalViewMode(
             rawValue: UserDefaults.standard.string(forKey: Self.graphicalViewModeKey) ?? ""
         ) ?? .icons
+        listingBackend = ListingBackend(
+            rawValue: UserDefaults.standard.string(forKey: Self.listingBackendKey) ?? ""
+        ) ?? .eza
         newGroup()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
@@ -1472,6 +1624,7 @@ final class TerminalStore: ObservableObject {
     private func makeTab() -> TerminalSession {
         let tab = TerminalSession()
         tab.setGraphicalViewMode(graphicalViewMode, refresh: false)
+        tab.setListingBackend(listingBackend, refresh: false)
         tab.setGraphicalMode(graphicalMode)
         guard autocolorTabs else { return tab }
 

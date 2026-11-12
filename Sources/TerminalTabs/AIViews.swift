@@ -177,54 +177,74 @@ struct AppSettingsView: View {
                 Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
             }
 
-            GroupBox("Tabs") {
-                VStack(alignment: .leading, spacing: 10) {
-                    Picker("Orientation", selection: $store.tabOrientation) {
-                        Text("Horizontal").tag(TabOrientation.horizontal)
-                        Text("Vertical").tag(TabOrientation.vertical)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    GroupBox("Tabs") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Picker("Orientation", selection: $store.tabOrientation) {
+                                Text("Horizontal").tag(TabOrientation.horizontal)
+                                Text("Vertical").tag(TabOrientation.vertical)
+                            }
+                            .pickerStyle(.segmented)
+                            Toggle("Show tab bar", isOn: $store.isTabBarVisible)
+                            Toggle("Autocolor tabs", isOn: $store.autocolorTabs)
+                        }
+                        .padding(8)
                     }
-                    .pickerStyle(.segmented)
-                    Toggle("Show tab bar", isOn: $store.isTabBarVisible)
-                    Toggle("Autocolor tabs", isOn: $store.autocolorTabs)
-                }
-                .padding(8)
-            }
 
-            GroupBox("AI connections") {
-                VStack(spacing: 14) {
-                    credentialRow(
-                        provider: .openAI,
-                        connected: settings.openAIConnected,
-                        loggedIn: settings.openAILoggedIn,
-                        connectionMode: $settings.openAIConnectionMode,
-                        key: $openAIKey,
-                        model: $settings.openAIModel,
-                        placeholder: "OpenAI API key"
-                    )
-                    Divider()
-                    credentialRow(
-                        provider: .anthropic,
-                        connected: settings.anthropicConnected,
-                        loggedIn: settings.anthropicLoggedIn,
-                        connectionMode: $settings.anthropicConnectionMode,
-                        key: $anthropicKey,
-                        model: $settings.anthropicModel,
-                        placeholder: "Anthropic API key"
-                    )
-                }
-                .padding(8)
-            }
+                    GroupBox("Directory listings") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Picker("Backend", selection: $store.listingBackend) {
+                                ForEach(ListingBackend.allCases) { backend in
+                                    Text(backend.title).tag(backend)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            Text(store.listingBackend.detail)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(8)
+                    }
 
-            Text("Sign-in mode uses the official Codex or Claude Code login and its eligible subscription. API-key mode is billed separately, with keys stored in macOS Keychain.")
-                .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
-            if let error { Text(error).font(.system(size: 10)).foregroundStyle(.red) }
-            if let message = settings.loginStatusMessage {
-                Text(message).font(.system(size: 10)).foregroundStyle(.secondary)
+                    GroupBox("AI connections") {
+                        VStack(spacing: 14) {
+                            credentialRow(
+                                provider: .openAI,
+                                connected: settings.openAIConnected,
+                                loggedIn: settings.openAILoggedIn,
+                                connectionMode: $settings.openAIConnectionMode,
+                                key: $openAIKey,
+                                model: $settings.openAIModel,
+                                placeholder: "OpenAI API key"
+                            )
+                            Divider()
+                            credentialRow(
+                                provider: .anthropic,
+                                connected: settings.anthropicConnected,
+                                loggedIn: settings.anthropicLoggedIn,
+                                connectionMode: $settings.anthropicConnectionMode,
+                                key: $anthropicKey,
+                                model: $settings.anthropicModel,
+                                placeholder: "Anthropic API key"
+                            )
+                        }
+                        .padding(8)
+                    }
+
+                    Text("Sign-in mode uses the official Codex or Claude Code login and its eligible subscription. API-key mode is billed separately, with keys stored in macOS Keychain.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                    if let error { Text(error).font(.system(size: 10)).foregroundStyle(.red) }
+                    if let message = settings.loginStatusMessage {
+                        Text(message).font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity)
             }
         }
         .padding(22)
-        .frame(width: 500, height: 500)
+        .frame(width: 500, height: 560)
         .background(TerminalTheme.backdrop)
         .task { await settings.refreshLoginStatus() }
     }
