@@ -1393,6 +1393,24 @@ final class TerminalSession: ObservableObject, Identifiable {
 enum TabOrientation: String, CaseIterable {
     case horizontal
     case vertical
+
+    var panelTitle: String {
+        switch self {
+        case .horizontal: "Top Panel"
+        case .vertical: "Side Panel"
+        }
+    }
+
+    var panelName: String {
+        panelTitle.lowercased()
+    }
+
+    var panelSystemImage: String {
+        switch self {
+        case .horizontal: "rectangle.topthird.inset.filled"
+        case .vertical: "sidebar.left"
+        }
+    }
 }
 
 struct TerminalTabGroup: Identifiable {
@@ -1509,6 +1527,10 @@ final class TerminalStore: ObservableObject {
 
     var selected: TerminalSession? {
         groups.lazy.flatMap(\.tabs).first { $0.id == selectedID }
+    }
+
+    var tabPanelVisibilityActionTitle: String {
+        "\(isTabBarVisible ? "Hide" : "Show") \(tabOrientation.panelTitle)"
     }
 
     func setGraphicalMode(_ enabled: Bool) {

@@ -676,10 +676,14 @@ final class TerminalTabsTests: XCTestCase {
         store.graphicalViewMode = .list
         XCTAssertEqual(store.tabOrientation, .vertical)
         XCTAssertFalse(store.isTabBarVisible)
+        XCTAssertEqual(store.tabPanelVisibilityActionTitle, "Show Side Panel")
+        XCTAssertEqual(store.tabOrientation.panelSystemImage, "sidebar.left")
         XCTAssertEqual(store.selected?.graphicalViewMode, .list)
         store.tabOrientation = .horizontal
         store.isTabBarVisible = true
         store.graphicalViewMode = .icons
+        XCTAssertEqual(store.tabPanelVisibilityActionTitle, "Hide Top Panel")
+        XCTAssertEqual(store.tabOrientation.panelSystemImage, "rectangle.topthird.inset.filled")
     }
 
     @MainActor
