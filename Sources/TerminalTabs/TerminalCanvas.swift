@@ -50,13 +50,26 @@ final class TerminalNSView: NSView,
     private var contextGraphicalItem: GraphicalFileItem?
     private var selectedBlockHistoryRow: UInt64?
     private var selectedGraphicalPlacementID: UInt32?
+    private var hoveredGraphicalPlacementID: UInt32?
     private var imageHitTargets: [ImageHitTarget] = []
+    private var graphicalTrackingArea: NSTrackingArea?
     private var imageCache: [UInt32: CGImage] = [:]
     private var folderBloomCache: [UInt32: CGImage] = [:]
     private var selectionGlowCache: [String: CGImage] = [:]
     private var quickLookURL: URL?
     private var sharingPicker: NSSharingServicePicker?
     private let ciContext = CIContext(options: [.cacheIntermediates: true])
+    private lazy var graphicalBackdropGradient: CGGradient? = {
+        let colors = [
+            NSColor(srgbRed: 0.15, green: 0.55, blue: 0.59, alpha: 0.15).cgColor,
+            NSColor(srgbRed: 0.02, green: 0.12, blue: 0.15, alpha: 0).cgColor,
+        ] as CFArray
+        return CGGradient(
+            colorsSpace: CGColorSpaceCreateDeviceRGB(),
+            colors: colors,
+            locations: [0, 1]
+        )
+    }()
 
     init(
         session: TerminalSession,
@@ -143,6 +156,33 @@ final class TerminalNSView: NSView,
         for target in imageHitTargets {
             addCursorRect(target.rect, cursor: .pointingHand)
         }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let graphicalTrackingArea { removeTrackingArea(graphicalTrackingArea) }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.activeInKeyWindow, .inVisibleRect, .mouseMoved, .mouseEnteredAndExited],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        graphicalTrackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let hovered = imageHitTargets.last(where: { $0.rect.contains(point) })?.placementID
+        guard hovered != hoveredGraphicalPlacementID else { return }
+        hoveredGraphicalPlacementID = hovered
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        guard hoveredGraphicalPlacementID != nil else { return }
+        hoveredGraphicalPlacementID = nil
+        needsDisplay = true
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -250,8 +290,12 @@ final class TerminalNSView: NSView,
         let frame = framePointer.pointee
         guard let cells = frame.cells else { return }
         let context = NSGraphicsContext.current?.cgContext
-        context?.setFillColor(NSColor(red: 0.024, green: 0.067, blue: 0.094, alpha: 1).cgColor)
-        context?.fill(bounds)
+        if session.graphicalMode {
+            drawGraphicalBackdrop(in: context)
+        } else {
+            context?.setFillColor(NSColor(red: 0.024, green: 0.067, blue: 0.094, alpha: 1).cgColor)
+            context?.fill(bounds)
+        }
 
         let ranges = blockRanges(frame: frame, cells: cells)
         let rowOffsets = Array(repeating: CGFloat.zero, count: Int(frame.rows))
@@ -271,6 +315,8 @@ final class TerminalNSView: NSView,
             (isSelected ? selectedSeparator : blockSeparator).setFill()
             NSRect(x: 0, y: rect.maxY - 1, width: bounds.width, height: 1).fill()
         }
+        updateGraphicalHitTargets(frame, rowOffsets: rowOffsets)
+        drawGraphicalItemSurfaces()
 
         for y in 0..<Int(frame.rows) {
             let isInBlock = ranges.contains { $0.contains(y) }
@@ -280,7 +326,9 @@ final class TerminalNSView: NSView,
                                   y: CGFloat(y) * cellHeight + rowOffsets[y],
                                   width: cellWidth + 0.5, height: cellHeight)
                 let hasDefaultBackground = cell.bg_r == 6 && cell.bg_g == 17 && cell.bg_b == 24
-                if !isInBlock || !hasDefaultBackground {
+                let shouldDrawBackground = !hasDefaultBackground
+                    || (!session.graphicalMode && !isInBlock)
+                if shouldDrawBackground {
                     color(cell.bg_r, cell.bg_g, cell.bg_b).setFill()
                     rect.fill()
                 }
@@ -307,9 +355,8 @@ final class TerminalNSView: NSView,
             }
         }
 
-        // Images must be composited after terminal cell backgrounds. A freshly
-        // navigated directory is not always part of a semantic command block,
-        // so drawing images first lets the normal background pass cover them.
+        // Keep labels crisp by painting the item surfaces before terminal text,
+        // then composite the antialiased icons over the completed cell grid.
         drawImages(frame, rowOffsets: rowOffsets)
 
         if frame.cursor_visible {
@@ -342,61 +389,121 @@ final class TerminalNSView: NSView,
         )
     }
 
-    private func drawImages(_ frame: GTFrame, rowOffsets: [CGFloat]) {
+    private func drawGraphicalBackdrop(in context: CGContext?) {
+        guard let context else { return }
+        let base = NSColor(srgbRed: 0.020, green: 0.052, blue: 0.069, alpha: 1)
+        context.setFillColor(base.cgColor)
+        context.fill(bounds)
+
+        guard let graphicalBackdropGradient else { return }
+        let radius = max(bounds.width, bounds.height) * 0.82
+        context.drawRadialGradient(
+            graphicalBackdropGradient,
+            startCenter: CGPoint(x: bounds.minX + bounds.width * 0.18, y: bounds.minY),
+            startRadius: 0,
+            endCenter: CGPoint(x: bounds.minX + bounds.width * 0.18, y: bounds.minY),
+            endRadius: radius,
+            options: [.drawsAfterEndLocation]
+        )
+    }
+
+    private func updateGraphicalHitTargets(_ frame: GTFrame, rowOffsets: [CGFloat]) {
         let previousTargets = imageHitTargets
-        var nextTargets: [ImageHitTarget] = []
-        guard let images = frame.images, frame.image_count > 0 else {
+        guard session.graphicalMode, let images = frame.images, frame.image_count > 0 else {
             imageHitTargets = []
             selectedGraphicalPlacementID = nil
+            hoveredGraphicalPlacementID = nil
             invalidateCursorRectsIfChanged(from: previousTargets)
             return
         }
+
+        imageHitTargets = (0..<Int(frame.image_count)).compactMap { index in
+            let placement = images[index]
+            guard placement.placement_id != 0 else { return nil }
+            let imageRect = imageRect(for: placement, rowOffsets: rowOffsets)
+            let layout = session.graphicalItemHitLayout(for: placement.placement_id)
+            let tileStartX = max(6, imageRect.minX - cellWidth * CGFloat(layout.0))
+            return ImageHitTarget(
+                placementID: placement.placement_id,
+                rect: NSRect(
+                    x: tileStartX,
+                    y: imageRect.minY,
+                    width: min(
+                        cellWidth * CGFloat(layout.1),
+                        max(0, bounds.maxX - 8 - tileStartX)
+                    ),
+                    height: cellHeight * CGFloat(layout.2)
+                )
+            )
+        }
+
+        if let selectedGraphicalPlacementID,
+           !imageHitTargets.contains(where: { $0.placementID == selectedGraphicalPlacementID }) {
+            self.selectedGraphicalPlacementID = nil
+        }
+        if let hoveredGraphicalPlacementID,
+           !imageHitTargets.contains(where: { $0.placementID == hoveredGraphicalPlacementID }) {
+            self.hoveredGraphicalPlacementID = nil
+        }
+        invalidateCursorRectsIfChanged(from: previousTargets)
+    }
+
+    private func drawGraphicalItemSurfaces() {
+        guard session.graphicalMode else { return }
+        for target in imageHitTargets {
+            if target.placementID == selectedGraphicalPlacementID {
+                drawGraphicalSelection(in: target.rect)
+            } else if target.placementID == hoveredGraphicalPlacementID {
+                drawGraphicalHover(in: target.rect)
+            }
+        }
+    }
+
+    private func imageRect(for placement: GTImage, rowOffsets: [CGFloat]) -> NSRect {
+        let placementRow = Int(placement.viewport_row)
+        let rowOffset = rowOffsets.indices.contains(placementRow) ? rowOffsets[placementRow] : 0
+        return NSRect(
+            x: CGFloat(placement.viewport_col) * cellWidth
+                + CGFloat(placement.cell_offset_x)
+                + 10,
+            y: CGFloat(placement.viewport_row) * cellHeight
+                + CGFloat(placement.cell_offset_y)
+                + rowOffset,
+            width: CGFloat(placement.pixel_width),
+            height: CGFloat(placement.pixel_height)
+        )
+    }
+
+    private func drawImages(_ frame: GTFrame, rowOffsets: [CGFloat]) {
+        guard let images = frame.images, frame.image_count > 0 else { return }
         for index in 0..<Int(frame.image_count) {
             let placement = images[index]
             guard let cgImage = cachedImage(for: placement) else { continue }
             let displayedImage = folderBloomImage(for: placement, baseImage: cgImage) ?? cgImage
-            let placementRow = Int(placement.viewport_row)
-            let rowOffset = rowOffsets.indices.contains(placementRow) ? rowOffsets[placementRow] : 0
-
-            let rect = NSRect(
-                x: CGFloat(placement.viewport_col) * cellWidth
-                    + CGFloat(placement.cell_offset_x)
-                    + 10,
-                y: CGFloat(placement.viewport_row) * cellHeight
-                    + CGFloat(placement.cell_offset_y)
-                    + rowOffset,
-                width: CGFloat(placement.pixel_width),
-                height: CGFloat(placement.pixel_height)
-            )
-            if placement.placement_id != 0 {
-                let layout = session.graphicalItemHitLayout(for: placement.placement_id)
-                let tileStartX = max(0, rect.minX - cellWidth * CGFloat(layout.0))
-                let tileRect = NSRect(
-                    x: tileStartX,
-                    y: rect.minY,
-                    width: min(cellWidth * CGFloat(layout.1), bounds.maxX - tileStartX),
-                    height: cellHeight * CGFloat(layout.2)
-                )
-                if selectedGraphicalPlacementID == placement.placement_id {
-                    drawGraphicalSelection(in: tileRect)
-                }
-                nextTargets.append(.init(placementID: placement.placement_id, rect: tileRect))
-            }
+            let rect = imageRect(for: placement, rowOffsets: rowOffsets)
             NSImage(cgImage: displayedImage, size: rect.size).draw(
                 in: rect,
                 from: .zero,
                 operation: .sourceOver,
                 fraction: 1,
                 respectFlipped: true,
-                hints: [.interpolation: NSImageInterpolation.none]
+                hints: [.interpolation: NSImageInterpolation.high]
             )
         }
-        imageHitTargets = nextTargets
-        if let selectedGraphicalPlacementID,
-           !nextTargets.contains(where: { $0.placementID == selectedGraphicalPlacementID }) {
-            self.selectedGraphicalPlacementID = nil
-        }
-        invalidateCursorRectsIfChanged(from: previousTargets)
+    }
+
+    private func drawGraphicalHover(in rect: NSRect) {
+        let highlight = rect.insetBy(dx: 3, dy: 2)
+        let path = NSBezierPath(
+            roundedRect: highlight,
+            xRadius: 8,
+            yRadius: 8
+        )
+        NSColor.white.withAlphaComponent(0.055).setFill()
+        path.fill()
+        NSColor.white.withAlphaComponent(0.10).setStroke()
+        path.lineWidth = 1
+        path.stroke()
     }
 
     private func drawGraphicalSelection(in rect: NSRect) {
@@ -415,12 +522,20 @@ final class TerminalNSView: NSView,
             )
         }
 
-        let turquoise = NSColor(srgbRed: 0.38, green: 0.96, blue: 0.90, alpha: 0.92)
+        let fill = NSColor(srgbRed: 0.24, green: 0.78, blue: 0.78, alpha: 0.14)
+        fill.setFill()
+        NSBezierPath(
+            roundedRect: highlight,
+            xRadius: 8,
+            yRadius: 8
+        ).fill()
+
+        let turquoise = NSColor(srgbRed: 0.43, green: 0.95, blue: 0.91, alpha: 0.94)
         turquoise.setStroke()
         let border = NSBezierPath(
             roundedRect: highlight.insetBy(dx: 0.5, dy: 0.5),
-            xRadius: 5.5,
-            yRadius: 5.5
+            xRadius: 7.5,
+            yRadius: 7.5
         )
         border.lineWidth = 1
         border.stroke()
@@ -498,8 +613,8 @@ final class TerminalNSView: NSView,
         guard let filter = CIFilter(name: "CIBloom") else { return nil }
         let input = CIImage(cgImage: baseImage)
         filter.setValue(input, forKey: kCIInputImageKey)
-        filter.setValue(2.2, forKey: kCIInputRadiusKey)
-        filter.setValue(0.72, forKey: kCIInputIntensityKey)
+        filter.setValue(1.4, forKey: kCIInputRadiusKey)
+        filter.setValue(0.34, forKey: kCIInputIntensityKey)
         guard let output = filter.outputImage?.cropped(to: input.extent),
               let image = ciContext.createCGImage(output, from: input.extent) else { return nil }
         folderBloomCache[placement.image_id] = image
