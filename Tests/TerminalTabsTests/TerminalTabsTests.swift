@@ -484,6 +484,91 @@ final class TerminalTabsTests: XCTestCase {
     }
 
     @MainActor
+    func testGraphicalFolderMenuMatchesFinderActions() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "terminal-tabs-menu-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let session = TerminalSession(cols: 40, rows: 10)
+        let view = TerminalNSView(session: session)
+
+        let menu = view.graphicalItemMenu(for: GraphicalFileItem(
+            path: root.path,
+            name: root.lastPathComponent,
+            kind: .directory
+        ))
+        let titles = Set(menu.items.map(\.title))
+
+        XCTAssertTrue(titles.contains("Open"))
+        XCTAssertTrue(titles.contains("Open in New Tab"))
+        XCTAssertTrue(titles.contains("Show in Finder"))
+        XCTAssertTrue(titles.contains("Get Info"))
+        XCTAssertTrue(titles.contains("Rename"))
+        XCTAssertTrue(titles.contains("Compress “\(root.lastPathComponent)”"))
+        XCTAssertTrue(titles.contains("Duplicate"))
+        XCTAssertTrue(titles.contains("Quick Look"))
+        XCTAssertTrue(titles.contains("Copy"))
+        XCTAssertTrue(titles.contains("Paste Item"))
+        XCTAssertTrue(titles.contains("Share"))
+        XCTAssertTrue(titles.contains("Move to Trash"))
+        XCTAssertFalse(titles.contains("Open With"))
+    }
+
+    @MainActor
+    func testParentFolderMenuOmitsDestructiveActions() {
+        let session = TerminalSession(cols: 40, rows: 10)
+        let view = TerminalNSView(session: session)
+        let parent = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .deletingLastPathComponent()
+        let menu = view.graphicalItemMenu(for: GraphicalFileItem(
+            path: parent.path,
+            name: "..",
+            kind: .directory
+        ))
+        let titles = Set(menu.items.map(\.title))
+
+        XCTAssertFalse(titles.contains("Rename"))
+        XCTAssertFalse(titles.contains("Duplicate"))
+        XCTAssertFalse(titles.contains("Move to Trash"))
+        XCTAssertFalse(titles.contains(where: { $0.hasPrefix("Compress") }))
+    }
+
+    func testGraphicalFolderRenameAndArchiveDestination() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "terminal-tabs-operations-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let original = root.appending(path: "Original", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: original, withIntermediateDirectories: false)
+
+        let renamed = try GraphicalFileOperations.rename(original, to: "Renamed")
+        XCTAssertEqual(renamed.lastPathComponent, "Renamed")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: renamed.path))
+        XCTAssertThrowsError(try GraphicalFileOperations.rename(renamed, to: ".hidden"))
+
+        let firstArchive = GraphicalFileOperations.archiveDestination(for: renamed)
+        try Data().write(to: firstArchive)
+        XCTAssertEqual(
+            GraphicalFileOperations.archiveDestination(for: renamed).lastPathComponent,
+            "Renamed 2.zip"
+        )
+    }
+
+    func testGraphicalFolderCompressionCreatesZipArchive() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "terminal-tabs-compress-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let folder = root.appending(path: "Folder", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("contents".utf8).write(to: folder.appending(path: "file.txt"))
+
+        let archive = try await GraphicalFileOperations.compress(folder)
+
+        XCTAssertEqual(archive.lastPathComponent, "Folder.zip")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: archive.path))
+    }
+
+    @MainActor
     func testWorkingDirectoryTracksShellChanges() throws {
         if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
         let session = TerminalSession(cols: 40, rows: 10)
@@ -499,6 +584,26 @@ final class TerminalTabsTests: XCTestCase {
             session.poll()
         }
         XCTAssertTrue(expected.contains(session.workingDirectory), "actual cwd: \(session.workingDirectory)")
+    }
+
+    @MainActor
+    func testTerminalSessionStartsInRequestedDirectory() throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "terminal-tabs-start-directory-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let session = TerminalSession(cols: 40, rows: 10, workingDirectory: root.path)
+
+        for _ in 0..<50 {
+            usleep(20_000)
+            session.poll()
+        }
+
+        XCTAssertEqual(
+            URL(fileURLWithPath: session.workingDirectory).resolvingSymlinksInPath().path,
+            root.resolvingSymlinksInPath().path
+        )
     }
 
     func testCommandLineTrackerHandlesTypingAndBackspace() {

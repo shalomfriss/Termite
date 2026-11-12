@@ -1,23 +1,31 @@
 import AppKit
 import CoreImage
 import GhosttyBridge
+import QuickLookUI
 import SwiftUI
 import UniformTypeIdentifiers
 
 struct TerminalCanvas: NSViewRepresentable {
     @ObservedObject var session: TerminalSession
+    let openDirectoryInNewTab: (URL) -> Void
 
     func makeNSView(context: Context) -> TerminalNSView {
-        TerminalNSView(session: session)
+        TerminalNSView(
+            session: session,
+            openDirectoryInNewTab: openDirectoryInNewTab
+        )
     }
 
     func updateNSView(_ view: TerminalNSView, context: Context) {
         view.session = session
+        view.openDirectoryInNewTab = openDirectoryInNewTab
         view.needsDisplay = true
     }
 }
 
-final class TerminalNSView: NSView {
+final class TerminalNSView: NSView,
+    @MainActor QLPreviewPanelDataSource,
+    @MainActor QLPreviewPanelDelegate {
     private struct BlockContents {
         let command: String
         let output: String
@@ -30,6 +38,7 @@ final class TerminalNSView: NSView {
     }
 
     var session: TerminalSession
+    var openDirectoryInNewTab: (URL) -> Void
     private let font = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
     private let boldFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .semibold)
     private let italicFont: NSFont
@@ -45,10 +54,16 @@ final class TerminalNSView: NSView {
     private var imageCache: [UInt32: CGImage] = [:]
     private var folderBloomCache: [UInt32: CGImage] = [:]
     private var selectionGlowCache: [String: CGImage] = [:]
+    private var quickLookURL: URL?
+    private var sharingPicker: NSSharingServicePicker?
     private let ciContext = CIContext(options: [.cacheIntermediates: true])
 
-    init(session: TerminalSession) {
+    init(
+        session: TerminalSession,
+        openDirectoryInNewTab: @escaping (URL) -> Void = { _ in }
+    ) {
         self.session = session
+        self.openDirectoryInNewTab = openDirectoryInNewTab
         let descriptor = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular).fontDescriptor
             .withSymbolicTraits(.italic)
         italicFont = NSFont(descriptor: descriptor, size: 14) ?? font
@@ -149,27 +164,11 @@ final class TerminalNSView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         if let target = imageHitTargets.last(where: { $0.rect.contains(point) }),
            let item = session.graphicalItem(for: target.placementID) {
-            contextGraphicalItem = item
+            selectedBlockHistoryRow = nil
+            selectedGraphicalPlacementID = target.placementID
+            needsDisplay = true
             contextBlock = nil
-            let menu = NSMenu()
-            menu.addItem(menuItem("Open", action: #selector(openGraphicalItem), enabled: true))
-            menu.addItem(openWithMenuItem(for: item))
-            menu.addItem(menuItem("Copy", action: #selector(copyGraphicalItem), enabled: true))
-            menu.addItem(menuItem(
-                "Paste",
-                action: #selector(pasteGraphicalItem),
-                enabled: NSPasteboard.general.canReadObject(
-                    forClasses: [NSURL.self],
-                    options: [.urlReadingFileURLsOnly: true]
-                )
-            ))
-            menu.addItem(.separator())
-            menu.addItem(menuItem(
-                "Attach Directory Listing to AI Chat",
-                action: #selector(attachOutputToAI),
-                enabled: session.canAttachGraphicalOutputToAI
-            ))
-            return menu
+            return graphicalItemMenu(for: item)
         }
 
         contextGraphicalItem = nil
@@ -213,6 +212,34 @@ final class TerminalNSView: NSView {
             return
         }
         if let data = TerminalInput.sequence(for: event) { session.sendUserInput(data) }
+    }
+
+    nonisolated override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
+        MainActor.assumeIsolated { quickLookURL != nil }
+    }
+
+    nonisolated override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        MainActor.assumeIsolated {
+            panel.dataSource = self
+            panel.delegate = self
+            panel.reloadData()
+        }
+    }
+
+    nonisolated override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        MainActor.assumeIsolated {
+            panel.dataSource = nil
+            panel.delegate = nil
+            quickLookURL = nil
+        }
+    }
+
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
+        quickLookURL == nil ? 0 : 1
+    }
+
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> any QLPreviewItem {
+        (quickLookURL ?? URL(fileURLWithPath: "/")) as NSURL
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -512,6 +539,100 @@ final class TerminalNSView: NSView {
         return item
     }
 
+    func graphicalItemMenu(for item: GraphicalFileItem) -> NSMenu {
+        contextGraphicalItem = item
+        if session.graphicalItemIsDirectory(item) {
+            return folderMenu(for: item)
+        }
+        return fileMenu(for: item)
+    }
+
+    private func folderMenu(for item: GraphicalFileItem) -> NSMenu {
+        let menu = NSMenu()
+        let canModify = item.name != ".." && item.path != "/"
+
+        menu.addItem(menuItem("Open", action: #selector(openGraphicalItem), enabled: true))
+        menu.addItem(menuItem(
+            "Open in New Tab",
+            action: #selector(openGraphicalFolderInNewTab),
+            enabled: true
+        ))
+        menu.addItem(menuItem(
+            "Show in Finder",
+            action: #selector(showGraphicalItemInFinder),
+            enabled: true
+        ))
+        menu.addItem(.separator())
+        menu.addItem(menuItem("Get Info", action: #selector(showGraphicalItemInfo), enabled: true))
+        if canModify {
+            menu.addItem(menuItem("Rename", action: #selector(renameGraphicalItem), enabled: true))
+            menu.addItem(menuItem(
+                "Compress “\(item.name)”",
+                action: #selector(compressGraphicalItem),
+                enabled: true
+            ))
+            menu.addItem(menuItem("Duplicate", action: #selector(duplicateGraphicalItem), enabled: true))
+        }
+        menu.addItem(menuItem("Quick Look", action: #selector(quickLookGraphicalItem), enabled: true))
+        menu.addItem(.separator())
+        menu.addItem(menuItem("Copy", action: #selector(copyGraphicalItem), enabled: true))
+        menu.addItem(menuItem(
+            "Paste Item",
+            action: #selector(pasteGraphicalItem),
+            enabled: canPasteFiles
+        ))
+        menu.addItem(shareMenuItem(for: item))
+        menu.addItem(.separator())
+        menu.addItem(menuItem(
+            "Attach Directory Listing to AI Chat",
+            action: #selector(attachOutputToAI),
+            enabled: session.canAttachGraphicalOutputToAI
+        ))
+        if canModify {
+            menu.addItem(.separator())
+            menu.addItem(menuItem(
+                "Move to Trash",
+                action: #selector(moveGraphicalItemToTrash),
+                enabled: true
+            ))
+        }
+        return menu
+    }
+
+    private func fileMenu(for item: GraphicalFileItem) -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(menuItem("Open", action: #selector(openGraphicalItem), enabled: true))
+        menu.addItem(openWithMenuItem(for: item))
+        menu.addItem(menuItem("Copy", action: #selector(copyGraphicalItem), enabled: true))
+        menu.addItem(menuItem(
+            "Paste",
+            action: #selector(pasteGraphicalItem),
+            enabled: canPasteFiles
+        ))
+        menu.addItem(.separator())
+        menu.addItem(menuItem(
+            "Attach Directory Listing to AI Chat",
+            action: #selector(attachOutputToAI),
+            enabled: session.canAttachGraphicalOutputToAI
+        ))
+        return menu
+    }
+
+    private var canPasteFiles: Bool {
+        NSPasteboard.general.canReadObject(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        )
+    }
+
+    private func shareMenuItem(for item: GraphicalFileItem) -> NSMenuItem {
+        let picker = NSSharingServicePicker(items: [URL(fileURLWithPath: item.path)])
+        sharingPicker = picker
+        let shareItem = picker.standardShareMenuItem
+        shareItem.title = "Share"
+        return shareItem
+    }
+
     func openWithMenuItem(for item: GraphicalFileItem) -> NSMenuItem {
         let parentItem = NSMenuItem(title: "Open With", action: nil, keyEquivalent: "")
         let submenu = NSMenu(title: "Open With")
@@ -582,6 +703,111 @@ final class TerminalNSView: NSView {
     @objc private func openGraphicalItem() {
         guard let contextGraphicalItem else { return }
         session.activateGraphicalItem(contextGraphicalItem)
+    }
+
+    @objc private func openGraphicalFolderInNewTab() {
+        guard let contextGraphicalItem,
+              session.graphicalItemIsDirectory(contextGraphicalItem) else { return }
+        openDirectoryInNewTab(URL(fileURLWithPath: contextGraphicalItem.path, isDirectory: true))
+    }
+
+    @objc private func showGraphicalItemInFinder() {
+        guard let contextGraphicalItem else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([
+            URL(fileURLWithPath: contextGraphicalItem.path),
+        ])
+    }
+
+    @objc private func showGraphicalItemInfo() {
+        guard let contextGraphicalItem else { return }
+        let url = URL(fileURLWithPath: contextGraphicalItem.path)
+        let kind = session.graphicalItemIsDirectory(contextGraphicalItem) ? "Folder" : "File"
+        let size = Int64(clamping: contextGraphicalItem.size).formatted(.byteCount(style: .file))
+        let modified = contextGraphicalItem.modified.formatted(date: .abbreviated, time: .shortened)
+        let alert = NSAlert()
+        alert.messageText = "“\(contextGraphicalItem.name)” Info"
+        alert.informativeText = """
+        Kind: \(kind)
+        Size: \(size)
+        Modified: \(modified)
+        Permissions: \(contextGraphicalItem.permissions)
+        Where: \(url.deletingLastPathComponent().path)
+        """
+        alert.icon = NSWorkspace.shared.icon(forFile: url.path)
+        alert.addButton(withTitle: "OK")
+        present(alert)
+    }
+
+    @objc private func renameGraphicalItem() {
+        guard let contextGraphicalItem, let window else { return }
+        let source = URL(fileURLWithPath: contextGraphicalItem.path)
+        let field = NSTextField(string: contextGraphicalItem.name)
+        field.frame = NSRect(x: 0, y: 0, width: 320, height: 24)
+        field.selectText(nil)
+
+        let alert = NSAlert()
+        alert.messageText = "Rename “\(contextGraphicalItem.name)”"
+        alert.informativeText = "Enter a new name for this folder."
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn, let self else { return }
+            do {
+                _ = try GraphicalFileOperations.rename(source, to: field.stringValue)
+                self.session.showCurrentDirectoryGraphically()
+            } catch {
+                self.presentOperationError(error)
+            }
+        }
+    }
+
+    @objc private func compressGraphicalItem() {
+        guard let contextGraphicalItem else { return }
+        let source = URL(fileURLWithPath: contextGraphicalItem.path)
+        Task { @MainActor [weak self] in
+            do {
+                _ = try await GraphicalFileOperations.compress(source)
+                self?.session.showCurrentDirectoryGraphically()
+            } catch {
+                self?.presentOperationError(error)
+            }
+        }
+    }
+
+    @objc private func duplicateGraphicalItem() {
+        guard let contextGraphicalItem else { return }
+        let source = URL(fileURLWithPath: contextGraphicalItem.path)
+        Task { @MainActor [weak self] in
+            do {
+                _ = try await NSWorkspace.shared.duplicate([source])
+                self?.session.showCurrentDirectoryGraphically()
+            } catch {
+                self?.presentOperationError(error)
+            }
+        }
+    }
+
+    @objc private func quickLookGraphicalItem() {
+        guard let contextGraphicalItem else { return }
+        quickLookURL = URL(fileURLWithPath: contextGraphicalItem.path)
+        focusTerminal()
+        guard let panel = QLPreviewPanel.shared() else { return }
+        panel.updateController()
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func moveGraphicalItemToTrash() {
+        guard let contextGraphicalItem else { return }
+        let source = URL(fileURLWithPath: contextGraphicalItem.path)
+        Task { @MainActor [weak self] in
+            do {
+                _ = try await NSWorkspace.shared.recycle([source])
+                self?.session.showCurrentDirectoryGraphically()
+            } catch {
+                self?.presentOperationError(error)
+            }
+        }
     }
 
     @objc private func openGraphicalItemWithApplication(_ sender: NSMenuItem) {
@@ -655,6 +881,18 @@ final class TerminalNSView: NSView {
         guard let value else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(value, forType: .string)
+    }
+
+    private func present(_ alert: NSAlert) {
+        if let window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
+    }
+
+    private func presentOperationError(_ error: any Error) {
+        present(NSAlert(error: error))
     }
 
     private func blockRanges(frame: GTFrame, cells: UnsafePointer<GTCell>) -> [Range<Int>] {

@@ -247,6 +247,11 @@ static void set_error(const char **out, const char *message) {
 }
 
 GTSession *gt_session_create(uint16_t cols, uint16_t rows, const char **error) {
+    return gt_session_create_at(cols, rows, NULL, error);
+}
+
+GTSession *gt_session_create_at(uint16_t cols, uint16_t rows,
+                                const char *working_directory, const char **error) {
     const char *load_error = gt_runtime_error();
     if (load_error) { set_error(error, load_error); return NULL; }
     GTSession *s = calloc(1, sizeof(*s));
@@ -280,6 +285,10 @@ GTSession *gt_session_create(uint16_t cols, uint16_t rows, const char **error) {
         return NULL;
     }
     if (s->child == 0) {
+        if (working_directory) {
+            if (chdir(working_directory) != 0) _exit(126);
+            setenv("PWD", working_directory, 1);
+        }
         const char *shell = getenv("SHELL");
         if (!shell || !shell[0]) shell = "/bin/zsh";
         const char *name = strrchr(shell, '/');

@@ -151,7 +151,12 @@ struct TerminalWorkspace: View {
             }
             .padding(.horizontal, 6)
 
-            TerminalCanvas(session: session)
+            TerminalCanvas(
+                session: session,
+                openDirectoryInNewTab: { directory in
+                    store.newTab(startingIn: directory.path)
+                }
+            )
                 .id(session.id)
             if session.isAIChatVisible {
                 AIConversationPanel(session: session, settings: settings)

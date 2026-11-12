@@ -109,13 +109,33 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var graphicalHitLayoutsByPlacementID: [UInt32: GraphicalHitLayout] = [:]
     private var currentGraphicalListing: GraphicalDirectoryListing?
 
-    init(cols: UInt16 = 100, rows: UInt16 = 32) {
+    init(
+        cols: UInt16 = 100,
+        rows: UInt16 = 32,
+        workingDirectory initialWorkingDirectory: String? = nil
+    ) {
         tabAccentColor = nil
+        let initialDirectory = initialWorkingDirectory.map {
+            URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL.path
+        }
         var message: UnsafePointer<CChar>?
-        handle = gt_session_create(cols, rows, &message)
+        if let initialDirectory {
+            handle = initialDirectory.withCString {
+                gt_session_create_at(cols, rows, $0, &message)
+            }
+        } else {
+            handle = gt_session_create(cols, rows, &message)
+        }
         error = message.map(String.init(cString:))
         isRunning = handle != nil
         refreshFrame()
+        if let initialDirectory {
+            // The child may not have completed its chdir when the first frame is
+            // captured. Keep the requested directory until shell output provides
+            // an authoritative working directory on a later poll.
+            workingDirectory = initialDirectory
+            shellWorkingDirectory = initialDirectory
+        }
     }
 
     isolated deinit {
@@ -1528,25 +1548,25 @@ final class TerminalStore: ObservableObject {
         graphicalMode = enabled
     }
 
-    func newGroup() {
+    func newGroup(startingIn directory: String? = nil) {
         let usedNumbers = Set(groups.compactMap { group -> Int? in
             guard group.name.hasPrefix("Group ") else { return nil }
             return Int(group.name.dropFirst("Group ".count))
         })
         let number = (1...).first { !usedNumbers.contains($0) } ?? groups.count + 1
-        let tab = makeTab()
+        let tab = makeTab(startingIn: directory)
         let group = TerminalTabGroup(name: "Group \(number)", tabs: [tab])
         groups.append(group)
         selectedGroupID = group.id
         selectedID = tab.id
     }
 
-    func newTab(in groupID: UUID? = nil) {
+    func newTab(in groupID: UUID? = nil, startingIn directory: String? = nil) {
         guard let index = groupIndex(for: groupID ?? selectedGroupID) else {
-            newGroup()
+            newGroup(startingIn: directory)
             return
         }
-        let tab = makeTab()
+        let tab = makeTab(startingIn: directory)
         groups[index].tabs.append(tab)
         groups[index].isCollapsed = false
         selectedGroupID = groups[index].id
@@ -1621,8 +1641,8 @@ final class TerminalStore: ObservableObject {
         selectedID = tabs[index].id
     }
 
-    private func makeTab() -> TerminalSession {
-        let tab = TerminalSession()
+    private func makeTab(startingIn directory: String? = nil) -> TerminalSession {
+        let tab = TerminalSession(workingDirectory: directory)
         tab.setGraphicalViewMode(graphicalViewMode, refresh: false)
         tab.setListingBackend(listingBackend, refresh: false)
         tab.setGraphicalMode(graphicalMode)
