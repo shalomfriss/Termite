@@ -186,7 +186,10 @@ struct AppSettingsView: View {
                                 Text("Vertical").tag(TabOrientation.vertical)
                             }
                             .pickerStyle(.segmented)
-                            Toggle("Show tab bar", isOn: $store.isTabBarVisible)
+                            Toggle(
+                                "Show \(store.tabOrientation.panelName)",
+                                isOn: $store.isTabBarVisible
+                            )
                             Toggle("Autocolor tabs", isOn: $store.autocolorTabs)
                         }
                         .padding(8)

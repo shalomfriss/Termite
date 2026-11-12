@@ -56,7 +56,7 @@ struct TerminalTabsApp: App {
                 }
             }
             CommandMenu("Tab Layout") {
-                Button(store.isTabBarVisible ? "Hide Tab Bar" : "Show Tab Bar") {
+                Button(store.tabPanelVisibilityActionTitle) {
                     store.isTabBarVisible.toggle()
                 }
                 .keyboardShortcut("b", modifiers: [.command, .shift])
@@ -206,6 +206,12 @@ struct HorizontalTabBar: View {
                     store.newTab()
                 }
                 TabSettingsMenu(store: store)
+                SmallIconButton(
+                    systemName: store.tabOrientation.panelSystemImage,
+                    help: "Hide top panel"
+                ) {
+                    store.isTabBarVisible = false
+                }
                 Spacer(minLength: 8)
             }
             .frame(height: 38)
@@ -250,6 +256,12 @@ struct VerticalTabSidebar: View {
                 }
                 TabSettingsMenu(store: store)
                 Spacer()
+                SmallIconButton(
+                    systemName: store.tabOrientation.panelSystemImage,
+                    help: "Hide side panel"
+                ) {
+                    store.isTabBarVisible = false
+                }
             }
             .padding(.horizontal, 8)
             .frame(height: 42)
@@ -321,7 +333,21 @@ struct CompactTitleBar: View {
     @ObservedObject var store: TerminalStore
 
     var body: some View {
-        HStack {
+        HStack(spacing: 6) {
+            Spacer().frame(width: 76)
+            Button(
+                store.tabPanelVisibilityActionTitle,
+                systemImage: store.tabOrientation.panelSystemImage
+            ) {
+                store.isTabBarVisible = true
+            }
+            .buttonStyle(.plain)
+            .font(.callout)
+            .foregroundStyle(TerminalTheme.cyanMuted)
+            .padding(.horizontal, 8)
+            .frame(height: 28)
+            .background(TerminalTheme.raised.opacity(0.62), in: .rect(cornerRadius: 7))
+            .help(store.tabPanelVisibilityActionTitle)
             Spacer()
             TabSettingsMenu(store: store)
             Spacer().frame(width: 8)
@@ -377,14 +403,12 @@ struct TabSettingsMenu: View {
     @ObservedObject var store: TerminalStore
 
     var body: some View {
-        Button {
+        Button("Settings", systemImage: "gearshape") {
             store.isSettingsVisible = true
-        } label: {
-            Image(systemName: "gearshape")
-                .frame(width: 28, height: 28)
         }
+        .labelStyle(.iconOnly)
         .buttonStyle(.plain)
-        .frame(width: 28)
+        .frame(width: 28, height: 28)
         .foregroundStyle(TerminalTheme.cyanMuted)
         .help("Settings")
     }
@@ -396,12 +420,11 @@ struct SmallIconButton: View {
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 12, weight: .semibold))
-                .frame(width: 28, height: 28)
-                .contentShape(Rectangle())
-        }
+        Button(help, systemImage: systemName, action: action)
+        .labelStyle(.iconOnly)
+        .font(.system(size: 12, weight: .semibold))
+        .frame(width: 28, height: 28)
+        .contentShape(Rectangle())
         .buttonStyle(.plain)
         .foregroundStyle(TerminalTheme.cyanMuted)
         .help(help)
