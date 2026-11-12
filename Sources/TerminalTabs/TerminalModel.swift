@@ -680,8 +680,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         func append(_ value: String) { output.append(contentsOf: value.utf8) }
         if let command { append(command + "\r\n") }
         for (kind, imageID) in imageIDs {
-            let pixels = Self.iconPixels(for: kind)
-            append("\u{1B}_Ga=t,f=32,s=16,v=16,i=\(imageID),q=2;")
+            let pixels = GraphicalFileIcon.pixels(for: kind)
+            append("\u{1B}_Ga=t,f=32,s=\(GraphicalFileIcon.pixelSize),v=\(GraphicalFileIcon.pixelSize),i=\(imageID),q=2;")
             append(pixels.base64EncodedString())
             append("\u{1B}\\")
         }
@@ -699,7 +699,9 @@ final class TerminalSession: ObservableObject, Identifiable {
                 renderColumnListing(items, imageIDs: imageIDs, append: append)
             }
         }
-        if items.isEmpty { append("(empty directory)\r\n") }
+        if items.isEmpty {
+            append("\r\n\u{1B}[38;2;112;139;151m  No items in this folder\u{1B}[0m\r\n")
+        }
 
         feedTerminalOutput(output, handle: handle)
         return true
@@ -732,9 +734,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         imageIDs: [GraphicalFileItem.Kind: UInt32],
         append: (String) -> Void
     ) {
-        let tileWidth = 8
-        let labelWidth = 7
+        let tileWidth = 10
+        let labelWidth = 9
         let outerMarginColumns = 1
+        let iconWidth = 4
+        let iconHeight = 2
         let usableColumns = max(tileWidth, terminalColumns - outerMarginColumns * 2)
         let itemsPerRow = max(1, usableColumns / tileWidth)
 
@@ -749,18 +753,18 @@ final class TerminalSession: ObservableObject, Identifiable {
                 let placementID = nextGraphicalPlacementID
                 nextGraphicalPlacementID &+= 1
                 let tileStart = outerMarginColumns + index * tileWidth
-                let iconOffset = (tileWidth - 2) / 2
+                let iconOffset = (tileWidth - iconWidth) / 2
                 let iconColumn = tileStart + iconOffset
                 graphicalItemsByPlacementID[placementID] = item
                 graphicalHitLayoutsByPlacementID[placementID] = GraphicalHitLayout(
                     leadingColumns: iconOffset,
                     widthColumns: tileWidth,
-                    rowHeight: 1 + labelRowCount
+                    rowHeight: iconHeight + labelRowCount
                 )
                 append("\u{1B}[\(iconColumn + 1)G")
-                append("\u{1B}_Ga=p,i=\(imageID),p=\(placementID),c=2,r=1,C=1,q=2\u{1B}\\")
+                append("\u{1B}_Ga=p,i=\(imageID),p=\(placementID),c=\(iconWidth),r=\(iconHeight),C=1,q=2\u{1B}\\")
             }
-            append("\r\n")
+            for _ in 0..<iconHeight { append("\r\n") }
             for labelRow in 0..<labelRowCount {
                 for (index, item) in rowItems.enumerated() where labelRow < labels[index].count {
                     let line = labels[index][labelRow]
@@ -788,7 +792,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             nextGraphicalPlacementID &+= 1
             graphicalItemsByPlacementID[placementID] = item
             graphicalHitLayoutsByPlacementID[placementID] = GraphicalHitLayout(
-                leadingColumns: 0,
+                leadingColumns: iconColumn,
                 widthColumns: max(1, terminalColumns - 2),
                 rowHeight: 1
             )
@@ -850,7 +854,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             nextGraphicalPlacementID &+= 1
             graphicalItemsByPlacementID[placementID] = item
             graphicalHitLayoutsByPlacementID[placementID] = GraphicalHitLayout(
-                leadingColumns: 0,
+                leadingColumns: iconColumn,
                 widthColumns: max(1, terminalColumns - 2),
                 rowHeight: 1
             )
@@ -894,52 +898,11 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     nonisolated static func labelColor(for kind: GraphicalFileItem.Kind) -> String {
         switch kind {
-        case .directory: "\u{1B}[38;2;255;184;30m"
-        case .executable: "\u{1B}[38;2;89;209;99m"
-        case .symbolicLink: "\u{1B}[38;2;82;214;224m"
-        case .file: "\u{1B}[38;2;210;225;234m"
+        case .directory: "\u{1B}[38;2;151;226;228m"
+        case .executable: "\u{1B}[38;2;142;219;166m"
+        case .symbolicLink: "\u{1B}[38;2;144;187;225m"
+        case .file: "\u{1B}[38;2;204;218;226m"
         }
-    }
-
-    nonisolated static func iconPixels(for kind: GraphicalFileItem.Kind) -> Data {
-        let size = 16
-        var pixels = [UInt8](repeating: 0, count: size * size * 4)
-        func fill(_ x: Range<Int>, _ y: Range<Int>, _ color: (UInt8, UInt8, UInt8, UInt8)) {
-            for row in y where row >= 0 && row < size {
-                for column in x where column >= 0 && column < size {
-                    let offset = (row * size + column) * 4
-                    pixels[offset] = color.0
-                    pixels[offset + 1] = color.1
-                    pixels[offset + 2] = color.2
-                    pixels[offset + 3] = color.3
-                }
-            }
-        }
-        switch kind {
-        case .directory:
-            fill(2..<15, 5..<15, (112, 61, 5, 210))
-            fill(2..<8, 2..<5, (255, 205, 67, 255))
-            fill(1..<14, 4..<14, (220, 125, 8, 255))
-            fill(2..<14, 5..<8, (255, 207, 66, 255))
-            fill(2..<14, 8..<11, (255, 177, 24, 255))
-            fill(2..<14, 11..<13, (225, 126, 7, 255))
-            fill(3..<13, 5..<6, (255, 239, 158, 230))
-            fill(13..<14, 6..<13, (159, 82, 2, 255))
-        case .file:
-            fill(3..<13, 1..<15, (190, 205, 216, 255))
-            fill(9..<13, 1..<5, (232, 240, 245, 255))
-            fill(5..<11, 7..<8, (91, 113, 128, 255))
-            fill(5..<11, 10..<11, (91, 113, 128, 255))
-        case .executable:
-            fill(3..<13, 1..<15, (105, 195, 112, 255))
-            fill(5..<11, 7..<8, (28, 92, 48, 255))
-            fill(5..<11, 10..<11, (28, 92, 48, 255))
-        case .symbolicLink:
-            fill(2..<9, 4..<7, (72, 196, 220, 255))
-            fill(7..<14, 9..<12, (72, 196, 220, 255))
-            fill(6..<10, 7..<9, (72, 196, 220, 255))
-        }
-        return Data(pixels)
     }
 
     nonisolated static func directoryListing(at path: String) -> GraphicalDirectoryListing {
@@ -1339,6 +1302,10 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     var canAttachGraphicalOutputToAI: Bool {
         currentGraphicalListing != nil
+    }
+
+    var graphicalItemCount: Int? {
+        currentGraphicalListing?.items.count
     }
 
     func attachGraphicalOutputToAI() {

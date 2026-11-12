@@ -246,8 +246,20 @@ final class TerminalTabsTests: XCTestCase {
         let firstImage = try XCTUnwrap(frame.images).pointee
         let hitLayout = session.graphicalItemHitLayout(for: firstImage.placement_id)
         XCTAssertEqual(hitLayout.0, 3)
-        XCTAssertEqual(hitLayout.1, 8)
-        XCTAssertLessThanOrEqual(hitLayout.2, 3)
+        XCTAssertEqual(hitLayout.1, 10)
+        XCTAssertLessThanOrEqual(hitLayout.2, 4)
+    }
+
+    @MainActor
+    func testGraphicalFileIconsUseHighResolutionSymbols() {
+        let kinds: [GraphicalFileItem.Kind] = [.directory, .file, .executable, .symbolicLink]
+        for kind in kinds {
+            let pixels = GraphicalFileIcon.pixels(for: kind)
+            XCTAssertEqual(pixels.count, GraphicalFileIcon.pixelSize * GraphicalFileIcon.pixelSize * 4)
+            XCTAssertTrue(stride(from: 3, to: pixels.count, by: 4).contains {
+                pixels[pixels.index(pixels.startIndex, offsetBy: $0)] > 0
+            })
+        }
     }
 
     @MainActor

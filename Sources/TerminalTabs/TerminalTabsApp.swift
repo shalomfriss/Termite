@@ -138,18 +138,12 @@ struct TerminalWorkspace: View {
     @ObservedObject var settings: AISettings
 
     var body: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 8) {
-                Toggle(isOn: $store.graphicalMode) {
-                    Label("Graphical mode", systemImage: "square.grid.2x2")
-                        .font(.callout)
-                }
-                .toggleStyle(.checkbox)
-                .help("Show the current directory as clickable inline graphics")
-                Spacer()
-                GraphicalViewPicker(selection: $store.graphicalViewMode)
-            }
-            .padding(.horizontal, 6)
+        VStack(spacing: 9) {
+            GraphicalModeToolbar(
+                session: session,
+                isEnabled: $store.graphicalMode,
+                viewMode: $store.graphicalViewMode
+            )
 
             TerminalCanvas(
                 session: session,
@@ -157,7 +151,24 @@ struct TerminalWorkspace: View {
                     store.newTab(startingIn: directory.path)
                 }
             )
-                .id(session.id)
+            .id(session.id)
+            .clipShape(.rect(cornerRadius: 13))
+            .overlay {
+                RoundedRectangle(cornerRadius: 13)
+                    .stroke(
+                        store.graphicalMode
+                            ? TerminalTheme.cyan.opacity(0.22)
+                            : Color.white.opacity(0.06),
+                        lineWidth: 1
+                    )
+            }
+            .shadow(
+                color: store.graphicalMode
+                    ? TerminalTheme.cyan.opacity(0.08)
+                    : TerminalTheme.canvas.opacity(0.32),
+                radius: 18,
+                y: 8
+            )
             if session.isAIChatVisible {
                 AIConversationPanel(session: session, settings: settings)
             }
