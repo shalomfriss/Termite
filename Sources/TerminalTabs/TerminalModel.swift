@@ -87,6 +87,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published var isAIResponding = false
     @Published var aiError: String?
     @Published var graphicalMode = false
+    @Published var tabAccentColor: NSColor?
+    var graphicalViewMode: GraphicalViewMode = .icons
     let error: String?
     private var terminalTitle = "Shell"
     private var customTitle: String?
@@ -99,8 +101,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var nextGraphicalPlacementID: UInt32 = 1
     private var graphicalItemsByPlacementID: [UInt32: GraphicalFileItem] = [:]
     private var graphicalHitLayoutsByPlacementID: [UInt32: GraphicalHitLayout] = [:]
+    private var currentGraphicalListing: GraphicalDirectoryListing?
 
     init(cols: UInt16 = 100, rows: UInt16 = 32) {
+        tabAccentColor = nil
         var message: UnsafePointer<CChar>?
         handle = gt_session_create(cols, rows, &message)
         error = message.map(String.init(cString:))
@@ -190,6 +194,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func submitCommand(_ byte: UInt8, handle: OpaquePointer) {
+        var directoryChangeTarget: String?
         if isMarkingInput {
             // Drain the PTY first so the shell's echoed command remains tagged as input.
             if gt_session_poll(handle) { refreshFrame() }
@@ -201,15 +206,31 @@ final class TerminalSession: ObservableObject, Identifiable {
                     workingDirectory: workingDirectory
                 ) {
                     workingDirectory = target
+                    directoryChangeTarget = target
                 }
             }
             gt_session_mark_output(handle)
             revision &+= 1
-            if graphicalMode,
-               let request = Self.fileListingRequest(for: command, workingDirectory: workingDirectory),
-               renderInlineFileListing(command: command, request: request, handle: handle) {
+            if let request = Self.fileListingRequest(
+                for: command,
+                workingDirectory: workingDirectory
+            ) {
+                let renderedListing = if graphicalMode {
+                    renderInlineFileListing(command: command, request: request, handle: handle)
+                } else {
+                    renderEzaFileListing(command: command, request: request, handle: handle)
+                }
+                if renderedListing {
+                    isMarkingInput = false
+                    write(Data([byte]))
+                    return
+                }
+            }
+            if graphicalMode, let directoryChangeTarget {
                 isMarkingInput = false
-                write(Data([byte]))
+                Task { @MainActor [weak self] in
+                    await self?.navigateGraphically(to: directoryChangeTarget)
+                }
                 return
             }
         }
@@ -326,12 +347,21 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func setGraphicalMode(_ enabled: Bool) {
         graphicalMode = enabled
-        guard enabled else { return }
+        guard enabled else {
+            currentGraphicalListing = nil
+            return
+        }
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(80))
-            guard let self, self.graphicalMode else { return }
+            guard let self, self.graphicalMode, !self.isMarkingInput else { return }
             self.showCurrentDirectoryGraphically()
         }
+    }
+
+    func setGraphicalViewMode(_ mode: GraphicalViewMode, refresh: Bool = true) {
+        guard graphicalViewMode != mode else { return }
+        graphicalViewMode = mode
+        if refresh, graphicalMode { showCurrentDirectoryGraphically() }
     }
 
     func showCurrentDirectoryGraphically() {
@@ -341,7 +371,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         write(Data([0x15]))
         usleep(8_000)
         if gt_session_poll(handle) { refreshFrame() }
-        feedTerminalOutput("\r\u{1B}[2K", handle: handle)
+        feedTerminalOutput("\r\u{1B}[2J\u{1B}[H", handle: handle)
         let request = FileListingRequest(path: workingDirectory, showsHidden: true, detailed: false)
         if renderInlineFileListing(command: nil, request: request, handle: handle,
                                    clearShellInput: false) {
@@ -355,8 +385,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         // This bypasses semantic command capture because navigation is a window
         // action rather than a command the user typed.
         write(Data([0x15]))
+        try? await Task.sleep(for: .milliseconds(10))
+        if gt_session_poll(handle) { refreshFrame() }
         write(Data(("cd -- \(Self.shellQuoted(target))\r").utf8))
-        for _ in 0..<20 {
+        for _ in 0..<60 {
             try? await Task.sleep(for: .milliseconds(15))
             if gt_session_poll(handle) { refreshFrame() }
             if URL(fileURLWithPath: shellWorkingDirectory).standardizedFileURL.path == target { break }
@@ -364,7 +396,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
         // Clear the transient echoed cd and prompt, then silently render the
         // equivalent ls result and restore one clean prompt underneath it.
-        feedTerminalOutput("\r\u{1B}[2K\u{1B}[1A\r\u{1B}[2K", handle: handle)
+        feedTerminalOutput("\r\u{1B}[2J\u{1B}[H", handle: handle)
         let request = FileListingRequest(path: target, showsHidden: true, detailed: false)
         if renderInlineFileListing(command: nil, request: request, handle: handle,
                                    clearShellInput: false) {
@@ -563,9 +595,21 @@ final class TerminalSession: ObservableObject, Identifiable {
         handle: OpaquePointer,
         clearShellInput: Bool = true
     ) -> Bool {
-        let listing = Self.directoryListing(at: request.path)
-        guard listing.error == nil else { return false }
+        let listing = Self.ezaDirectoryListing(
+            at: request.path,
+            showsHidden: request.showsHidden
+        ) ?? Self.directoryListing(at: request.path)
+        guard listing.error == nil else {
+            currentGraphicalListing = nil
+            return false
+        }
         let items = listing.items.filter { request.showsHidden || !$0.name.hasPrefix(".") || $0.name == ".." }
+        currentGraphicalListing = GraphicalDirectoryListing(
+            path: listing.path,
+            items: items,
+            error: nil,
+            isLoading: false
+        )
 
         // Clear the command buffered by the interactive shell. The app renders
         // the equivalent output into libghostty-vt, then submits a blank line so
@@ -576,11 +620,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             if gt_session_poll(handle) { refreshFrame() }
         }
 
-        let tileWidth = 14
-        let labelWidth = 12
-        let outerMarginColumns = 1
-        let usableColumns = max(tileWidth, terminalColumns - outerMarginColumns * 2)
-        let itemsPerRow = max(1, usableColumns / tileWidth)
         var imageIDs: [GraphicalFileItem.Kind: UInt32] = [:]
         for kind in Set(items.map(\.kind)) {
             imageIDs[kind] = nextGraphicalImageID
@@ -599,7 +638,56 @@ final class TerminalSession: ObservableObject, Identifiable {
 
         if request.detailed {
             renderDetailedListing(items, imageIDs: imageIDs, append: append)
+            if !items.isEmpty { append("\r\n") }
         } else {
+            switch graphicalViewMode {
+            case .icons:
+                renderIconListing(items, imageIDs: imageIDs, append: append)
+            case .list:
+                renderSimpleList(items, imageIDs: imageIDs, append: append)
+            case .columns:
+                renderColumnListing(items, imageIDs: imageIDs, append: append)
+            }
+        }
+        if items.isEmpty { append("(empty directory)\r\n") }
+
+        feedTerminalOutput(output, handle: handle)
+        return true
+    }
+
+    private func renderEzaFileListing(
+        command: String,
+        request: FileListingRequest,
+        handle: OpaquePointer
+    ) -> Bool {
+        guard let output = Self.ezaOutput(
+            for: request,
+            terminalColumns: terminalColumns,
+            terminalOutput: true
+        ) else { return false }
+
+        write(Data([0x15]))
+        usleep(8_000)
+        if gt_session_poll(handle) { refreshFrame() }
+
+        let normalizedOutput = String(decoding: output, as: UTF8.self)
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\n", with: "\r\n")
+        feedTerminalOutput(command + "\r\n" + normalizedOutput, handle: handle)
+        return true
+    }
+
+    private func renderIconListing(
+        _ items: [GraphicalFileItem],
+        imageIDs: [GraphicalFileItem.Kind: UInt32],
+        append: (String) -> Void
+    ) {
+        let tileWidth = 10
+        let labelWidth = 8
+        let outerMarginColumns = 1
+        let usableColumns = max(tileWidth, terminalColumns - outerMarginColumns * 2)
+        let itemsPerRow = max(1, usableColumns / tileWidth)
+
             for rowStart in stride(from: 0, to: items.count, by: itemsPerRow) {
                 let rowItems = Array(items[rowStart..<min(rowStart + itemsPerRow, items.count)])
                 let labels = rowItems.map {
@@ -612,7 +700,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                     nextGraphicalPlacementID &+= 1
                     graphicalItemsByPlacementID[placementID] = item
                     graphicalHitLayoutsByPlacementID[placementID] = GraphicalHitLayout(
-                        leadingColumns: 6,
+                        leadingColumns: 4,
                         widthColumns: tileWidth,
                         rowHeight: 1 + labelRowCount
                     )
@@ -634,11 +722,65 @@ final class TerminalSession: ObservableObject, Identifiable {
                 }
                 append("\r\n")
             }
-        }
-        if items.isEmpty { append("(empty directory)\r\n") }
+    }
 
-        feedTerminalOutput(output, handle: handle)
-        return true
+    private func renderSimpleList(
+        _ items: [GraphicalFileItem],
+        imageIDs: [GraphicalFileItem.Kind: UInt32],
+        append: (String) -> Void
+    ) {
+        let iconColumn = 1
+        let textColumn = 4
+        let nameWidth = max(4, terminalColumns - textColumn - 2)
+        for item in items {
+            guard let imageID = imageIDs[item.kind] else { continue }
+            let placementID = nextGraphicalPlacementID
+            nextGraphicalPlacementID &+= 1
+            graphicalItemsByPlacementID[placementID] = item
+            graphicalHitLayoutsByPlacementID[placementID] = GraphicalHitLayout(
+                leadingColumns: 0,
+                widthColumns: max(1, terminalColumns - 2),
+                rowHeight: 1
+            )
+            append("\u{1B}[\(iconColumn + 1)G")
+            append("\u{1B}_Ga=p,i=\(imageID),p=\(placementID),c=2,r=1,C=1,q=2\u{1B}\\")
+            let name = Self.truncatedGraphicalName(item.name, maximumCharacters: nameWidth)
+            append("\u{1B}[\(textColumn + 1)G")
+            append(Self.labelColor(for: item.kind) + name + "\u{1B}[0m\r\n")
+        }
+        if !items.isEmpty { append("\r\n") }
+    }
+
+    private func renderColumnListing(
+        _ items: [GraphicalFileItem],
+        imageIDs: [GraphicalFileItem.Kind: UInt32],
+        append: (String) -> Void
+    ) {
+        let columnWidth = 14
+        let labelWidth = 10
+        let outerMarginColumns = 1
+        let itemsPerRow = max(1, (terminalColumns - outerMarginColumns * 2) / columnWidth)
+        for rowStart in stride(from: 0, to: items.count, by: itemsPerRow) {
+            let rowItems = Array(items[rowStart..<min(rowStart + itemsPerRow, items.count)])
+            for (index, item) in rowItems.enumerated() {
+                guard let imageID = imageIDs[item.kind] else { continue }
+                let placementID = nextGraphicalPlacementID
+                nextGraphicalPlacementID &+= 1
+                graphicalItemsByPlacementID[placementID] = item
+                graphicalHitLayoutsByPlacementID[placementID] = GraphicalHitLayout(
+                    leadingColumns: 0,
+                    widthColumns: columnWidth,
+                    rowHeight: 1
+                )
+                let columnStart = outerMarginColumns + index * columnWidth
+                append("\u{1B}[\(columnStart + 1)G")
+                append("\u{1B}_Ga=p,i=\(imageID),p=\(placementID),c=2,r=1,C=1,q=2\u{1B}\\")
+                let name = Self.truncatedGraphicalName(item.name, maximumCharacters: labelWidth)
+                append("\u{1B}[\(columnStart + 4)G")
+                append(Self.labelColor(for: item.kind) + name + "\u{1B}[0m")
+            }
+            append("\r\n\r\n")
+        }
     }
 
     private func renderDetailedListing(
@@ -674,7 +816,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             let nameWidth = max(4, terminalColumns - textColumn - metadata.count - 1)
             let name = Self.truncatedGraphicalName(item.name, maximumCharacters: nameWidth)
             append("\u{1B}[\(textColumn + 1)G")
-            append(metadata + Self.labelColor(for: item.kind) + name + "\u{1B}[0m\r\n\r\n")
+            append(metadata + Self.labelColor(for: item.kind) + name + "\u{1B}[0m\r\n")
         }
     }
 
@@ -725,9 +867,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         switch kind {
         case .directory:
-            fill(2..<8, 2..<5, (255, 193, 45, 255))
-            fill(1..<15, 4..<14, (255, 174, 20, 255))
-            fill(2..<14, 6..<13, (255, 190, 36, 255))
+            fill(2..<15, 5..<15, (112, 61, 5, 210))
+            fill(2..<8, 2..<5, (255, 205, 67, 255))
+            fill(1..<14, 4..<14, (220, 125, 8, 255))
+            fill(2..<14, 5..<8, (255, 207, 66, 255))
+            fill(2..<14, 8..<11, (255, 177, 24, 255))
+            fill(2..<14, 11..<13, (225, 126, 7, 255))
+            fill(3..<13, 5..<6, (255, 239, 158, 230))
+            fill(13..<14, 6..<13, (159, 82, 2, 255))
         case .file:
             fill(3..<13, 1..<15, (190, 205, 216, 255))
             fill(9..<13, 1..<5, (232, 240, 245, 255))
@@ -788,6 +935,128 @@ final class TerminalSession: ObservableObject, Identifiable {
                 isLoading: false
             )
         }
+    }
+
+    nonisolated static func ezaDirectoryListing(
+        at path: String,
+        showsHidden: Bool,
+        executableURL: URL? = ezaExecutableURL()
+    ) -> GraphicalDirectoryListing? {
+        guard let executableURL else { return nil }
+        let request = FileListingRequest(path: path, showsHidden: showsHidden, detailed: false)
+        guard let output = ezaOutput(
+            for: request,
+            terminalColumns: 80,
+            terminalOutput: false,
+            executableURL: executableURL
+        ) else { return nil }
+
+        let fallback = directoryListing(at: path)
+        guard fallback.error == nil else { return fallback }
+        let visibleItems = fallback.items.filter {
+            showsHidden || !$0.name.hasPrefix(".") || $0.name == ".."
+        }
+        var itemsByPath = Dictionary(uniqueKeysWithValues: visibleItems.map {
+            (URL(fileURLWithPath: $0.path).standardizedFileURL.path, $0)
+        })
+        var orderedItems: [GraphicalFileItem] = []
+        if let parent = itemsByPath.removeValue(forKey: URL(
+            fileURLWithPath: path,
+            isDirectory: true
+        ).deletingLastPathComponent().standardizedFileURL.path) {
+            orderedItems.append(parent)
+        }
+
+        let outputPaths = String(decoding: output, as: UTF8.self)
+            .split(whereSeparator: \Character.isNewline)
+            .map(String.init)
+        for outputPath in outputPaths {
+            let standardizedPath = URL(fileURLWithPath: outputPath).standardizedFileURL.path
+            if let item = itemsByPath.removeValue(forKey: standardizedPath) {
+                orderedItems.append(item)
+            }
+        }
+        orderedItems.append(contentsOf: itemsByPath.values.sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        })
+        return GraphicalDirectoryListing(
+            path: fallback.path,
+            items: orderedItems,
+            error: nil,
+            isLoading: false
+        )
+    }
+
+    nonisolated static func ezaExecutableURL(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        currentDirectoryPath: String = FileManager.default.currentDirectoryPath
+    ) -> URL? {
+        var candidates: [URL] = []
+        if let configuredPath = environment["TERMINAL_TABS_EZA_PATH"],
+           !configuredPath.isEmpty {
+            candidates.append(URL(fileURLWithPath: configuredPath))
+        }
+        candidates.append(
+            URL(fileURLWithPath: currentDirectoryPath, isDirectory: true)
+                .appending(path: ".build/bin/eza")
+        )
+        if let path = environment["PATH"] {
+            candidates.append(contentsOf: path.split(separator: ":").map {
+                URL(fileURLWithPath: String($0), isDirectory: true).appending(path: "eza")
+            })
+        }
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
+    nonisolated static func ezaOutput(
+        for request: FileListingRequest,
+        terminalColumns: Int,
+        terminalOutput: Bool,
+        executableURL: URL? = ezaExecutableURL()
+    ) -> Data? {
+        guard let executableURL else { return nil }
+        let arguments = ezaArguments(
+            for: request,
+            terminalColumns: terminalColumns,
+            terminalOutput: terminalOutput
+        )
+
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return process.terminationStatus == 0 ? data : nil
+        } catch {
+            return nil
+        }
+    }
+
+    nonisolated static func ezaArguments(
+        for request: FileListingRequest,
+        terminalColumns: Int,
+        terminalOutput: Bool
+    ) -> [String] {
+        var arguments = [
+            terminalOutput ? "--color=always" : "--color=never",
+            "--icons=never",
+            "--hyperlink=never",
+            "--group-directories-first",
+        ]
+        if terminalOutput {
+            arguments.append(request.detailed ? "--long" : "--grid")
+            arguments.append("--width=\(max(1, terminalColumns))")
+        } else {
+            arguments.append(contentsOf: ["--oneline", "--absolute=on", "--no-quotes"])
+        }
+        if request.showsHidden { arguments.append("--all") }
+        arguments.append(contentsOf: ["--", request.path])
+        return arguments
     }
 
     nonisolated static func graphicalFileItem(
@@ -893,6 +1162,33 @@ final class TerminalSession: ObservableObject, Identifiable {
         aiError = nil
     }
 
+    var canAttachGraphicalOutputToAI: Bool {
+        currentGraphicalListing != nil
+    }
+
+    func attachGraphicalOutputToAI() {
+        guard let currentGraphicalListing else { return }
+        let attachment = Self.aiAttachment(for: currentGraphicalListing)
+        attachToAI(
+            command: attachment.command,
+            output: attachment.output,
+            workingDirectory: attachment.workingDirectory
+        )
+    }
+
+    nonisolated static func aiAttachment(
+        for listing: GraphicalDirectoryListing
+    ) -> TerminalBlockAttachment {
+        let output = listing.items.map { item in
+            "\(item.permissions) \(item.size) \(item.name)"
+        }.joined(separator: "\n")
+        return TerminalBlockAttachment(
+            command: "ls -la -- \(shellQuoted(listing.path))",
+            output: output.isEmpty ? "(empty directory)" : output,
+            workingDirectory: listing.path
+        )
+    }
+
     func sendAIMessage(using settings: AISettings) {
         let question = aiDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !question.isEmpty, !isAIResponding else { return }
@@ -981,6 +1277,16 @@ final class TerminalStore: ObservableObject {
     private static let orientationKey = "tabOrientation"
     private static let tabBarVisibilityKey = "isTabBarVisible"
     private static let graphicalModeKey = "graphicalMode"
+    private static let graphicalViewModeKey = "graphicalViewMode"
+    private static let autocolorTabsKey = "autocolorTabs"
+    private static let automaticTabColors = [
+        NSColor(srgbRed: 0.55, green: 0.39, blue: 0.48, alpha: 1),
+        NSColor(srgbRed: 0.38, green: 0.49, blue: 0.60, alpha: 1),
+        NSColor(srgbRed: 0.39, green: 0.55, blue: 0.48, alpha: 1),
+        NSColor(srgbRed: 0.60, green: 0.48, blue: 0.34, alpha: 1),
+        NSColor(srgbRed: 0.48, green: 0.43, blue: 0.61, alpha: 1),
+        NSColor(srgbRed: 0.57, green: 0.39, blue: 0.37, alpha: 1),
+    ]
 
     @Published var groups: [TerminalTabGroup] = []
     let aiSettings = AISettings()
@@ -993,6 +1299,9 @@ final class TerminalStore: ObservableObject {
     @Published var isTabBarVisible: Bool {
         didSet { UserDefaults.standard.set(isTabBarVisible, forKey: Self.tabBarVisibilityKey) }
     }
+    @Published var autocolorTabs: Bool {
+        didSet { UserDefaults.standard.set(autocolorTabs, forKey: Self.autocolorTabsKey) }
+    }
     @Published var graphicalMode: Bool {
         didSet {
             UserDefaults.standard.set(graphicalMode, forKey: Self.graphicalModeKey)
@@ -1001,7 +1310,16 @@ final class TerminalStore: ObservableObject {
             }
         }
     }
+    @Published var graphicalViewMode: GraphicalViewMode {
+        didSet {
+            UserDefaults.standard.set(graphicalViewMode.rawValue, forKey: Self.graphicalViewModeKey)
+            for tab in groups.lazy.flatMap(\.tabs) {
+                tab.setGraphicalViewMode(graphicalViewMode)
+            }
+        }
+    }
     private var timer: Timer?
+    private var lastAutomaticTabColorIndex: Int?
 
     init() {
         tabOrientation = TabOrientation(
@@ -1012,7 +1330,15 @@ final class TerminalStore: ObservableObject {
         } else {
             isTabBarVisible = UserDefaults.standard.bool(forKey: Self.tabBarVisibilityKey)
         }
+        if UserDefaults.standard.object(forKey: Self.autocolorTabsKey) == nil {
+            autocolorTabs = true
+        } else {
+            autocolorTabs = UserDefaults.standard.bool(forKey: Self.autocolorTabsKey)
+        }
         graphicalMode = UserDefaults.standard.bool(forKey: Self.graphicalModeKey)
+        graphicalViewMode = GraphicalViewMode(
+            rawValue: UserDefaults.standard.string(forKey: Self.graphicalViewModeKey) ?? ""
+        ) ?? .icons
         newGroup()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
@@ -1041,8 +1367,7 @@ final class TerminalStore: ObservableObject {
             return Int(group.name.dropFirst("Group ".count))
         })
         let number = (1...).first { !usedNumbers.contains($0) } ?? groups.count + 1
-        let tab = TerminalSession()
-        tab.setGraphicalMode(graphicalMode)
+        let tab = makeTab()
         let group = TerminalTabGroup(name: "Group \(number)", tabs: [tab])
         groups.append(group)
         selectedGroupID = group.id
@@ -1054,8 +1379,7 @@ final class TerminalStore: ObservableObject {
             newGroup()
             return
         }
-        let tab = TerminalSession()
-        tab.setGraphicalMode(graphicalMode)
+        let tab = makeTab()
         groups[index].tabs.append(tab)
         groups[index].isCollapsed = false
         selectedGroupID = groups[index].id
@@ -1084,8 +1408,7 @@ final class TerminalStore: ObservableObject {
 
         if groups[groupIndex].tabs.isEmpty {
             if groups.count == 1 {
-                let replacement = TerminalSession()
-                replacement.setGraphicalMode(graphicalMode)
+                let replacement = makeTab()
                 groups[groupIndex].tabs = [replacement]
                 selectedGroupID = groups[groupIndex].id
                 selectedID = replacement.id
@@ -1129,6 +1452,22 @@ final class TerminalStore: ObservableObject {
     func select(_ index: Int) {
         guard tabs.indices.contains(index) else { return }
         selectedID = tabs[index].id
+    }
+
+    private func makeTab() -> TerminalSession {
+        let tab = TerminalSession()
+        tab.setGraphicalViewMode(graphicalViewMode, refresh: false)
+        tab.setGraphicalMode(graphicalMode)
+        guard autocolorTabs else { return tab }
+
+        var colorIndex = Int.random(in: Self.automaticTabColors.indices)
+        if colorIndex == lastAutomaticTabColorIndex, Self.automaticTabColors.count > 1 {
+            colorIndex = (colorIndex + Int.random(in: 1..<Self.automaticTabColors.count))
+                % Self.automaticTabColors.count
+        }
+        lastAutomaticTabColorIndex = colorIndex
+        tab.tabAccentColor = Self.automaticTabColors[colorIndex]
+        return tab
     }
 
     func selectNext(delta: Int) {

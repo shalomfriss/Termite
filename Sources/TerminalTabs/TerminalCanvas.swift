@@ -1,6 +1,8 @@
 import AppKit
+import CoreImage
 import GhosttyBridge
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct TerminalCanvas: NSViewRepresentable {
     @ObservedObject var session: TerminalSession
@@ -38,8 +40,11 @@ final class TerminalNSView: NSView {
     private var contextBlock: BlockContents?
     private var contextGraphicalItem: GraphicalFileItem?
     private var selectedBlockHistoryRow: UInt64?
+    private var selectedGraphicalPlacementID: UInt32?
     private var imageHitTargets: [ImageHitTarget] = []
     private var imageCache: [UInt32: CGImage] = [:]
+    private var folderBloomCache: [UInt32: CGImage] = [:]
+    private let ciContext = CIContext(options: [.cacheIntermediates: true])
 
     init(session: TerminalSession) {
         self.session = session
@@ -77,7 +82,8 @@ final class TerminalNSView: NSView {
         ) { [weak self] _ in
             Task { @MainActor in self?.focusTerminal() }
         }
-        DispatchQueue.main.async { [weak self] in
+        Task { @MainActor [weak self] in
+            await Task.yield()
             self?.focusTerminal()
         }
     }
@@ -104,11 +110,15 @@ final class TerminalNSView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         if let target = imageHitTargets.last(where: { $0.rect.contains(point) }),
            let item = session.graphicalItem(for: target.placementID) {
-            if session.graphicalItemIsDirectory(item) || event.clickCount >= 2 {
+            selectedBlockHistoryRow = nil
+            selectedGraphicalPlacementID = target.placementID
+            needsDisplay = true
+            if event.clickCount >= 2 {
                 session.activateGraphicalItem(item)
             }
             return
         }
+        selectedGraphicalPlacementID = nil
         selectBlock(at: Int(point.y / cellHeight))
     }
 
@@ -142,6 +152,7 @@ final class TerminalNSView: NSView {
             contextBlock = nil
             let menu = NSMenu()
             menu.addItem(menuItem("Open", action: #selector(openGraphicalItem), enabled: true))
+            menu.addItem(openWithMenuItem(for: item))
             menu.addItem(menuItem("Copy", action: #selector(copyGraphicalItem), enabled: true))
             menu.addItem(menuItem(
                 "Paste",
@@ -150,6 +161,12 @@ final class TerminalNSView: NSView {
                     forClasses: [NSURL.self],
                     options: [.urlReadingFileURLsOnly: true]
                 )
+            ))
+            menu.addItem(.separator())
+            menu.addItem(menuItem(
+                "Attach Directory Listing to AI Chat",
+                action: #selector(attachOutputToAI),
+                enabled: session.canAttachGraphicalOutputToAI
             ))
             return menu
         }
@@ -162,7 +179,11 @@ final class TerminalNSView: NSView {
         menu.addItem(menuItem("Copy Command", action: #selector(copyCommand), enabled: contextBlock != nil))
         menu.addItem(menuItem("Copy Working Directory", action: #selector(copyWorkingDirectory), enabled: contextBlock != nil))
         menu.addItem(.separator())
-        menu.addItem(menuItem("Attach Output to AI Chat", action: #selector(attachOutputToAI), enabled: contextBlock != nil))
+        menu.addItem(menuItem(
+            "Attach Output to AI Chat",
+            action: #selector(attachOutputToAI),
+            enabled: contextBlock != nil || session.canAttachGraphicalOutputToAI
+        ))
         menu.addItem(.separator())
         menu.addItem(menuItem("Paste", action: #selector(pasteIntoTerminal),
                               enabled: NSPasteboard.general.string(forType: .string) != nil))
@@ -205,38 +226,35 @@ final class TerminalNSView: NSView {
         context?.fill(bounds)
 
         let ranges = blockRanges(frame: frame, cells: cells)
+        let rowOffsets = Array(repeating: CGFloat.zero, count: Int(frame.rows))
         let blockFill = NSColor(red: 0.035, green: 0.094, blue: 0.122, alpha: 1)
-        let blockStroke = NSColor(red: 0.20, green: 0.55, blue: 0.62, alpha: 0.58)
+        let blockSeparator = NSColor(red: 0.20, green: 0.55, blue: 0.62, alpha: 0.20)
         let selectedFill = NSColor(red: 0.050, green: 0.135, blue: 0.165, alpha: 1)
-        let selectedStroke = NSColor(red: 0.32, green: 0.84, blue: 0.88, alpha: 0.82)
+        let selectedSeparator = NSColor(red: 0.32, green: 0.84, blue: 0.88, alpha: 0.34)
         for range in ranges {
-            let rect = NSRect(x: 2, y: CGFloat(range.lowerBound) * cellHeight + 5,
-                              width: max(0, bounds.width - 4),
-                              height: max(1, CGFloat(range.count) * cellHeight - 10))
-            let path = NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7)
+            let rect = Self.blockBackgroundRect(
+                for: range,
+                cellHeight: cellHeight,
+                width: bounds.width
+            )
             let isSelected = frame.scroll_offset + UInt64(range.lowerBound) == selectedBlockHistoryRow
             (isSelected ? selectedFill : blockFill).setFill()
-            path.fill()
-            (isSelected ? selectedStroke : blockStroke).setStroke()
-            path.lineWidth = 1
-            path.stroke()
+            rect.fill()
+            (isSelected ? selectedSeparator : blockSeparator).setFill()
+            NSRect(x: 0, y: rect.maxY - 1, width: bounds.width, height: 1).fill()
         }
-
-        drawImages(frame, blockRanges: ranges)
 
         for y in 0..<Int(frame.rows) {
             let isInBlock = ranges.contains { $0.contains(y) }
             for x in 0..<Int(frame.cols) {
                 let cell = cells[y * Int(frame.cols) + x]
-                let contentInset: CGFloat = isInBlock ? 10 : 0
-                let rect = NSRect(x: CGFloat(x) * cellWidth + contentInset,
-                                  y: CGFloat(y) * cellHeight,
+                let rect = NSRect(x: CGFloat(x) * cellWidth + 10,
+                                  y: CGFloat(y) * cellHeight + rowOffsets[y],
                                   width: cellWidth + 0.5, height: cellHeight)
                 let hasDefaultBackground = cell.bg_r == 6 && cell.bg_g == 17 && cell.bg_b == 24
                 if !isInBlock || !hasDefaultBackground {
                     color(cell.bg_r, cell.bg_g, cell.bg_b).setFill()
-                    NSRect(x: CGFloat(x) * cellWidth, y: CGFloat(y) * cellHeight,
-                           width: cellWidth + 0.5, height: cellHeight).fill()
+                    rect.fill()
                 }
                 guard cell.text_len > 0, cell.style & UInt16(GT_STYLE_INVISIBLE) == 0 else { continue }
                 let text = withUnsafeBytes(of: cell.text) { raw -> String in
@@ -261,10 +279,16 @@ final class TerminalNSView: NSView {
             }
         }
 
+        // Images must be composited after terminal cell backgrounds. A freshly
+        // navigated directory is not always part of a semantic command block,
+        // so drawing images first lets the normal background pass cover them.
+        drawImages(frame, rowOffsets: rowOffsets)
+
         if frame.cursor_visible {
-            let cursorInset: CGFloat = ranges.contains { $0.contains(Int(frame.cursor_y)) } ? 10 : 0
-            let cursor = NSRect(x: CGFloat(frame.cursor_x) * cellWidth + cursorInset,
-                                y: CGFloat(frame.cursor_y) * cellHeight,
+            let cursorRow = Int(frame.cursor_y)
+            let cursorOffset = rowOffsets.indices.contains(cursorRow) ? rowOffsets[cursorRow] : 0
+            let cursor = NSRect(x: CGFloat(frame.cursor_x) * cellWidth + 10,
+                                y: CGFloat(frame.cursor_y) * cellHeight + cursorOffset,
                                 width: cellWidth, height: cellHeight)
             color(frame.cursor_r, frame.cursor_g, frame.cursor_b).withAlphaComponent(0.72).setFill()
             cursor.fill(using: .screen)
@@ -277,33 +301,44 @@ final class TerminalNSView: NSView {
         drawScrollbar(frame)
     }
 
-    private func drawImages(_ frame: GTFrame, blockRanges: [Range<Int>]) {
+    static func blockBackgroundRect(
+        for range: Range<Int>,
+        cellHeight: CGFloat,
+        width: CGFloat
+    ) -> NSRect {
+        NSRect(
+            x: 0,
+            y: CGFloat(range.lowerBound) * cellHeight,
+            width: width,
+            height: CGFloat(range.count) * cellHeight
+        )
+    }
+
+    private func drawImages(_ frame: GTFrame, rowOffsets: [CGFloat]) {
         let previousTargets = imageHitTargets
         var nextTargets: [ImageHitTarget] = []
         guard let images = frame.images, frame.image_count > 0 else {
             imageHitTargets = []
+            selectedGraphicalPlacementID = nil
             invalidateCursorRectsIfChanged(from: previousTargets)
             return
         }
         for index in 0..<Int(frame.image_count) {
             let placement = images[index]
             guard let cgImage = cachedImage(for: placement) else { continue }
+            let displayedImage = folderBloomImage(for: placement, baseImage: cgImage) ?? cgImage
+            let placementRow = Int(placement.viewport_row)
+            let rowOffset = rowOffsets.indices.contains(placementRow) ? rowOffsets[placementRow] : 0
 
             let rect = NSRect(
                 x: CGFloat(placement.viewport_col) * cellWidth
                     + CGFloat(placement.cell_offset_x)
-                    + (blockRanges.contains { $0.contains(Int(placement.viewport_row)) } ? 10 : 0),
-                y: CGFloat(placement.viewport_row) * cellHeight + CGFloat(placement.cell_offset_y),
+                    + 10,
+                y: CGFloat(placement.viewport_row) * cellHeight
+                    + CGFloat(placement.cell_offset_y)
+                    + rowOffset,
                 width: CGFloat(placement.pixel_width),
                 height: CGFloat(placement.pixel_height)
-            )
-            NSImage(cgImage: cgImage, size: rect.size).draw(
-                in: rect,
-                from: .zero,
-                operation: .sourceOver,
-                fraction: 1,
-                respectFlipped: true,
-                hints: [.interpolation: NSImageInterpolation.none]
             )
             if placement.placement_id != 0 {
                 let layout = session.graphicalItemHitLayout(for: placement.placement_id)
@@ -314,11 +349,37 @@ final class TerminalNSView: NSView {
                     width: min(cellWidth * CGFloat(layout.1), bounds.maxX - tileStartX),
                     height: cellHeight * CGFloat(layout.2)
                 )
+                if selectedGraphicalPlacementID == placement.placement_id {
+                    drawGraphicalSelection(in: tileRect)
+                }
                 nextTargets.append(.init(placementID: placement.placement_id, rect: tileRect))
             }
+            NSImage(cgImage: displayedImage, size: rect.size).draw(
+                in: rect,
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1,
+                respectFlipped: true,
+                hints: [.interpolation: NSImageInterpolation.none]
+            )
         }
         imageHitTargets = nextTargets
+        if let selectedGraphicalPlacementID,
+           !nextTargets.contains(where: { $0.placementID == selectedGraphicalPlacementID }) {
+            self.selectedGraphicalPlacementID = nil
+        }
         invalidateCursorRectsIfChanged(from: previousTargets)
+    }
+
+    private func drawGraphicalSelection(in rect: NSRect) {
+        let highlight = rect.insetBy(dx: 2, dy: 2)
+        NSColor.controlAccentColor.withAlphaComponent(0.18).setFill()
+        NSBezierPath(roundedRect: highlight, xRadius: 6, yRadius: 6).fill()
+        NSColor.controlAccentColor.withAlphaComponent(0.72).setStroke()
+        let border = NSBezierPath(roundedRect: highlight.insetBy(dx: 0.5, dy: 0.5),
+                                  xRadius: 5.5, yRadius: 5.5)
+        border.lineWidth = 1
+        border.stroke()
     }
 
     private func cachedImage(for placement: GTImage) -> CGImage? {
@@ -348,9 +409,24 @@ final class TerminalNSView: NSView {
         return image
     }
 
+    private func folderBloomImage(for placement: GTImage, baseImage: CGImage) -> CGImage? {
+        guard session.graphicalItem(for: placement.placement_id)?.kind == .directory else { return nil }
+        if let cached = folderBloomCache[placement.image_id] { return cached }
+        guard let filter = CIFilter(name: "CIBloom") else { return nil }
+        let input = CIImage(cgImage: baseImage)
+        filter.setValue(input, forKey: kCIInputImageKey)
+        filter.setValue(2.2, forKey: kCIInputRadiusKey)
+        filter.setValue(0.72, forKey: kCIInputIntensityKey)
+        guard let output = filter.outputImage?.cropped(to: input.extent),
+              let image = ciContext.createCGImage(output, from: input.extent) else { return nil }
+        folderBloomCache[placement.image_id] = image
+        return image
+    }
+
     private func invalidateCursorRectsIfChanged(from previousTargets: [ImageHitTarget]) {
         guard previousTargets != imageHitTargets else { return }
-        DispatchQueue.main.async { [weak self] in
+        Task { @MainActor [weak self] in
+            await Task.yield()
             guard let self, let window = self.window else { return }
             window.invalidateCursorRects(for: self)
         }
@@ -380,6 +456,55 @@ final class TerminalNSView: NSView {
         return item
     }
 
+    func openWithMenuItem(for item: GraphicalFileItem) -> NSMenuItem {
+        let parentItem = NSMenuItem(title: "Open With", action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: "Open With")
+        let itemURL = URL(fileURLWithPath: item.path)
+        var seenApplicationURLs: Set<URL> = []
+        let applicationURLs = NSWorkspace.shared.urlsForApplications(toOpen: itemURL)
+            .filter { seenApplicationURLs.insert($0.standardizedFileURL).inserted }
+            .sorted {
+                applicationName(for: $0).localizedStandardCompare(applicationName(for: $1))
+                    == .orderedAscending
+            }
+
+        if applicationURLs.isEmpty {
+            submenu.addItem(menuItem(
+                "No Recommended Applications",
+                action: #selector(openGraphicalItem),
+                enabled: false
+            ))
+        } else {
+            for applicationURL in applicationURLs {
+                let applicationItem = menuItem(
+                    applicationName(for: applicationURL),
+                    action: #selector(openGraphicalItemWithApplication(_:)),
+                    enabled: true
+                )
+                applicationItem.representedObject = applicationURL
+                let icon = NSWorkspace.shared.icon(forFile: applicationURL.path).copy() as? NSImage
+                icon?.size = NSSize(width: 16, height: 16)
+                applicationItem.image = icon
+                submenu.addItem(applicationItem)
+            }
+        }
+
+        submenu.addItem(.separator())
+        submenu.addItem(menuItem(
+            "Other…",
+            action: #selector(chooseApplicationForGraphicalItem),
+            enabled: true
+        ))
+        parentItem.submenu = submenu
+        return parentItem
+    }
+
+    private func applicationName(for url: URL) -> String {
+        let localizedName = try? url.resourceValues(forKeys: [.localizedNameKey]).localizedName
+        let name = localizedName ?? url.lastPathComponent
+        return (name as NSString).deletingPathExtension
+    }
+
     private func selectBlock(at row: Int) {
         guard let handle = session.handle, let framePointer = gt_session_frame(handle),
               let cells = framePointer.pointee.cells else {
@@ -403,6 +528,46 @@ final class TerminalNSView: NSView {
         session.activateGraphicalItem(contextGraphicalItem)
     }
 
+    @objc private func openGraphicalItemWithApplication(_ sender: NSMenuItem) {
+        guard let contextGraphicalItem,
+              let applicationURL = sender.representedObject as? URL else { return }
+        openGraphicalItemWithApplication(contextGraphicalItem, applicationURL: applicationURL)
+    }
+
+    @objc private func chooseApplicationForGraphicalItem() {
+        guard contextGraphicalItem != nil, let window else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Choose an Application"
+        panel.prompt = "Open"
+        panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+        panel.allowedContentTypes = [.application]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK,
+                  let self,
+                  let contextGraphicalItem = self.contextGraphicalItem,
+                  let applicationURL = panel.url else { return }
+            self.openGraphicalItemWithApplication(
+                contextGraphicalItem,
+                applicationURL: applicationURL
+            )
+        }
+    }
+
+    private func openGraphicalItemWithApplication(
+        _ item: GraphicalFileItem,
+        applicationURL: URL
+    ) {
+        let configuration = NSWorkspace.OpenConfiguration()
+        NSWorkspace.shared.open(
+            [URL(fileURLWithPath: item.path)],
+            withApplicationAt: applicationURL,
+            configuration: configuration
+        )
+    }
+
     @objc private func copyGraphicalItem() {
         guard let contextGraphicalItem else { return }
         session.copyGraphicalItem(contextGraphicalItem)
@@ -414,12 +579,15 @@ final class TerminalNSView: NSView {
     }
 
     @objc private func attachOutputToAI() {
-        guard let block = contextBlock else { return }
-        session.attachToAI(
-            command: block.command,
-            output: session.fullOutput(for: block.command) ?? block.output,
-            workingDirectory: block.workingDirectory
-        )
+        if let block = contextBlock {
+            session.attachToAI(
+                command: block.command,
+                output: session.fullOutput(for: block.command) ?? block.output,
+                workingDirectory: block.workingDirectory
+            )
+        } else {
+            session.attachGraphicalOutputToAI()
+        }
     }
 
     @objc private func pasteIntoTerminal() {

@@ -29,6 +29,37 @@ final class TerminalTabsTests: XCTestCase {
         XCTAssertEqual(session.aiAttachment?.output, "Package.swift")
     }
 
+    func testGraphicalDirectoryListingCreatesAIAttachment() {
+        let listing = GraphicalDirectoryListing(
+            path: "/tmp/project",
+            items: [
+                GraphicalFileItem(
+                    path: "/tmp/project/Sources",
+                    name: "Sources",
+                    kind: .directory,
+                    permissions: "drwxr-xr-x",
+                    size: 96
+                ),
+                GraphicalFileItem(
+                    path: "/tmp/project/Package.swift",
+                    name: "Package.swift",
+                    kind: .file,
+                    permissions: "-rw-r--r--",
+                    size: 512
+                ),
+            ],
+            error: nil,
+            isLoading: false
+        )
+
+        let attachment = TerminalSession.aiAttachment(for: listing)
+
+        XCTAssertEqual(attachment.workingDirectory, "/tmp/project")
+        XCTAssertTrue(attachment.command.contains("ls -la"))
+        XCTAssertTrue(attachment.output.contains("Sources"))
+        XCTAssertTrue(attachment.output.contains("Package.swift"))
+    }
+
     @MainActor
     func testTabCanBeRenamedAndReset() {
         let session = TerminalSession(cols: 40, rows: 10)
@@ -164,6 +195,16 @@ final class TerminalTabsTests: XCTestCase {
             session.poll()
         }
         XCTAssertEqual(session.workingDirectory, target)
+
+        var navigatedImageCount = 0
+        for _ in 0..<100 where navigatedImageCount == 0 {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+            navigatedImageCount = gt_session_frame(try XCTUnwrap(session.handle)).map {
+                Int($0.pointee.image_count)
+            } ?? 0
+        }
+        XCTAssertGreaterThan(navigatedImageCount, 0)
     }
 
     @MainActor
@@ -253,6 +294,101 @@ final class TerminalTabsTests: XCTestCase {
         XCTAssertTrue(longAll.detailed)
     }
 
+    func testEzaArgumentsPreserveListingLayoutOptions() {
+        let request = FileListingRequest(path: "/tmp/project", showsHidden: true, detailed: true)
+
+        let terminalArguments = TerminalSession.ezaArguments(
+            for: request,
+            terminalColumns: 96,
+            terminalOutput: true
+        )
+        XCTAssertTrue(terminalArguments.contains("--long"))
+        XCTAssertTrue(terminalArguments.contains("--all"))
+        XCTAssertTrue(terminalArguments.contains("--width=96"))
+        XCTAssertEqual(terminalArguments.suffix(2), ["--", "/tmp/project"])
+
+        let graphicalArguments = TerminalSession.ezaArguments(
+            for: request,
+            terminalColumns: 96,
+            terminalOutput: false
+        )
+        XCTAssertTrue(graphicalArguments.contains("--oneline"))
+        XCTAssertTrue(graphicalArguments.contains("--absolute=on"))
+        XCTAssertTrue(graphicalArguments.contains("--no-quotes"))
+    }
+
+    func testEzaExecutableUsesConfiguredPath() {
+        let executable = TerminalSession.ezaExecutableURL(
+            environment: ["TERMINAL_TABS_EZA_PATH": "/bin/ls", "PATH": ""],
+            currentDirectoryPath: "/tmp"
+        )
+        XCTAssertEqual(executable?.path, "/bin/ls")
+    }
+
+    func testBundledEzaOrdersGraphicalDirectoryListing() throws {
+        let executableURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appending(path: ".build/bin/eza")
+        guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
+            throw XCTSkip("The bundled eza executable has not been built.")
+        }
+
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "terminal-tabs-eza-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appending(path: "Sources"),
+            withIntermediateDirectories: false
+        )
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: root.appending(path: "Package.swift").path,
+            contents: Data()
+        ))
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: root.appending(path: ".hidden").path,
+            contents: Data()
+        ))
+
+        let visible = try XCTUnwrap(TerminalSession.ezaDirectoryListing(
+            at: root.path,
+            showsHidden: false,
+            executableURL: executableURL
+        ))
+        XCTAssertEqual(visible.items.map(\.name), ["..", "Sources", "Package.swift"])
+
+        let all = try XCTUnwrap(TerminalSession.ezaDirectoryListing(
+            at: root.path,
+            showsHidden: true,
+            executableURL: executableURL
+        ))
+        XCTAssertTrue(all.items.contains(where: { $0.name == ".hidden" }))
+    }
+
+    @MainActor
+    func testAdjacentBlockBackgroundsDoNotOverlap() {
+        let first = TerminalNSView.blockBackgroundRect(for: 1..<3, cellHeight: 20, width: 400)
+        let second = TerminalNSView.blockBackgroundRect(for: 3..<5, cellHeight: 20, width: 400)
+
+        XCTAssertEqual(first.maxY, second.minY)
+    }
+
+    @MainActor
+    func testGraphicalOpenWithMenuIncludesOtherApplicationPicker() {
+        let session = TerminalSession(cols: 40, rows: 10)
+        let view = TerminalNSView(session: session)
+        let path = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appending(path: "Package.swift").path
+
+        let menuItem = view.openWithMenuItem(for: GraphicalFileItem(
+            path: path,
+            name: "Package.swift",
+            kind: .file
+        ))
+
+        XCTAssertEqual(menuItem.title, "Open With")
+        XCTAssertTrue(menuItem.submenu?.items.contains(where: { $0.title == "Other…" }) == true)
+    }
+
     @MainActor
     func testWorkingDirectoryTracksShellChanges() throws {
         if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
@@ -326,10 +462,26 @@ final class TerminalTabsTests: XCTestCase {
         let store = TerminalStore()
         store.tabOrientation = .vertical
         store.isTabBarVisible = false
+        store.graphicalViewMode = .list
         XCTAssertEqual(store.tabOrientation, .vertical)
         XCTAssertFalse(store.isTabBarVisible)
+        XCTAssertEqual(store.selected?.graphicalViewMode, .list)
         store.tabOrientation = .horizontal
         store.isTabBarVisible = true
+        store.graphicalViewMode = .icons
+    }
+
+    @MainActor
+    func testAutocolorAppliesOnlyToNewTabsWhenEnabled() {
+        let store = TerminalStore()
+        store.autocolorTabs = true
+        store.newTab()
+        XCTAssertNotNil(store.selected?.tabAccentColor)
+
+        store.autocolorTabs = false
+        store.newTab()
+        XCTAssertNil(store.selected?.tabAccentColor)
+        store.autocolorTabs = true
     }
 
     @MainActor

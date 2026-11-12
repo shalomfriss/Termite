@@ -185,6 +185,7 @@ struct AppSettingsView: View {
                     }
                     .pickerStyle(.segmented)
                     Toggle("Show tab bar", isOn: $store.isTabBarVisible)
+                    Toggle("Autocolor tabs", isOn: $store.autocolorTabs)
                 }
                 .padding(8)
             }

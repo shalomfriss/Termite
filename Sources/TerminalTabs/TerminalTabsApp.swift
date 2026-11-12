@@ -140,27 +140,19 @@ struct TerminalWorkspace: View {
     var body: some View {
         VStack(spacing: 8) {
             HStack(spacing: 8) {
-                Toggle(isOn: Binding(
-                    get: { store.graphicalMode },
-                    set: { store.setGraphicalMode($0) }
-                )) {
+                Toggle(isOn: $store.graphicalMode) {
                     Label("Graphical mode", systemImage: "square.grid.2x2")
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.callout)
                 }
                 .toggleStyle(.checkbox)
                 .help("Show the current directory as clickable inline graphics")
                 Spacer()
+                GraphicalViewPicker(selection: $store.graphicalViewMode)
             }
-            .padding(.horizontal, 4)
+            .padding(.horizontal, 6)
 
             TerminalCanvas(session: session)
                 .id(session.id)
-            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .stroke(TerminalTheme.cyan.opacity(0.46), lineWidth: 1.25)
-            }
-            .shadow(color: TerminalTheme.cyan.opacity(0.12), radius: 14)
             if session.isAIChatVisible {
                 AIConversationPanel(session: session, settings: settings)
             }
@@ -237,13 +229,13 @@ struct VerticalTabSidebar: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
-                Spacer().frame(width: 76)
                 SmallIconButton(systemName: "folder.badge.plus", help: "New tab group") {
                     store.newGroup()
                 }
                 TabSettingsMenu(store: store)
+                Spacer()
             }
-            .padding(.trailing, 8)
+            .padding(.horizontal, 8)
             .frame(height: 42)
 
             ScrollView {
@@ -454,8 +446,22 @@ struct TerminalTabButton: View {
         .padding(.trailing, 8)
         .frame(width: vertical ? nil : 196, height: 38)
         .frame(maxWidth: vertical ? .infinity : nil)
-        .background(selected ? TerminalTheme.cyan.opacity(0.105) : Color.clear)
+        .background {
+            if vertical, let accent = tab.tabAccentColor {
+                Color(nsColor: accent).opacity(selected ? 0.22 : 0.11)
+            } else {
+                selected ? TerminalTheme.cyan.opacity(0.105) : Color.clear
+            }
+        }
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .overlay(alignment: .leading) {
+            if vertical, let accent = tab.tabAccentColor {
+                Capsule()
+                    .fill(Color(nsColor: accent))
+                    .frame(width: 3, height: 22)
+                    .padding(.leading, 4)
+            }
+        }
         .overlay {
             if selected {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
