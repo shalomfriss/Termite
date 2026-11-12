@@ -682,46 +682,46 @@ final class TerminalSession: ObservableObject, Identifiable {
         imageIDs: [GraphicalFileItem.Kind: UInt32],
         append: (String) -> Void
     ) {
-        let tileWidth = 10
-        let labelWidth = 8
+        let tileWidth = 8
+        let labelWidth = 7
         let outerMarginColumns = 1
         let usableColumns = max(tileWidth, terminalColumns - outerMarginColumns * 2)
         let itemsPerRow = max(1, usableColumns / tileWidth)
 
-            for rowStart in stride(from: 0, to: items.count, by: itemsPerRow) {
-                let rowItems = Array(items[rowStart..<min(rowStart + itemsPerRow, items.count)])
-                let labels = rowItems.map {
-                    Self.graphicalLabelLines(name: $0.name, maxWidth: labelWidth)
-                }
-                let labelRowCount = min(2, labels.map(\.count).max() ?? 1)
-                for (index, item) in rowItems.enumerated() {
-                    guard let imageID = imageIDs[item.kind] else { continue }
-                    let placementID = nextGraphicalPlacementID
-                    nextGraphicalPlacementID &+= 1
-                    graphicalItemsByPlacementID[placementID] = item
-                    graphicalHitLayoutsByPlacementID[placementID] = GraphicalHitLayout(
-                        leadingColumns: 4,
-                        widthColumns: tileWidth,
-                        rowHeight: 1 + labelRowCount
-                    )
+        for rowStart in stride(from: 0, to: items.count, by: itemsPerRow) {
+            let rowItems = Array(items[rowStart..<min(rowStart + itemsPerRow, items.count)])
+            let labels = rowItems.map {
+                Self.graphicalLabelLines(name: $0.name, maxWidth: labelWidth)
+            }
+            let labelRowCount = min(2, labels.map(\.count).max() ?? 1)
+            for (index, item) in rowItems.enumerated() {
+                guard let imageID = imageIDs[item.kind] else { continue }
+                let placementID = nextGraphicalPlacementID
+                nextGraphicalPlacementID &+= 1
+                let tileStart = outerMarginColumns + index * tileWidth
+                let iconOffset = (tileWidth - 2) / 2
+                let iconColumn = tileStart + iconOffset
+                graphicalItemsByPlacementID[placementID] = item
+                graphicalHitLayoutsByPlacementID[placementID] = GraphicalHitLayout(
+                    leadingColumns: iconOffset,
+                    widthColumns: tileWidth,
+                    rowHeight: 1 + labelRowCount
+                )
+                append("\u{1B}[\(iconColumn + 1)G")
+                append("\u{1B}_Ga=p,i=\(imageID),p=\(placementID),c=2,r=1,C=1,q=2\u{1B}\\")
+            }
+            append("\r\n")
+            for labelRow in 0..<labelRowCount {
+                for (index, item) in rowItems.enumerated() where labelRow < labels[index].count {
+                    let line = labels[index][labelRow]
                     let tileStart = outerMarginColumns + index * tileWidth
-                    let iconColumn = tileStart + (tileWidth - 2) / 2
-                    append("\u{1B}[\(iconColumn + 1)G")
-                    append("\u{1B}_Ga=p,i=\(imageID),p=\(placementID),c=2,r=1,C=1,q=2\u{1B}\\")
-                }
-                append("\r\n")
-                for labelRow in 0..<labelRowCount {
-                    for (index, item) in rowItems.enumerated() where labelRow < labels[index].count {
-                        let line = labels[index][labelRow]
-                        let tileStart = outerMarginColumns + index * tileWidth
-                        let centeredColumn = tileStart + max(0, (tileWidth - line.count) / 2)
-                        append("\u{1B}[\(centeredColumn + 1)G")
-                        append(Self.labelColor(for: item.kind) + line + "\u{1B}[0m")
-                    }
-                    append("\r\n")
+                    let centeredColumn = tileStart + max(0, (tileWidth - line.count) / 2)
+                    append("\u{1B}[\(centeredColumn + 1)G")
+                    append(Self.labelColor(for: item.kind) + line + "\u{1B}[0m")
                 }
                 append("\r\n")
             }
+        }
     }
 
     private func renderSimpleList(

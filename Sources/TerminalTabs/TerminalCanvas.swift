@@ -44,6 +44,7 @@ final class TerminalNSView: NSView {
     private var imageHitTargets: [ImageHitTarget] = []
     private var imageCache: [UInt32: CGImage] = [:]
     private var folderBloomCache: [UInt32: CGImage] = [:]
+    private var selectionGlowCache: [String: CGImage] = [:]
     private let ciContext = CIContext(options: [.cacheIntermediates: true])
 
     init(session: TerminalSession) {
@@ -372,14 +373,69 @@ final class TerminalNSView: NSView {
     }
 
     private func drawGraphicalSelection(in rect: NSRect) {
-        let highlight = rect.insetBy(dx: 2, dy: 2)
-        NSColor.controlAccentColor.withAlphaComponent(0.18).setFill()
-        NSBezierPath(roundedRect: highlight, xRadius: 6, yRadius: 6).fill()
-        NSColor.controlAccentColor.withAlphaComponent(0.72).setStroke()
-        let border = NSBezierPath(roundedRect: highlight.insetBy(dx: 0.5, dy: 0.5),
-                                  xRadius: 5.5, yRadius: 5.5)
+        let highlight = rect.insetBy(dx: 3, dy: 2)
+        let glowPadding: CGFloat = 9
+        let scale = window?.backingScaleFactor ?? 2
+        if let glowImage = selectionGlowImage(for: highlight.size, scale: scale) {
+            let glowRect = highlight.insetBy(dx: -glowPadding, dy: -glowPadding)
+            NSImage(cgImage: glowImage, size: glowRect.size).draw(
+                in: glowRect,
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1,
+                respectFlipped: true,
+                hints: [.interpolation: NSImageInterpolation.high]
+            )
+        }
+
+        let turquoise = NSColor(srgbRed: 0.38, green: 0.96, blue: 0.90, alpha: 0.92)
+        turquoise.setStroke()
+        let border = NSBezierPath(
+            roundedRect: highlight.insetBy(dx: 0.5, dy: 0.5),
+            xRadius: 5.5,
+            yRadius: 5.5
+        )
         border.lineWidth = 1
         border.stroke()
+    }
+
+    private func selectionGlowImage(for size: NSSize, scale: CGFloat) -> CGImage? {
+        let glowPadding: CGFloat = 9
+        let pixelWidth = max(1, Int(ceil(size.width * scale)))
+        let pixelHeight = max(1, Int(ceil(size.height * scale)))
+        let pixelPadding = Int(ceil(glowPadding * scale))
+        let key = "\(pixelWidth)x\(pixelHeight)@\(pixelPadding)"
+        if let cached = selectionGlowCache[key] { return cached }
+
+        let innerExtent = CGRect(
+            x: pixelPadding,
+            y: pixelPadding,
+            width: pixelWidth,
+            height: pixelHeight
+        )
+        guard let roundedRectangle = CIFilter(name: "CIRoundedRectangleGenerator"),
+              let bloom = CIFilter(name: "CIBloom") else { return nil }
+        roundedRectangle.setValue(CIVector(cgRect: innerExtent), forKey: "inputExtent")
+        roundedRectangle.setValue(6 * scale, forKey: "inputRadius")
+        roundedRectangle.setValue(
+            CIColor(red: 0.38, green: 0.96, blue: 0.90, alpha: 0.20),
+            forKey: "inputColor"
+        )
+        guard let baseImage = roundedRectangle.outputImage else { return nil }
+
+        bloom.setValue(baseImage, forKey: kCIInputImageKey)
+        bloom.setValue(5.5 * scale, forKey: kCIInputRadiusKey)
+        bloom.setValue(1.05, forKey: kCIInputIntensityKey)
+        let outputExtent = CGRect(
+            x: 0,
+            y: 0,
+            width: pixelWidth + pixelPadding * 2,
+            height: pixelHeight + pixelPadding * 2
+        )
+        guard let output = bloom.outputImage?.cropped(to: outputExtent),
+              let image = ciContext.createCGImage(output, from: outputExtent) else { return nil }
+        selectionGlowCache[key] = image
+        return image
     }
 
     private func cachedImage(for placement: GTImage) -> CGImage? {

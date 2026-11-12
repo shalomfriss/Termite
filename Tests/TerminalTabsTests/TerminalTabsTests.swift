@@ -225,6 +225,12 @@ final class TerminalTabsTests: XCTestCase {
             } ?? 0
         }
         XCTAssertGreaterThan(imageCount, 0)
+        let frame = try XCTUnwrap(gt_session_frame(try XCTUnwrap(session.handle))).pointee
+        let firstImage = try XCTUnwrap(frame.images).pointee
+        let hitLayout = session.graphicalItemHitLayout(for: firstImage.placement_id)
+        XCTAssertEqual(hitLayout.0, 3)
+        XCTAssertEqual(hitLayout.1, 8)
+        XCTAssertLessThanOrEqual(hitLayout.2, 3)
     }
 
     @MainActor
