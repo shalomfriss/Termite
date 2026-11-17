@@ -559,6 +559,10 @@ final class AirTests: XCTestCase {
         XCTAssertTrue(visibleFrameText(revealedFrame).contains(visibleMarker))
     }
 
+    func testGraphicalViewModesExcludeColumns() {
+        XCTAssertEqual(GraphicalViewMode.allCases, [.icons, .list])
+    }
+
     func testLocalFilePassesICloudAvailabilityPreparation() async throws {
         let file = FileManager.default.temporaryDirectory
             .appending(path: "terminal-tabs-local-\(UUID().uuidString).txt")

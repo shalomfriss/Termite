@@ -1231,8 +1231,6 @@ final class TerminalSession: ObservableObject, Identifiable {
                     renderIconListing(section.items, imageIDs: imageIDs, append: append)
                 case .list:
                     renderSimpleList(section.items, imageIDs: imageIDs, append: append)
-                case .columns:
-                    renderColumnListing(section.items, imageIDs: imageIDs, append: append)
                 }
             }
         }
