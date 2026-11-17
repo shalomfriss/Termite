@@ -3,4 +3,5 @@
 .swiftpm/
 .codebase-memory/
 .DS_Store
+dist/
 *.xcodeproj/

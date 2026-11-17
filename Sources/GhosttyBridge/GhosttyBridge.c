@@ -153,6 +153,7 @@ static void load_runtime(void) {
     const char *explicit_path = getenv("LIBGHOSTTY_VT_PATH");
     const char *paths[] = {
         explicit_path,
+        "@executable_path/../Frameworks/libghostty-vt.dylib",
         ".build/lib/libghostty-vt.dylib",
         ".deps/ghostty/zig-out/lib/libghostty-vt.dylib",
         "/opt/homebrew/lib/libghostty-vt.dylib",
@@ -166,7 +167,7 @@ static void load_runtime(void) {
         }
     }
     if (!library_handle) {
-        runtime_error = "libghostty-vt was not found. Run Scripts/run.sh or set LIBGHOSTTY_VT_PATH.";
+        runtime_error = "libghostty-vt was not found in the application bundle or configured paths.";
         return;
     }
     LOAD(terminal_new, "ghostty_terminal_new");

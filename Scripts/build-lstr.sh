@@ -37,9 +37,9 @@ git -C "$source_dir" checkout --detach "$lstr_commit"
     export SDKROOT="$sdk_path"
   fi
   if [[ -n "$rustc_path" ]]; then
-    RUSTC="$rustc_path" "${cargo_command[@]}" build --release --locked
+    LIBGIT2_NO_PKG_CONFIG=1 RUSTC="$rustc_path" "${cargo_command[@]}" build --release --locked
   else
-    "${cargo_command[@]}" build --release --locked
+    LIBGIT2_NO_PKG_CONFIG=1 "${cargo_command[@]}" build --release --locked
   fi
 )
 

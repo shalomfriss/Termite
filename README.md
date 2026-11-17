@@ -20,6 +20,16 @@ The first run fetches Ghostty, eza, and lstr; builds `libghostty-vt.dylib` plus 
 LIBGHOSTTY_VT_PATH=/path/to/libghostty-vt.dylib swift run Air
 ```
 
+## Package for another Mac
+
+Create a standalone Apple Silicon application bundle for macOS 14 or newer:
+
+```sh
+./Scripts/package-macos.sh
+```
+
+The distributable archive is written to `dist/Air-macOS-arm64.zip`. It embeds libghostty-vt, eza, lstr, shell integration resources, and third-party license files. The bundle is ad-hoc signed because this repository is not configured with a Developer ID Application certificate; on another Mac, use Finder's **Open** context-menu action the first time if Gatekeeper asks for confirmation.
+
 ## Shortcuts
 
 | Action | Shortcut |

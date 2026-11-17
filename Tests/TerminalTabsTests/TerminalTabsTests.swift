@@ -831,6 +831,44 @@ final class AirTests: XCTestCase {
         XCTAssertEqual(executable?.path, "/bin/ls")
     }
 
+    func testListingExecutablesCanLoadFromApplicationResources() throws {
+        let resources = FileManager.default.temporaryDirectory.appending(
+            path: "air-bundled-tools-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        let binaryDirectory = resources.appending(path: "bin", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(
+            at: binaryDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: resources) }
+        for name in ["eza", "lstr"] {
+            try FileManager.default.createSymbolicLink(
+                at: binaryDirectory.appending(path: name),
+                withDestinationURL: URL(fileURLWithPath: "/bin/ls")
+            )
+        }
+
+        let environment = ["PATH": ""]
+        let missingWorkingDirectory = "/private/tmp/air-missing-working-directory"
+        XCTAssertEqual(
+            TerminalSession.ezaExecutableURL(
+                environment: environment,
+                currentDirectoryPath: missingWorkingDirectory,
+                bundleResourceURL: resources
+            ),
+            binaryDirectory.appending(path: "eza")
+        )
+        XCTAssertEqual(
+            TerminalSession.lstrExecutableURL(
+                environment: environment,
+                currentDirectoryPath: missingWorkingDirectory,
+                bundleResourceURL: resources
+            ),
+            binaryDirectory.appending(path: "lstr")
+        )
+    }
+
     func testBundledEzaOrdersGraphicalDirectoryListing() throws {
         let executableURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appending(path: ".build/bin/eza")

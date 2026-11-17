@@ -1839,25 +1839,29 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     nonisolated static func ezaExecutableURL(
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        currentDirectoryPath: String = FileManager.default.currentDirectoryPath
+        currentDirectoryPath: String = FileManager.default.currentDirectoryPath,
+        bundleResourceURL: URL? = Bundle.main.resourceURL
     ) -> URL? {
         executableURL(
             named: "eza",
             configuredBy: "TERMINAL_TABS_EZA_PATH",
             environment: environment,
-            currentDirectoryPath: currentDirectoryPath
+            currentDirectoryPath: currentDirectoryPath,
+            bundleResourceURL: bundleResourceURL
         )
     }
 
     nonisolated static func lstrExecutableURL(
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        currentDirectoryPath: String = FileManager.default.currentDirectoryPath
+        currentDirectoryPath: String = FileManager.default.currentDirectoryPath,
+        bundleResourceURL: URL? = Bundle.main.resourceURL
     ) -> URL? {
         executableURL(
             named: "lstr",
             configuredBy: "TERMINAL_TABS_LSTR_PATH",
             environment: environment,
-            currentDirectoryPath: currentDirectoryPath
+            currentDirectoryPath: currentDirectoryPath,
+            bundleResourceURL: bundleResourceURL
         )
     }
 
@@ -1865,12 +1869,20 @@ final class TerminalSession: ObservableObject, Identifiable {
         named executableName: String,
         configuredBy environmentKey: String,
         environment: [String: String],
-        currentDirectoryPath: String
+        currentDirectoryPath: String,
+        bundleResourceURL: URL?
     ) -> URL? {
         var candidates: [URL] = []
         if let configuredPath = environment[environmentKey],
            !configuredPath.isEmpty {
             candidates.append(URL(fileURLWithPath: configuredPath))
+        }
+        if let bundleResourceURL {
+            candidates.append(
+                bundleResourceURL
+                    .appending(path: "bin", directoryHint: .isDirectory)
+                    .appending(path: executableName)
+            )
         }
         candidates.append(
             URL(fileURLWithPath: currentDirectoryPath, isDirectory: true)
