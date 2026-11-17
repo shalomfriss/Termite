@@ -3,6 +3,7 @@ import SwiftUI
 struct AIConversationPanel: View {
     @ObservedObject var session: TerminalSession
     @ObservedObject var settings: AISettings
+    @State private var isDropTargeted = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -23,14 +24,12 @@ struct AIConversationPanel: View {
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
                 Spacer()
-                Button { session.clearAIConversation() } label: {
-                    Image(systemName: "trash")
-                }
+                Button("Clear conversation", systemImage: "trash", action: session.clearAIConversation)
+                .labelStyle(.iconOnly)
                 .buttonStyle(.plain)
                 .help("Clear conversation")
-                Button { session.isAIChatVisible = false } label: {
-                    Image(systemName: "xmark")
-                }
+                Button("Close AI chat", systemImage: "xmark") { session.isAIChatVisible = false }
+                .labelStyle(.iconOnly)
                 .buttonStyle(.plain)
                 .help("Close AI chat")
             }
@@ -79,57 +78,58 @@ struct AIConversationPanel: View {
                     .padding(.bottom, 5)
             }
 
-            if let attachment = session.aiAttachment {
-                HStack(spacing: 8) {
-                    Image(systemName: "terminal")
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(attachment.command).lineLimit(1)
-                        Text("\(attachment.output.count) characters of output")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.tertiary)
+            if !session.aiAttachments.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(spacing: 7) {
+                        ForEach(session.aiAttachments) { attachment in
+                            AIAttachmentChip(attachment: attachment) {
+                                session.removeAIAttachment(attachment.id)
+                            }
+                        }
                     }
-                    Spacer()
-                    Button { session.aiAttachment = nil } label: { Image(systemName: "xmark.circle.fill") }
-                        .buttonStyle(.plain)
+                    .padding(.horizontal, 10)
                 }
-                .font(.system(size: 11, design: .monospaced))
-                .padding(.horizontal, 10)
-                .frame(height: 38)
-                .background(Color.white.opacity(0.045))
-                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                .padding(.horizontal, 10)
+                .frame(height: 42)
                 .padding(.bottom, 6)
             }
 
             HStack(alignment: .bottom, spacing: 8) {
-                TextEditor(text: $session.aiDraft)
+                TextField("Ask about the terminal, or drop files and folders here", text: $session.aiDraft, axis: .vertical)
                     .font(.system(size: 12))
-                    .scrollContentBackground(.hidden)
-                    .frame(minHeight: 38, maxHeight: 68)
-                    .padding(4)
-                    .background(Color.black.opacity(0.2))
-                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-                Button {
-                    session.sendAIMessage(using: settings)
-                } label: {
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 12, weight: .bold))
-                        .frame(width: 28, height: 28)
-                }
+                    .lineLimit(2...5)
+                    .textFieldStyle(.plain)
+                    .padding(8)
+                    .background(isDropTargeted ? TerminalTheme.cyan.opacity(0.12) : Color.black.opacity(0.2))
+                    .clipShape(.rect(cornerRadius: 7))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 7)
+                            .stroke(isDropTargeted ? TerminalTheme.cyan : Color.clear, lineWidth: 1)
+                    }
+                Button("Send", systemImage: "arrow.up") { session.sendAIMessage(using: settings) }
+                .labelStyle(.iconOnly)
+                .font(.system(size: 12, weight: .bold))
+                .frame(width: 28, height: 28)
                 .buttonStyle(.borderedProminent)
-                .disabled(session.aiDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || session.isAIResponding)
+                .disabled(
+                    session.aiDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        && session.aiAttachments.isEmpty
+                        || session.isAIResponding
+                )
                 .keyboardShortcut(.return, modifiers: .command)
                 .help("Send (Command-Return)")
             }
             .padding(10)
         }
-        .frame(minHeight: 180, idealHeight: 250, maxHeight: 310)
+        .frame(minHeight: 180, idealHeight: 250)
         .background(TerminalTheme.surface)
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .clipShape(.rect(cornerRadius: 8))
         .overlay {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                .stroke(isDropTargeted ? TerminalTheme.cyan.opacity(0.8) : Color.white.opacity(0.1), lineWidth: 1)
         }
+        .dropDestination(for: URL.self) { urls, _ in
+            session.attachFilesToAI(urls)
+        } isTargeted: { isDropTargeted = $0 }
     }
 }
 
@@ -141,14 +141,9 @@ private struct AIMessageView: View {
             Text(message.role == .user ? "You" : "AI")
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.secondary)
-            if let attachment = message.attachment {
-                Label(attachment.command, systemImage: "terminal")
-                    .font(.system(size: 10, design: .monospaced))
-                    .lineLimit(1)
-                    .padding(6)
+            ForEach(message.attachments) { attachment in
+                AIAttachmentChip(attachment: attachment)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.white.opacity(0.05))
-                    .clipShape(RoundedRectangle(cornerRadius: 5))
             }
             Text(message.text)
                 .font(.system(size: 12))

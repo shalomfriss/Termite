@@ -6,14 +6,16 @@ struct GraphicalViewPicker: View {
     var body: some View {
         HStack(spacing: 3) {
             ForEach(GraphicalViewMode.allCases) { mode in
-                Button(mode.title, systemImage: mode.systemImage) {
+                Button {
                     selection = mode
+                } label: {
+                    Image(systemName: mode.systemImage)
+                        .frame(width: 30, height: 26)
+                        .contentShape(.rect)
                 }
-                .labelStyle(.iconOnly)
                 .buttonStyle(.plain)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(selection == mode ? TerminalTheme.canvas : TerminalTheme.mutedText)
-                .frame(width: 30, height: 26)
                 .background(
                     selection == mode ? TerminalTheme.cyan : .clear,
                     in: .rect(cornerRadius: 7)
@@ -24,6 +26,8 @@ struct GraphicalViewPicker: View {
                             .stroke(.white.opacity(0.24), lineWidth: 1)
                     }
                 }
+                .contentShape(.rect)
+                .accessibilityLabel(mode.title)
                 .accessibilityAddTraits(selection == mode ? .isSelected : [])
                 .help("\(mode.title) view")
             }

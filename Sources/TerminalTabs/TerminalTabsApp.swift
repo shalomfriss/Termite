@@ -20,7 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 @main
-struct TerminalTabsApp: App {
+struct AirApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var store = TerminalStore()
 
@@ -73,6 +73,12 @@ struct TerminalTabsApp: App {
                     store.selected?.clearAIConversation()
                 }
             }
+            CommandMenu("Jobs") {
+                Button("Scheduled Jobs…", systemImage: "clock") {
+                    store.isScheduledJobsVisible = true
+                }
+                .keyboardShortcut("j", modifiers: [.command, .shift])
+            }
         }
     }
 }
@@ -82,13 +88,25 @@ struct TerminalWindow: View {
     @State private var isRenamingGroup = false
     @State private var renameGroupID: UUID?
     @State private var groupNameDraft = ""
+    @State private var verticalPanelWidth: CGFloat = 238
+    @State private var verticalPanelDragStartWidth: CGFloat?
 
     var body: some View {
         Group {
-            if store.isTabBarVisible && store.tabOrientation == .vertical {
-                HStack(spacing: 0) {
-                    VerticalTabSidebar(store: store, rename: beginRename)
-                    terminal
+            if store.tabOrientation == .vertical {
+                VStack(spacing: 0) {
+                    VerticalPanelHeader(store: store)
+                    HStack(spacing: 0) {
+                        if store.isTabBarVisible {
+                            VerticalTabSidebar(store: store, rename: beginRename)
+                                .frame(width: verticalPanelWidth)
+                                .transition(.move(edge: .leading).combined(with: .opacity))
+                            VerticalPanelResizeHandle()
+                                .gesture(verticalPanelResizeGesture)
+                                .transition(.opacity)
+                        }
+                        terminal
+                    }
                 }
             } else {
                 VStack(spacing: 0) {
@@ -102,6 +120,7 @@ struct TerminalWindow: View {
             }
         }
         .background(TerminalTheme.backdrop)
+        .animation(.smooth(duration: 0.22), value: store.isTabBarVisible)
         .onAppear {
             NSRunningApplication.current.activate(options: .activateAllWindows)
         }
@@ -114,6 +133,9 @@ struct TerminalWindow: View {
         }
         .sheet(isPresented: $store.isSettingsVisible) {
             AppSettingsView(store: store, settings: store.aiSettings)
+        }
+        .sheet(isPresented: $store.isScheduledJobsVisible) {
+            ScheduledJobsView(store: store)
         }
     }
 
@@ -130,6 +152,74 @@ struct TerminalWindow: View {
         groupNameDraft = group.name
         isRenamingGroup = true
     }
+
+    private var verticalPanelResizeGesture: some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { value in
+                if verticalPanelDragStartWidth == nil {
+                    verticalPanelDragStartWidth = verticalPanelWidth
+                }
+                verticalPanelWidth = min(
+                    420,
+                    max(180, (verticalPanelDragStartWidth ?? verticalPanelWidth) + value.translation.width)
+                )
+            }
+            .onEnded { _ in
+                verticalPanelDragStartWidth = nil
+            }
+    }
+}
+
+struct VerticalPanelHeader: View {
+    @ObservedObject var store: TerminalStore
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Spacer().frame(width: 72)
+            Button {
+                store.isTabBarVisible.toggle()
+            } label: {
+                Image(systemName: store.tabOrientation.panelSystemImage)
+                    .font(.system(size: 13, weight: .semibold))
+                    .frame(width: 28, height: 26)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(store.isTabBarVisible ? TerminalTheme.cyan : TerminalTheme.mutedText)
+            .background(
+                store.isTabBarVisible ? TerminalTheme.cyan.opacity(0.12) : .clear,
+                in: .rect(cornerRadius: 6)
+            )
+            .help(store.tabPanelVisibilityActionTitle)
+
+            Text(store.selected?.title ?? "Terminal")
+                .font(.caption)
+                .foregroundStyle(TerminalTheme.mutedText)
+                .lineLimit(1)
+            Spacer()
+            ScheduledJobsButton(store: store)
+            TabSettingsMenu(store: store)
+            Spacer().frame(width: 8)
+        }
+        .frame(height: 38)
+        .background(TerminalTheme.surface)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(.white.opacity(0.055)).frame(height: 1)
+        }
+    }
+}
+
+struct VerticalPanelResizeHandle: View {
+    @State private var isHovering = false
+
+    var body: some View {
+        Rectangle()
+            .fill(isHovering ? TerminalTheme.cyan.opacity(0.42) : TerminalTheme.cyan.opacity(0.16))
+            .frame(width: 4)
+            .contentShape(Rectangle().inset(by: -3))
+            .onHover { isHovering = $0 }
+            .help("Resize side panel")
+    }
 }
 
 struct TerminalWorkspace: View {
@@ -142,35 +232,31 @@ struct TerminalWorkspace: View {
             GraphicalModeToolbar(
                 session: session,
                 isEnabled: $store.graphicalMode,
-                viewMode: $store.graphicalViewMode
+                viewMode: $store.graphicalViewMode,
+                showsHiddenFiles: $store.graphicalShowsHiddenFiles,
+                sortOption: $store.graphicalSortOption,
+                groupOption: $store.graphicalGroupOption,
+                sortDirection: $store.graphicalSortDirection,
+                foldersFirst: $store.graphicalFoldersFirst
             )
 
-            TerminalCanvas(
-                session: session,
-                openDirectoryInNewTab: { directory in
-                    store.newTab(startingIn: directory.path)
-                }
-            )
-            .id(session.id)
-            .clipShape(.rect(cornerRadius: 13))
-            .overlay {
-                RoundedRectangle(cornerRadius: 13)
-                    .stroke(
-                        store.graphicalMode
-                            ? TerminalTheme.cyan.opacity(0.22)
-                            : Color.white.opacity(0.06),
-                        lineWidth: 1
-                    )
-            }
-            .shadow(
-                color: store.graphicalMode
-                    ? TerminalTheme.cyan.opacity(0.08)
-                    : TerminalTheme.canvas.opacity(0.32),
-                radius: 18,
-                y: 8
-            )
             if session.isAIChatVisible {
-                AIConversationPanel(session: session, settings: settings)
+                ResizableTerminalAIPane(
+                    session: session,
+                    store: store,
+                    settings: settings,
+                    openDirectoryInNewTab: { directory in
+                        store.newTab(startingIn: directory.path)
+                    }
+                )
+            } else {
+                TerminalSurface(
+                    session: session,
+                    store: store,
+                    openDirectoryInNewTab: { directory in
+                        store.newTab(startingIn: directory.path)
+                    }
+                )
             }
         }
     }
@@ -205,6 +291,7 @@ struct HorizontalTabBar: View {
                 SmallIconButton(systemName: "plus", help: "New tab (Command-T)") {
                     store.newTab()
                 }
+                ScheduledJobsButton(store: store)
                 TabSettingsMenu(store: store)
                 SmallIconButton(
                     systemName: store.tabOrientation.panelSystemImage,
@@ -254,14 +341,9 @@ struct VerticalTabSidebar: View {
                 SmallIconButton(systemName: "folder.badge.plus", help: "New tab group") {
                     store.newGroup()
                 }
+                ScheduledJobsButton(store: store)
                 TabSettingsMenu(store: store)
                 Spacer()
-                SmallIconButton(
-                    systemName: store.tabOrientation.panelSystemImage,
-                    help: "Hide side panel"
-                ) {
-                    store.isTabBarVisible = false
-                }
             }
             .padding(.horizontal, 8)
             .frame(height: 42)
@@ -321,7 +403,6 @@ struct VerticalTabSidebar: View {
                 .padding(.vertical, 10)
             }
         }
-        .frame(width: 238)
         .background(TerminalTheme.surface)
         .overlay(alignment: .trailing) {
             Rectangle().fill(TerminalTheme.cyan.opacity(0.22)).frame(width: 1)
@@ -349,6 +430,7 @@ struct CompactTitleBar: View {
             .background(TerminalTheme.raised.opacity(0.62), in: .rect(cornerRadius: 7))
             .help(store.tabPanelVisibilityActionTitle)
             Spacer()
+            ScheduledJobsButton(store: store)
             TabSettingsMenu(store: store)
             Spacer().frame(width: 8)
         }

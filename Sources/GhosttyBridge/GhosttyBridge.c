@@ -247,11 +247,18 @@ static void set_error(const char **out, const char *message) {
 }
 
 GTSession *gt_session_create(uint16_t cols, uint16_t rows, const char **error) {
-    return gt_session_create_at(cols, rows, NULL, error);
+    return gt_session_create_configured(cols, rows, NULL, NULL, error);
 }
 
 GTSession *gt_session_create_at(uint16_t cols, uint16_t rows,
                                 const char *working_directory, const char **error) {
+    return gt_session_create_configured(cols, rows, working_directory, NULL, error);
+}
+
+GTSession *gt_session_create_configured(uint16_t cols, uint16_t rows,
+                                        const char *working_directory,
+                                        const char *shell_integration_directory,
+                                        const char **error) {
     const char *load_error = gt_runtime_error();
     if (load_error) { set_error(error, load_error); return NULL; }
     GTSession *s = calloc(1, sizeof(*s));
@@ -293,6 +300,15 @@ GTSession *gt_session_create_at(uint16_t cols, uint16_t rows,
         if (!shell || !shell[0]) shell = "/bin/zsh";
         const char *name = strrchr(shell, '/');
         name = name ? name + 1 : shell;
+        if (shell_integration_directory && strcmp(name, "zsh") == 0) {
+            const char *original_zdotdir = getenv("ZDOTDIR");
+            if (!original_zdotdir || !original_zdotdir[0]) original_zdotdir = getenv("HOME");
+            if (original_zdotdir && original_zdotdir[0]) {
+                setenv("TERMINAL_TABS_ORIGINAL_ZDOTDIR", original_zdotdir, 1);
+            }
+            setenv("TERMINAL_TABS_INTEGRATION_ZDOTDIR", shell_integration_directory, 1);
+            setenv("ZDOTDIR", shell_integration_directory, 1);
+        }
         char login_name[256];
         snprintf(login_name, sizeof(login_name), "-%s", name);
         setenv("TERM", "xterm-256color", 1);

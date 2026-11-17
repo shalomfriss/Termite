@@ -2,10 +2,10 @@
 import PackageDescription
 
 let package = Package(
-    name: "TerminalTabs",
+    name: "Air",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "TerminalTabs", targets: ["TerminalTabs"]),
+        .executable(name: "Air", targets: ["Air"]),
     ],
     targets: [
         .target(
@@ -14,14 +14,15 @@ let package = Package(
             publicHeadersPath: "include"
         ),
         .executableTarget(
-            name: "TerminalTabs",
+            name: "Air",
             dependencies: ["GhosttyBridge"],
             path: "Sources/TerminalTabs",
+            resources: [.copy("Resources/ShellIntegration")],
             linkerSettings: [.linkedFramework("Security")]
         ),
         .testTarget(
-            name: "TerminalTabsTests",
-            dependencies: ["TerminalTabs"],
+            name: "AirTests",
+            dependencies: ["Air"],
             path: "Tests/TerminalTabsTests"
         ),
     ]

@@ -22,4 +22,4 @@ export LIBGHOSTTY_VT_PATH="$library_path"
 export TERMINAL_TABS_EZA_PATH="$eza_path"
 export TERMINAL_TABS_LSTR_PATH="$lstr_path"
 cd "$repo_root"
-swift run TerminalTabs
+swift run Air

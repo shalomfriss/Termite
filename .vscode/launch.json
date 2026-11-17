@@ -5,20 +5,20 @@
             "request": "launch",
             "args": [],
             "cwd": "${workspaceFolder:libghostty}",
-            "name": "Debug TerminalTabs",
-            "target": "TerminalTabs",
+            "name": "Debug Air",
+            "target": "Air",
             "configuration": "debug",
-            "preLaunchTask": "swift: Build Debug TerminalTabs"
+            "preLaunchTask": "swift: Build Debug Air"
         },
         {
             "type": "swift",
             "request": "launch",
             "args": [],
             "cwd": "${workspaceFolder:libghostty}",
-            "name": "Release TerminalTabs",
-            "target": "TerminalTabs",
+            "name": "Release Air",
+            "target": "Air",
             "configuration": "release",
-            "preLaunchTask": "swift: Build Release TerminalTabs"
+            "preLaunchTask": "swift: Build Release Air"
         }
     ]
 }

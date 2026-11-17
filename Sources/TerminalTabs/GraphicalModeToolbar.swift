@@ -4,6 +4,12 @@ struct GraphicalModeToolbar: View {
     @ObservedObject var session: TerminalSession
     @Binding var isEnabled: Bool
     @Binding var viewMode: GraphicalViewMode
+    @Binding var showsHiddenFiles: Bool
+    @Binding var sortOption: GraphicalSortOption
+    @Binding var groupOption: GraphicalGroupOption
+    @Binding var sortDirection: GraphicalSortDirection
+    @Binding var foldersFirst: Bool
+    @State private var isNewFolderPopoverPresented = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -60,6 +66,12 @@ struct GraphicalModeToolbar: View {
                         .foregroundStyle(TerminalTheme.mutedText)
                 }
 
+                if session.isGraphicalNavigationInProgress {
+                    ProgressView()
+                        .controlSize(.small)
+                        .help("Opening folder…")
+                }
+
                 Button("Attach listing to AI Chat", systemImage: "paperclip") {
                     session.attachGraphicalOutputToAI()
                 }
@@ -79,7 +91,64 @@ struct GraphicalModeToolbar: View {
                 .foregroundStyle(TerminalTheme.mutedText)
                 .frame(width: 28, height: 28)
                 .background(.white.opacity(0.045), in: .rect(cornerRadius: 7))
+                .disabled(session.isGraphicalNavigationInProgress)
                 .help("Refresh directory")
+
+                Button("New folder", systemImage: "folder.badge.plus") {
+                    isNewFolderPopoverPresented = true
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.plain)
+                .foregroundStyle(TerminalTheme.mutedText)
+                .frame(width: 28, height: 28)
+                .background(.white.opacity(0.045), in: .rect(cornerRadius: 7))
+                .disabled(session.isGraphicalNavigationInProgress)
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+                .help("New folder (Shift-Command-N)")
+                .popover(isPresented: $isNewFolderPopoverPresented, arrowEdge: .bottom) {
+                    NewFolderPopover(suggestedName: session.suggestedGraphicalFolderName) { name in
+                        try session.createGraphicalFolder(named: name)
+                    }
+                }
+
+                Menu {
+                    Picker("Sort By", selection: $sortOption) {
+                        ForEach(GraphicalSortOption.allCases) { option in
+                            Text(option.title).tag(option)
+                        }
+                    }
+                    Picker("Group By", selection: $groupOption) {
+                        ForEach(GraphicalGroupOption.allCases) { option in
+                            Text(option.title).tag(option)
+                        }
+                    }
+                    Divider()
+                    Picker("Direction", selection: $sortDirection) {
+                        ForEach(GraphicalSortDirection.allCases) { direction in
+                            Label(direction.title, systemImage: direction.systemImage)
+                                .tag(direction)
+                        }
+                    }
+                    Toggle("Keep Folders on Top", isOn: $foldersFirst)
+                } label: {
+                    Image(systemName: "square.grid.3x3.square")
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .frame(width: 28, height: 28)
+                .fixedSize()
+                .foregroundStyle(TerminalTheme.mutedText)
+                .background(.white.opacity(0.045), in: .rect(cornerRadius: 7))
+                .help("Arrange and group items")
+
+                Toggle("Show hidden files", isOn: $showsHiddenFiles)
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
+                    .foregroundStyle(TerminalTheme.mutedText)
+                    .fixedSize()
+                    .help("Show files and folders whose names begin with a period")
 
                 GraphicalViewPicker(selection: $viewMode)
             } else {
@@ -99,6 +168,13 @@ struct GraphicalModeToolbar: View {
         }
         .shadow(color: TerminalTheme.canvas.opacity(0.42), radius: 14, y: 7)
         .animation(reduceMotion ? nil : .smooth(duration: 0.22), value: isEnabled)
+        .alert(item: $session.graphicalOperationIssue) { issue in
+            Alert(
+                title: Text(issue.title),
+                message: Text(issue.message),
+                dismissButton: .default(Text("OK"))
+            )
+        }
     }
 
     private var directoryName: String {

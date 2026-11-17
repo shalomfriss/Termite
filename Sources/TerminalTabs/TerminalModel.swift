@@ -3,6 +3,7 @@ import Combine
 import Darwin
 import Foundation
 import GhosttyBridge
+import UniformTypeIdentifiers
 
 struct TerminalCommandBlock: Equatable {
     let command: String
@@ -27,6 +28,11 @@ struct GraphicalFileItem: Identifiable, Equatable, Sendable {
     var group = "-"
     var size: UInt64 = 0
     var modified = Date.distantPast
+    var created = Date.distantPast
+    var added = Date.distantPast
+    var lastOpened = Date.distantPast
+    var kindDescription = "Item"
+    var tags: [String] = []
     var id: String { path }
 }
 
@@ -78,6 +84,16 @@ struct CommandLineTracker {
 
 @MainActor
 final class TerminalSession: ObservableObject, Identifiable {
+    static let graphicalNavigationConcealSequence = Data("\u{1B}[8m".utf8)
+    static let graphicalNavigationRevealSequence = Data("\u{1B}[28m".utf8)
+
+    static var shellIntegrationDirectory: String? {
+        Bundle.module.url(
+            forResource: "ShellIntegration",
+            withExtension: nil
+        )?.path
+    }
+
     let id = UUID()
     let handle: OpaquePointer?
 
@@ -88,18 +104,27 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published var isAIChatVisible = false
     @Published var aiDraft = ""
     @Published var aiMessages: [AIChatMessage] = []
-    @Published var aiAttachment: TerminalBlockAttachment?
+    @Published var aiAttachments: [AIInputAttachment] = []
     @Published var isAIResponding = false
     @Published var aiError: String?
     @Published var graphicalMode = false
+    @Published private(set) var isGraphicalNavigationInProgress = false
+    @Published var graphicalOperationIssue: GraphicalOperationIssue?
     @Published var tabAccentColor: NSColor?
+    @Published private(set) var gitBranch: String? = nil
     var graphicalViewMode: GraphicalViewMode = .icons
+    var graphicalShowsHiddenFiles = false
+    var graphicalSortOption: GraphicalSortOption = .name
+    var graphicalGroupOption: GraphicalGroupOption = .none
+    var graphicalSortDirection: GraphicalSortDirection = .ascending
+    var graphicalFoldersFirst = true
     var listingBackend: ListingBackend = .eza
     let error: String?
     private var terminalTitle = "Shell"
     private var customTitle: String?
     private var shellWorkingDirectory = FileManager.default.currentDirectoryPath
     private(set) var commandBlocks: [TerminalCommandBlock] = []
+    private var collapsedTerminalBlockIDs: Set<TerminalBlockID> = []
     private var commandLine = CommandLineTracker()
     private var isMarkingInput = false
     private var terminalColumns = 100
@@ -108,6 +133,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var graphicalItemsByPlacementID: [UInt32: GraphicalFileItem] = [:]
     private var graphicalHitLayoutsByPlacementID: [UInt32: GraphicalHitLayout] = [:]
     private var currentGraphicalListing: GraphicalDirectoryListing?
+    private var graphicalNavigationTask: Task<Void, Never>?
+    private var graphicalStartupTask: Task<Void, Never>?
+    private var graphicalNavigationGeneration: UInt = 0
 
     init(
         cols: UInt16 = 100,
@@ -119,9 +147,25 @@ final class TerminalSession: ObservableObject, Identifiable {
             URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL.path
         }
         var message: UnsafePointer<CChar>?
+        let shellIntegrationDirectory = Self.shellIntegrationDirectory
         if let initialDirectory {
-            handle = initialDirectory.withCString {
-                gt_session_create_at(cols, rows, $0, &message)
+            handle = initialDirectory.withCString { directory in
+                guard let shellIntegrationDirectory else {
+                    return gt_session_create_at(cols, rows, directory, &message)
+                }
+                return shellIntegrationDirectory.withCString { integrationDirectory in
+                    gt_session_create_configured(
+                        cols,
+                        rows,
+                        directory,
+                        integrationDirectory,
+                        &message
+                    )
+                }
+            }
+        } else if let shellIntegrationDirectory {
+            handle = shellIntegrationDirectory.withCString { integrationDirectory in
+                gt_session_create_configured(cols, rows, nil, integrationDirectory, &message)
             }
         } else {
             handle = gt_session_create(cols, rows, &message)
@@ -136,9 +180,12 @@ final class TerminalSession: ObservableObject, Identifiable {
             workingDirectory = initialDirectory
             shellWorkingDirectory = initialDirectory
         }
+        refreshGitBranch()
     }
 
     isolated deinit {
+        graphicalNavigationTask?.cancel()
+        graphicalStartupTask?.cancel()
         if let handle { gt_session_destroy(handle) }
     }
 
@@ -176,6 +223,53 @@ final class TerminalSession: ObservableObject, Identifiable {
                 workingDirectory = shellWorkingDirectory
             }
         }
+        refreshGitBranch()
+    }
+
+    private func refreshGitBranch() {
+        let branch = Self.gitBranchName(at: workingDirectory)
+        if branch != gitBranch { gitBranch = branch }
+    }
+
+    nonisolated static func gitBranchName(at path: String) -> String? {
+        let fileManager = FileManager.default
+        var directory = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+
+        while true {
+            let dotGit = directory.appending(path: ".git")
+            var isDirectory = ObjCBool(false)
+            if fileManager.fileExists(atPath: dotGit.path, isDirectory: &isDirectory) {
+                let gitDirectory: URL
+                if isDirectory.boolValue {
+                    gitDirectory = dotGit
+                } else if let marker = try? String(contentsOf: dotGit, encoding: .utf8),
+                          marker.hasPrefix("gitdir:") {
+                    let rawPath = marker
+                        .dropFirst("gitdir:".count)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    gitDirectory = URL(
+                        fileURLWithPath: rawPath,
+                        relativeTo: directory
+                    ).standardizedFileURL
+                } else {
+                    return nil
+                }
+
+                guard let head = try? String(
+                    contentsOf: gitDirectory.appending(path: "HEAD"),
+                    encoding: .utf8
+                ).trimmingCharacters(in: .whitespacesAndNewlines),
+                !head.isEmpty else { return nil }
+                if head.hasPrefix("ref: refs/heads/") {
+                    return String(head.dropFirst("ref: refs/heads/".count))
+                }
+                return String(head.prefix(7))
+            }
+
+            let parent = directory.deletingLastPathComponent().standardizedFileURL
+            if parent.path == directory.path { return nil }
+            directory = parent
+        }
     }
 
     func rename(to value: String) {
@@ -190,6 +284,54 @@ final class TerminalSession: ObservableObject, Identifiable {
             guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return }
             _ = gt_session_write(handle, base, data.count)
         }
+    }
+
+    func executeScheduledScript(_ script: String) async throws {
+        guard let handle, gt_session_is_running(handle) else {
+            throw ScheduledJobError.shellUnavailable
+        }
+        guard !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ScheduledJobError.emptyScript
+        }
+
+        // A scheduled script is real shell input even when the global graphical
+        // listing mode is enabled. Prevent its startup listing from racing the job.
+        graphicalStartupTask?.cancel()
+        graphicalStartupTask = nil
+
+        var candidatePrompt: String?
+        var stableChecks = 0
+        for attempt in 0..<240 {
+            try Task.checkCancellation()
+            if gt_session_poll(handle) {
+                revision &+= 1
+                refreshFrame()
+            }
+            guard gt_session_is_running(handle) else {
+                throw ScheduledJobError.shellUnavailable
+            }
+            if let prompt = visiblePromptText(handle: handle), !prompt.isEmpty {
+                if prompt == candidatePrompt {
+                    stableChecks += 1
+                } else {
+                    candidatePrompt = prompt
+                    stableChecks = 1
+                }
+                if stableChecks >= 3,
+                   Self.looksLikeShellPrompt(prompt) || attempt >= 200 {
+                    write(Data(script.utf8))
+                    if script.utf8.last != 0x0A, script.utf8.last != 0x0D {
+                        write(Data([0x0D]))
+                    }
+                    return
+                }
+            } else {
+                candidatePrompt = nil
+                stableChecks = 0
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        throw ScheduledJobError.shellReadinessTimedOut
     }
 
     func sendUserInput(_ data: Data) {
@@ -254,9 +396,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             }
             if graphicalMode, let directoryChangeTarget {
                 isMarkingInput = false
-                Task { @MainActor [weak self] in
-                    await self?.navigateGraphically(to: directoryChangeTarget)
-                }
+                requestGraphicalNavigation(to: directoryChangeTarget)
                 return
             }
         }
@@ -269,13 +409,28 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard FileManager.default.fileExists(atPath: item.path, isDirectory: &isDirectory) else { return }
         if isDirectory.boolValue {
             let target = URL(fileURLWithPath: item.path, isDirectory: true).standardizedFileURL.path
-            workingDirectory = target
-            revision &+= 1
-            Task { @MainActor [weak self] in
-                await self?.navigateGraphically(to: target)
-            }
+            requestGraphicalNavigation(to: target)
         } else {
-            NSWorkspace.shared.open(URL(fileURLWithPath: item.path))
+            let url = URL(fileURLWithPath: item.path)
+            performWhenUbiquitousItemIsAvailable(url, title: "Couldn’t Open File") {
+                NSWorkspace.shared.open(url)
+            }
+        }
+    }
+
+    func listGraphicalDirectory(_ item: GraphicalFileItem) {
+        guard graphicalMode, graphicalItemIsDirectory(item) else { return }
+        sendUserInput(Data("ls -- \(Self.shellQuoted(item.path))".utf8))
+        sendUserInput(Data([0x0D]))
+    }
+
+    func catGraphicalFile(_ item: GraphicalFileItem) {
+        guard graphicalMode, graphicalItemCanDisplayAsText(item) else { return }
+        let url = URL(fileURLWithPath: item.path)
+        performWhenUbiquitousItemIsAvailable(url, title: "Couldn’t Read File") { [weak self] in
+            guard let self, self.graphicalItemCanDisplayAsText(item) else { return }
+            self.sendUserInput(Data("cat -- \(Self.shellQuoted(item.path))".utf8))
+            self.sendUserInput(Data([0x0D]))
         }
     }
 
@@ -283,6 +438,129 @@ final class TerminalSession: ObservableObject, Identifiable {
         var isDirectory = ObjCBool(false)
         return FileManager.default.fileExists(atPath: item.path, isDirectory: &isDirectory)
             && isDirectory.boolValue
+    }
+
+    func graphicalItemCanDisplayAsText(_ item: GraphicalFileItem) -> Bool {
+        guard !graphicalItemIsDirectory(item) else { return false }
+        let url = URL(fileURLWithPath: item.path)
+        guard FileManager.default.fileExists(atPath: url.path) else { return false }
+
+        if let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType {
+            if contentType.conforms(to: .text) { return true }
+            if contentType.conforms(to: .image)
+                || contentType.conforms(to: .audio)
+                || contentType.conforms(to: .movie)
+                || contentType.conforms(to: .archive)
+                || contentType.conforms(to: .executable) {
+                return false
+            }
+        }
+
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let sample = try? handle.read(upToCount: 8_192) else { return false }
+        guard !sample.isEmpty else { return true }
+        if sample.contains(0) { return false }
+        return String(data: sample, encoding: .utf8) != nil
+    }
+
+    var suggestedGraphicalFolderName: String {
+        let directory = graphicalDirectoryURL
+        let manager = FileManager.default
+        var index = 1
+        while true {
+            let name = index == 1 ? "untitled folder" : "untitled folder \(index)"
+            if !manager.fileExists(atPath: directory.appending(path: name).path) {
+                return name
+            }
+            index += 1
+        }
+    }
+
+    @discardableResult
+    func createGraphicalFolder(named rawName: String) throws -> URL {
+        guard graphicalMode else { throw GraphicalFolderCreationError.graphicalModeRequired }
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty,
+              name != ".",
+              name != "..",
+              !name.contains("/"),
+              !name.contains("\0") else {
+            throw GraphicalFolderCreationError.invalidName
+        }
+
+        let destination = graphicalDirectoryURL.appending(path: name, directoryHint: .isDirectory)
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            throw GraphicalFolderCreationError.alreadyExists(name)
+        }
+        try FileManager.default.createDirectory(
+            at: destination,
+            withIntermediateDirectories: false
+        )
+        showCurrentDirectoryGraphically()
+        return destination
+    }
+
+    private var graphicalDirectoryURL: URL {
+        URL(
+            fileURLWithPath: currentGraphicalListing?.path ?? workingDirectory,
+            isDirectory: true
+        ).standardizedFileURL
+    }
+
+    nonisolated static func ensureUbiquitousItemIsAvailable(at url: URL) async throws {
+        let keys: Set<URLResourceKey> = [
+            .isUbiquitousItemKey,
+            .isDirectoryKey,
+            .ubiquitousItemDownloadingStatusKey,
+        ]
+        let initialValues = try url.resourceValues(forKeys: keys)
+        guard initialValues.isUbiquitousItem == true else { return }
+        if initialValues.isDirectory == true,
+           (try? FileManager.default.contentsOfDirectory(atPath: url.path)) != nil {
+            return
+        }
+        if Self.isAvailableUbiquitousStatus(initialValues.ubiquitousItemDownloadingStatus) {
+            return
+        }
+
+        try FileManager.default.startDownloadingUbiquitousItem(at: url)
+        for _ in 0..<120 {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(250))
+            let values = try url.resourceValues(forKeys: keys)
+            if Self.isAvailableUbiquitousStatus(values.ubiquitousItemDownloadingStatus) {
+                return
+            }
+        }
+        throw GraphicalOperationError.iCloudDownloadTimedOut(url.lastPathComponent)
+    }
+
+    nonisolated private static func isAvailableUbiquitousStatus(
+        _ status: URLUbiquitousItemDownloadingStatus?
+    ) -> Bool {
+        status == .current || status == .downloaded
+    }
+
+    private func performWhenUbiquitousItemIsAvailable(
+        _ url: URL,
+        title: String,
+        action: @escaping @MainActor () -> Void
+    ) {
+        Task { @MainActor [weak self] in
+            do {
+                try await Self.ensureUbiquitousItemIsAvailable(at: url)
+                try Task.checkCancellation()
+                action()
+            } catch is CancellationError {
+                return
+            } catch {
+                self?.graphicalOperationIssue = GraphicalOperationIssue(
+                    title: title,
+                    message: error.localizedDescription
+                )
+            }
+        }
     }
 
     func copyGraphicalItem(
@@ -348,6 +626,46 @@ final class TerminalSession: ObservableObject, Identifiable {
         return copiedAny
     }
 
+    func canMoveGraphicalItems(_ urls: [URL], into item: GraphicalFileItem) -> Bool {
+        guard graphicalMode, graphicalItemIsDirectory(item), !urls.isEmpty else { return false }
+        let destination = URL(fileURLWithPath: item.path, isDirectory: true).standardizedFileURL
+        let manager = FileManager.default
+        return urls.allSatisfy { source in
+            let source = source.standardizedFileURL
+            var isDirectory = ObjCBool(false)
+            guard manager.fileExists(atPath: source.path, isDirectory: &isDirectory),
+                  source != destination else { return false }
+            if isDirectory.boolValue, destination.path.hasPrefix(source.path + "/") {
+                return false
+            }
+            let target = destination.appendingPathComponent(source.lastPathComponent)
+            return !manager.fileExists(atPath: target.path)
+        }
+    }
+
+    @discardableResult
+    func moveGraphicalItems(_ urls: [URL], into item: GraphicalFileItem) -> Bool {
+        guard canMoveGraphicalItems(urls, into: item) else { return false }
+        let destination = URL(fileURLWithPath: item.path, isDirectory: true).standardizedFileURL
+        let manager = FileManager.default
+        var movedURLs: [(source: URL, destination: URL)] = []
+        for sourceURL in urls {
+            let source = sourceURL.standardizedFileURL
+            let target = destination.appendingPathComponent(source.lastPathComponent)
+            do {
+                try manager.moveItem(at: source, to: target)
+                movedURLs.append((source, target))
+            } catch {
+                for move in movedURLs.reversed() {
+                    try? manager.moveItem(at: move.destination, to: move.source)
+                }
+                return false
+            }
+        }
+        showCurrentDirectoryGraphically()
+        return true
+    }
+
     nonisolated static func availablePasteDestination(
         for source: URL,
         in directory: URL,
@@ -372,15 +690,50 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func setGraphicalMode(_ enabled: Bool) {
+        guard graphicalMode != enabled else { return }
         graphicalMode = enabled
         guard enabled else {
+            graphicalStartupTask?.cancel()
+            graphicalStartupTask = nil
+            graphicalNavigationTask?.cancel()
+            graphicalNavigationTask = nil
+            isGraphicalNavigationInProgress = false
             currentGraphicalListing = nil
             return
         }
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(80))
-            guard let self, self.graphicalMode, !self.isMarkingInput else { return }
-            self.showCurrentDirectoryGraphically()
+        graphicalStartupTask?.cancel()
+        graphicalStartupTask = Task { @MainActor [weak self] in
+            var candidatePrompt: String?
+            var stableChecks = 0
+            for attempt in 0..<80 {
+                do {
+                    try await Task.sleep(
+                        for: attempt == 0 ? .milliseconds(150) : .milliseconds(50)
+                    )
+                } catch {
+                    return
+                }
+                guard let self, self.graphicalMode, !self.isMarkingInput else { return }
+                self.poll()
+                guard let prompt = self.handle.flatMap({ self.visiblePromptText(handle: $0) }) else {
+                    candidatePrompt = nil
+                    stableChecks = 0
+                    continue
+                }
+                if prompt == candidatePrompt {
+                    stableChecks += 1
+                } else {
+                    candidatePrompt = prompt
+                    stableChecks = 1
+                }
+                guard stableChecks >= 4,
+                      Self.looksLikeShellPrompt(prompt) || attempt >= 70 else { continue }
+                if self.showCurrentDirectoryGraphically(preservingPrompt: prompt) {
+                    self.graphicalStartupTask = nil
+                    return
+                }
+            }
+            self?.graphicalStartupTask = nil
         }
     }
 
@@ -390,57 +743,174 @@ final class TerminalSession: ObservableObject, Identifiable {
         if refresh, graphicalMode { showCurrentDirectoryGraphically() }
     }
 
+    func setGraphicalShowsHiddenFiles(_ enabled: Bool, refresh: Bool = true) {
+        guard graphicalShowsHiddenFiles != enabled else { return }
+        graphicalShowsHiddenFiles = enabled
+        if refresh, graphicalMode { showCurrentDirectoryGraphically() }
+    }
+
+    func setGraphicalSortOption(_ option: GraphicalSortOption, refresh: Bool = true) {
+        guard graphicalSortOption != option else { return }
+        graphicalSortOption = option
+        if refresh, graphicalMode { showCurrentDirectoryGraphically() }
+    }
+
+    func setGraphicalGroupOption(_ option: GraphicalGroupOption, refresh: Bool = true) {
+        guard graphicalGroupOption != option else { return }
+        graphicalGroupOption = option
+        if refresh, graphicalMode { showCurrentDirectoryGraphically() }
+    }
+
+    func setGraphicalSortDirection(_ direction: GraphicalSortDirection, refresh: Bool = true) {
+        guard graphicalSortDirection != direction else { return }
+        graphicalSortDirection = direction
+        if refresh, graphicalMode { showCurrentDirectoryGraphically() }
+    }
+
+    func setGraphicalFoldersFirst(_ enabled: Bool, refresh: Bool = true) {
+        guard graphicalFoldersFirst != enabled else { return }
+        graphicalFoldersFirst = enabled
+        if refresh, graphicalMode { showCurrentDirectoryGraphically() }
+    }
+
     func setListingBackend(_ backend: ListingBackend, refresh: Bool = true) {
         guard listingBackend != backend else { return }
         listingBackend = backend
         if refresh, graphicalMode { showCurrentDirectoryGraphically() }
     }
 
-    func showCurrentDirectoryGraphically() {
-        guard graphicalMode, let handle else { return }
-        // Remove the idle prompt, replace it with the directory view, then ask
-        // the shell for a fresh prompt below the injected terminal output.
+    @discardableResult
+    func showCurrentDirectoryGraphically(preservingPrompt capturedPrompt: String? = nil) -> Bool {
+        guard graphicalMode,
+              !isGraphicalNavigationInProgress,
+              let handle,
+              let prompt = capturedPrompt ?? visiblePromptText(handle: handle) else { return false }
+        // Preserve the shell's existing idle prompt instead of submitting a
+        // blank command, which would make the shell emit a second prompt.
         write(Data([0x15]))
         usleep(8_000)
         if gt_session_poll(handle) { refreshFrame() }
         feedTerminalOutput("\r\u{1B}[2J\u{1B}[H", handle: handle)
-        let request = FileListingRequest(path: workingDirectory, showsHidden: true, detailed: false)
+        let request = FileListingRequest(
+            path: workingDirectory,
+            showsHidden: graphicalShowsHiddenFiles,
+            detailed: false
+        )
         if renderInlineFileListing(command: nil, request: request, handle: handle,
                                    clearShellInput: false) {
-            write(Data([0x0D]))
+            feedTerminalOutput(prompt, handle: handle)
+            return true
+        }
+        return false
+    }
+
+    nonisolated static func looksLikeShellPrompt(_ value: String) -> Bool {
+        guard let last = value.trimmingCharacters(in: .whitespacesAndNewlines).last else {
+            return false
+        }
+        return "%$#>❯❮›»λ".contains(last)
+    }
+
+    private func requestGraphicalNavigation(to rawTarget: String) {
+        guard graphicalMode else { return }
+        let targetURL = URL(fileURLWithPath: rawTarget, isDirectory: true).standardizedFileURL
+        graphicalStartupTask?.cancel()
+        graphicalStartupTask = nil
+        graphicalNavigationGeneration &+= 1
+        let generation = graphicalNavigationGeneration
+        graphicalNavigationTask?.cancel()
+        isGraphicalNavigationInProgress = true
+        workingDirectory = targetURL.path
+        revision &+= 1
+
+        graphicalNavigationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await Self.ensureUbiquitousItemIsAvailable(at: targetURL)
+                try Task.checkCancellation()
+                try await self.navigateGraphically(
+                    to: targetURL.path,
+                    generation: generation
+                )
+            } catch is CancellationError {
+                // A newer navigation request superseded this one.
+            } catch {
+                guard generation == self.graphicalNavigationGeneration else { return }
+                self.workingDirectory = self.shellWorkingDirectory
+                self.graphicalOperationIssue = GraphicalOperationIssue(
+                    title: "Couldn’t Open Folder",
+                    message: error.localizedDescription
+                )
+            }
+
+            guard generation == self.graphicalNavigationGeneration else { return }
+            if let handle = self.handle {
+                self.feedTerminalOutput(Self.graphicalNavigationRevealSequence, handle: handle)
+            }
+            self.isGraphicalNavigationInProgress = false
+            self.graphicalNavigationTask = nil
         }
     }
 
-    private func navigateGraphically(to target: String) async {
+    private func navigateGraphically(to target: String, generation: UInt) async throws {
         guard graphicalMode, let handle else { return }
         // Execute in the real shell so its process state remains authoritative.
         // This bypasses semantic command capture because navigation is a window
-        // action rather than a command the user typed.
+        // action rather than a command the user typed. Conceal its transient echo
+        // so graphical navigation never exposes the implementation command.
+        feedTerminalOutput(Self.graphicalNavigationConcealSequence, handle: handle)
+        var shouldRestoreVisibleOutput = true
+        defer {
+            if shouldRestoreVisibleOutput,
+               generation == graphicalNavigationGeneration {
+                feedTerminalOutput(Self.graphicalNavigationRevealSequence, handle: handle)
+            }
+        }
         write(Data([0x15]))
-        try? await Task.sleep(for: .milliseconds(10))
+        try await Task.sleep(for: .milliseconds(10))
+        try Task.checkCancellation()
         if gt_session_poll(handle) { refreshFrame() }
         write(Data(("cd -- \(Self.shellQuoted(target))\r").utf8))
-        for _ in 0..<60 {
-            try? await Task.sleep(for: .milliseconds(15))
+        var reachedTarget = false
+        for _ in 0..<200 {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(20))
             if gt_session_poll(handle) { refreshFrame() }
-            if URL(fileURLWithPath: shellWorkingDirectory).standardizedFileURL.path == target { break }
+            if URL(fileURLWithPath: shellWorkingDirectory).standardizedFileURL.path == target {
+                reachedTarget = true
+                break
+            }
         }
-        await drainShellOutput(handle: handle)
+        guard reachedTarget else { throw GraphicalOperationError.navigationTimedOut(target) }
+        try await drainShellOutput(handle: handle)
+        let prompt = try await waitForVisiblePrompt(handle: handle)
+        try Task.checkCancellation()
 
-        // Clear the transient echoed cd and prompt, then silently render the
-        // equivalent ls result and restore one clean prompt underneath it.
+        // Clear the concealed cd and prompt, then restore ordinary rendering
+        // before drawing the graphical listing and its preserved prompt.
         feedTerminalOutput("\r\u{1B}[2J\u{1B}[H", handle: handle)
-        let request = FileListingRequest(path: target, showsHidden: true, detailed: false)
-        if renderInlineFileListing(command: nil, request: request, handle: handle,
-                                   clearShellInput: false) {
-            write(Data([0x0D]))
-        }
+        feedTerminalOutput(Self.graphicalNavigationRevealSequence, handle: handle)
+        shouldRestoreVisibleOutput = false
+        let request = FileListingRequest(
+            path: target,
+            showsHidden: graphicalShowsHiddenFiles,
+            detailed: false
+        )
+        guard renderInlineFileListing(
+            command: nil,
+            request: request,
+            handle: handle,
+            clearShellInput: false
+        ) else { throw GraphicalOperationError.directoryUnavailable(target) }
+        feedTerminalOutput(prompt, handle: handle)
+        workingDirectory = target
     }
 
-    private func drainShellOutput(handle: OpaquePointer) async {
+    private func drainShellOutput(handle: OpaquePointer) async throws {
         var quietPolls = 0
-        for _ in 0..<20 {
-            try? await Task.sleep(for: .milliseconds(10))
+        for _ in 0..<40 {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(10))
             if gt_session_poll(handle) {
                 quietPolls = 0
                 refreshFrame()
@@ -449,6 +919,58 @@ final class TerminalSession: ObservableObject, Identifiable {
                 if quietPolls >= 3 { return }
             }
         }
+    }
+
+    private func waitForVisiblePrompt(handle: OpaquePointer) async throws -> String {
+        var candidate: String?
+        var stableChecks = 0
+        for _ in 0..<160 {
+            try Task.checkCancellation()
+            if gt_session_poll(handle) { refreshFrame() }
+            if let prompt = visiblePromptText(
+                handle: handle,
+                includesInvisibleCells: true
+            ), !prompt.isEmpty {
+                if prompt == candidate {
+                    stableChecks += 1
+                } else {
+                    candidate = prompt
+                    stableChecks = 1
+                }
+                if stableChecks >= 2 { return prompt }
+            } else {
+                candidate = nil
+                stableChecks = 0
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        throw GraphicalOperationError.promptUnavailable
+    }
+
+    private func visiblePromptText(
+        handle: OpaquePointer,
+        includesInvisibleCells: Bool = false
+    ) -> String? {
+        guard let framePointer = gt_session_frame(handle),
+              let cells = framePointer.pointee.cells,
+              framePointer.pointee.cursor_visible else { return nil }
+        let frame = framePointer.pointee
+        let row = Int(frame.cursor_y)
+        let columns = Int(frame.cols)
+        let endColumn = min(Int(frame.cursor_x), columns)
+        guard row >= 0, row < Int(frame.rows) else { return nil }
+
+        var prompt = ""
+        for column in 0..<endColumn {
+            let cell = cells[row * columns + column]
+            guard cell.text_len > 0 else { continue }
+            let isInvisible = cell.style & UInt16(GT_STYLE_INVISIBLE) != 0
+            guard includesInvisibleCells || !isInvisible else { continue }
+            prompt += withUnsafeBytes(of: cell.text) { raw in
+                String(decoding: raw.prefix(Int(cell.text_len)), as: UTF8.self)
+            }
+        }
+        return prompt
     }
 
     func graphicalItem(for placementID: UInt32) -> GraphicalFileItem? {
@@ -653,7 +1175,17 @@ final class TerminalSession: ObservableObject, Identifiable {
             currentGraphicalListing = nil
             return false
         }
-        let items = listing.items.filter { request.showsHidden || !$0.name.hasPrefix(".") || $0.name == ".." }
+        let visibleItems = listing.items.filter {
+            request.showsHidden || !$0.name.hasPrefix(".") || $0.name == ".."
+        }
+        let sections = Self.graphicalSections(
+            visibleItems,
+            sortBy: graphicalSortOption,
+            groupBy: graphicalGroupOption,
+            direction: graphicalSortDirection,
+            foldersFirst: graphicalFoldersFirst
+        )
+        let items = sections.flatMap(\.items)
         currentGraphicalListing = GraphicalDirectoryListing(
             path: listing.path,
             items: items,
@@ -686,17 +1218,22 @@ final class TerminalSession: ObservableObject, Identifiable {
             append("\u{1B}\\")
         }
 
-        if request.detailed {
-            renderDetailedListing(items, imageIDs: imageIDs, append: append)
-            if !items.isEmpty { append("\r\n") }
-        } else {
-            switch graphicalViewMode {
-            case .icons:
-                renderIconListing(items, imageIDs: imageIDs, append: append)
-            case .list:
-                renderSimpleList(items, imageIDs: imageIDs, append: append)
-            case .columns:
-                renderColumnListing(items, imageIDs: imageIDs, append: append)
+        for section in sections where !section.items.isEmpty {
+            if let title = section.title {
+                append("\u{1B}[38;2;112;196;198m  \(title)\u{1B}[0m\r\n")
+            }
+            if request.detailed {
+                renderDetailedListing(section.items, imageIDs: imageIDs, append: append)
+                append("\r\n")
+            } else {
+                switch graphicalViewMode {
+                case .icons:
+                    renderIconListing(section.items, imageIDs: imageIDs, append: append)
+                case .list:
+                    renderSimpleList(section.items, imageIDs: imageIDs, append: append)
+                case .columns:
+                    renderColumnListing(section.items, imageIDs: imageIDs, append: append)
+                }
             }
         }
         if items.isEmpty {
@@ -790,15 +1327,19 @@ final class TerminalSession: ObservableObject, Identifiable {
             guard let imageID = imageIDs[item.kind] else { continue }
             let placementID = nextGraphicalPlacementID
             nextGraphicalPlacementID &+= 1
-            graphicalItemsByPlacementID[placementID] = item
-            graphicalHitLayoutsByPlacementID[placementID] = GraphicalHitLayout(
-                leadingColumns: iconColumn,
-                widthColumns: max(1, terminalColumns - 2),
-                rowHeight: 1
-            )
             append("\u{1B}[\(iconColumn + 1)G")
             append("\u{1B}_Ga=p,i=\(imageID),p=\(placementID),c=2,r=1,C=1,q=2\u{1B}\\")
             let name = Self.truncatedGraphicalName(item.name, maximumCharacters: nameWidth)
+            graphicalItemsByPlacementID[placementID] = item
+            graphicalHitLayoutsByPlacementID[placementID] = GraphicalHitLayout(
+                leadingColumns: iconColumn,
+                widthColumns: Self.graphicalRowHitWidth(
+                    textColumn: textColumn,
+                    renderedTextCount: name.count,
+                    terminalColumns: terminalColumns
+                ),
+                rowHeight: 1
+            )
             append("\u{1B}[\(textColumn + 1)G")
             append(Self.labelColor(for: item.kind) + name + "\u{1B}[0m\r\n")
         }
@@ -852,12 +1393,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             guard let imageID = imageIDs[item.kind] else { continue }
             let placementID = nextGraphicalPlacementID
             nextGraphicalPlacementID &+= 1
-            graphicalItemsByPlacementID[placementID] = item
-            graphicalHitLayoutsByPlacementID[placementID] = GraphicalHitLayout(
-                leadingColumns: iconColumn,
-                widthColumns: max(1, terminalColumns - 2),
-                rowHeight: 1
-            )
             append("\u{1B}[\(iconColumn + 1)G")
             append("\u{1B}_Ga=p,i=\(imageID),p=\(placementID),c=2,r=1,C=1,q=2\u{1B}\\")
 
@@ -869,9 +1404,28 @@ final class TerminalSession: ObservableObject, Identifiable {
             let metadata = "\(item.permissions) \(links) \(owner) \(group) \(size) \(date) "
             let nameWidth = max(4, terminalColumns - textColumn - metadata.count - 1)
             let name = Self.truncatedGraphicalName(item.name, maximumCharacters: nameWidth)
+            graphicalItemsByPlacementID[placementID] = item
+            graphicalHitLayoutsByPlacementID[placementID] = GraphicalHitLayout(
+                leadingColumns: iconColumn,
+                widthColumns: Self.graphicalRowHitWidth(
+                    textColumn: textColumn,
+                    renderedTextCount: metadata.count + name.count,
+                    terminalColumns: terminalColumns
+                ),
+                rowHeight: 1
+            )
             append("\u{1B}[\(textColumn + 1)G")
             append(metadata + Self.labelColor(for: item.kind) + name + "\u{1B}[0m\r\n")
         }
+    }
+
+    nonisolated static func graphicalRowHitWidth(
+        textColumn: Int,
+        renderedTextCount: Int,
+        terminalColumns: Int
+    ) -> Int {
+        let contentWidth = textColumn + renderedTextCount + 1
+        return min(max(1, terminalColumns - 2), max(6, contentWidth))
     }
 
     nonisolated static func padded(
@@ -905,10 +1459,160 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
     }
 
+    nonisolated static func graphicalSections(
+        _ items: [GraphicalFileItem],
+        sortBy: GraphicalSortOption,
+        groupBy: GraphicalGroupOption,
+        direction: GraphicalSortDirection,
+        foldersFirst: Bool
+    ) -> [GraphicalItemSection] {
+        let parentItems = items.filter { $0.name == ".." }
+        let contentItems = items.filter { $0.name != ".." }
+        let sortedContent = contentItems.sorted { left, right in
+            if foldersFirst, sortBy == .name {
+                let leftDirectory = left.kind == .directory
+                let rightDirectory = right.kind == .directory
+                if leftDirectory != rightDirectory { return leftDirectory }
+            }
+            let result = graphicalComparison(left, right, option: sortBy)
+            if result == .orderedSame {
+                return left.name.localizedStandardCompare(right.name) == .orderedAscending
+            }
+            return direction == .ascending
+                ? result == .orderedAscending
+                : result == .orderedDescending
+        }
+
+        guard let groupOption = groupBy.sortOption else {
+            return [GraphicalItemSection(title: nil, items: parentItems + sortedContent)]
+        }
+
+        let groupedContent = sortedContent.sorted { left, right in
+            let leftTitle = graphicalGroupTitle(for: left, option: groupOption)
+            let rightTitle = graphicalGroupTitle(for: right, option: groupOption)
+            if leftTitle != rightTitle {
+                let comparison = graphicalComparison(left, right, option: groupOption)
+                let newestFirst: Bool = switch groupOption {
+                case .dateLastOpened, .dateAdded, .dateModified, .dateCreated, .size: true
+                case .name, .kind, .tags: false
+                }
+                if comparison != .orderedSame {
+                    return newestFirst
+                        ? comparison == .orderedDescending
+                        : comparison == .orderedAscending
+                }
+                return leftTitle.localizedStandardCompare(rightTitle) == .orderedAscending
+            }
+            let comparison = graphicalComparison(left, right, option: sortBy)
+            if comparison == .orderedSame {
+                return left.name.localizedStandardCompare(right.name) == .orderedAscending
+            }
+            return direction == .ascending
+                ? comparison == .orderedAscending
+                : comparison == .orderedDescending
+        }
+
+        var sections: [GraphicalItemSection] = []
+        if !parentItems.isEmpty {
+            sections.append(GraphicalItemSection(title: nil, items: parentItems))
+        }
+        for item in groupedContent {
+            let title = graphicalGroupTitle(for: item, option: groupOption)
+            if sections.last?.title == title {
+                let updatedItems = (sections.last?.items ?? []) + [item]
+                sections[sections.count - 1] = GraphicalItemSection(title: title, items: updatedItems)
+            } else {
+                sections.append(GraphicalItemSection(title: title, items: [item]))
+            }
+        }
+        return sections
+    }
+
+    nonisolated private static func graphicalComparison(
+        _ left: GraphicalFileItem,
+        _ right: GraphicalFileItem,
+        option: GraphicalSortOption
+    ) -> ComparisonResult {
+        switch option {
+        case .name:
+            left.name.localizedStandardCompare(right.name)
+        case .kind:
+            left.kindDescription.localizedStandardCompare(right.kindDescription)
+        case .dateLastOpened:
+            left.lastOpened.compare(right.lastOpened)
+        case .dateAdded:
+            left.added.compare(right.added)
+        case .dateModified:
+            left.modified.compare(right.modified)
+        case .dateCreated:
+            left.created.compare(right.created)
+        case .size:
+            left.size == right.size ? .orderedSame : (left.size < right.size ? .orderedAscending : .orderedDescending)
+        case .tags:
+            left.tags.joined(separator: ", ").localizedStandardCompare(
+                right.tags.joined(separator: ", ")
+            )
+        }
+    }
+
+    nonisolated private static func graphicalGroupTitle(
+        for item: GraphicalFileItem,
+        option: GraphicalSortOption
+    ) -> String {
+        switch option {
+        case .name:
+            guard let first = item.name.first else { return "#" }
+            let value = String(first).uppercased()
+            return value.rangeOfCharacter(from: .letters) == nil ? "#" : value
+        case .kind:
+            return item.kindDescription
+        case .dateLastOpened:
+            return dateGroupTitle(item.lastOpened)
+        case .dateAdded:
+            return dateGroupTitle(item.added)
+        case .dateModified:
+            return dateGroupTitle(item.modified)
+        case .dateCreated:
+            return dateGroupTitle(item.created)
+        case .size:
+            switch item.size {
+            case 0: return "Zero KB"
+            case 1..<(100 * 1_024): return "1 KB – 100 KB"
+            case (100 * 1_024)..<(1_024 * 1_024): return "100 KB – 1 MB"
+            case (1_024 * 1_024)..<(10 * 1_024 * 1_024): return "1 MB – 10 MB"
+            case (10 * 1_024 * 1_024)..<(100 * 1_024 * 1_024): return "10 MB – 100 MB"
+            case (100 * 1_024 * 1_024)..<(1_024 * 1_024 * 1_024): return "100 MB – 1 GB"
+            default: return "1 GB and larger"
+            }
+        case .tags:
+            return item.tags.first ?? "No Tags"
+        }
+    }
+
+    nonisolated private static func dateGroupTitle(_ date: Date) -> String {
+        guard date != .distantPast else { return "Unknown Date" }
+        let calendar = Calendar.current
+        if calendar.isDateInToday(date) { return "Today" }
+        if calendar.isDateInYesterday(date) { return "Yesterday" }
+        let days = calendar.dateComponents([.day], from: date, to: Date()).day ?? 0
+        if days >= 0, days < 7 { return "Previous 7 Days" }
+        if days >= 0, days < 30 { return "Previous 30 Days" }
+        return date.formatted(.dateTime.month(.wide).year())
+    }
+
     nonisolated static func directoryListing(at path: String) -> GraphicalDirectoryListing {
         let manager = FileManager.default
         do {
-            let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
+            let keys: Set<URLResourceKey> = [
+                .isDirectoryKey,
+                .isSymbolicLinkKey,
+                .localizedTypeDescriptionKey,
+                .creationDateKey,
+                .contentModificationDateKey,
+                .contentAccessDateKey,
+                .addedToDirectoryDateKey,
+                .tagNamesKey,
+            ]
             let directoryURL = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
             let urls = try manager.contentsOfDirectory(
                 at: directoryURL,
@@ -1205,6 +1909,15 @@ final class TerminalSession: ObservableObject, Identifiable {
         var info = stat()
         let didStat = url.path.withCString { lstat($0, &info) } == 0
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let resourceKeys: Set<URLResourceKey> = [
+            .localizedTypeDescriptionKey,
+            .creationDateKey,
+            .contentModificationDateKey,
+            .contentAccessDateKey,
+            .addedToDirectoryDateKey,
+            .tagNamesKey,
+        ]
+        let values = try? url.resourceValues(forKeys: resourceKeys)
         return GraphicalFileItem(
             path: url.path,
             name: name,
@@ -1216,7 +1929,15 @@ final class TerminalSession: ObservableObject, Identifiable {
             size: didStat ? UInt64(max(0, info.st_size)) : 0,
             modified: didStat
                 ? Date(timeIntervalSince1970: TimeInterval(info.st_mtimespec.tv_sec))
-                : .distantPast
+                : values?.contentModificationDate ?? .distantPast,
+            created: values?.creationDate
+                ?? attributes?[.creationDate] as? Date
+                ?? .distantPast,
+            added: values?.addedToDirectoryDate ?? .distantPast,
+            lastOpened: values?.contentAccessDate ?? .distantPast,
+            kindDescription: values?.localizedTypeDescription
+                ?? (kind == .directory ? "Folder" : "Item"),
+            tags: values?.tagNames ?? []
         )
     }
 
@@ -1242,6 +1963,21 @@ final class TerminalSession: ObservableObject, Identifiable {
         let normalized = command.trimmingCharacters(in: .whitespacesAndNewlines)
         return commandBlocks.last(where: { $0.command == normalized })?.workingDirectory
             ?? workingDirectory
+    }
+
+    func isTerminalBlockCollapsed(_ id: TerminalBlockID) -> Bool {
+        collapsedTerminalBlockIDs.contains(id)
+    }
+
+    func toggleTerminalBlockCollapsed(_ id: TerminalBlockID) {
+        if !collapsedTerminalBlockIDs.insert(id).inserted {
+            collapsedTerminalBlockIDs.remove(id)
+        }
+        revision &+= 1
+    }
+
+    func submittedCommand(matchingRenderedText text: String) -> String? {
+        commandBlocks.reversed().first(where: { text.contains($0.command) })?.command
     }
 
     func fullOutput(for command: String) -> String? {
@@ -1290,14 +2026,45 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
     }
 
-    func attachToAI(command: String, output: String, workingDirectory: String) {
-        aiAttachment = TerminalBlockAttachment(
+    @discardableResult
+    func attachToAI(
+        command: String,
+        output: String,
+        workingDirectory: String,
+        sourceBlockID: TerminalBlockID? = nil
+    ) -> Bool {
+        if let sourceBlockID, hasPendingAIAttachment(for: sourceBlockID) {
+            isAIChatVisible = true
+            return false
+        }
+        aiAttachments.append(.terminalBlock(TerminalBlockAttachment(
             command: command,
             output: output,
-            workingDirectory: workingDirectory
-        )
+            workingDirectory: workingDirectory,
+            sourceBlockID: sourceBlockID
+        )))
         isAIChatVisible = true
         aiError = nil
+        return true
+    }
+
+    func hasPendingAIAttachment(for sourceBlockID: TerminalBlockID) -> Bool {
+        aiAttachments.contains { $0.sourceBlockID == sourceBlockID }
+    }
+
+    @discardableResult
+    func attachFilesToAI(_ urls: [URL]) -> Bool {
+        let attachments = urls.compactMap { AIFileAttachment.load(url: $0) }
+            .map(AIInputAttachment.file)
+        guard !attachments.isEmpty else { return false }
+        aiAttachments.append(contentsOf: attachments)
+        isAIChatVisible = true
+        aiError = nil
+        return true
+    }
+
+    func removeAIAttachment(_ id: UUID) {
+        aiAttachments.removeAll { $0.id == id }
     }
 
     var canAttachGraphicalOutputToAI: Bool {
@@ -1309,13 +2076,16 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func attachGraphicalOutputToAI() {
-        guard let currentGraphicalListing else { return }
-        let attachment = Self.aiAttachment(for: currentGraphicalListing)
+        guard let attachment = graphicalBlockAttachment() else { return }
         attachToAI(
             command: attachment.command,
             output: attachment.output,
             workingDirectory: attachment.workingDirectory
         )
+    }
+
+    func graphicalBlockAttachment() -> TerminalBlockAttachment? {
+        currentGraphicalListing.map(Self.aiAttachment(for:))
     }
 
     nonisolated static func aiAttachment(
@@ -1333,7 +2103,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func sendAIMessage(using settings: AISettings) {
         let question = aiDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !question.isEmpty, !isAIResponding else { return }
+        guard (!question.isEmpty || !aiAttachments.isEmpty), !isAIResponding else { return }
         let provider = settings.provider
         let connectionMode = settings.connectionMode(for: provider)
         let apiKey: String
@@ -1347,10 +2117,10 @@ final class TerminalSession: ObservableObject, Identifiable {
             apiKey = ""
         }
 
-        let message = AIChatMessage(role: .user, text: question, attachment: aiAttachment)
+        let message = AIChatMessage(role: .user, text: question, attachments: aiAttachments)
         aiMessages.append(message)
         aiDraft = ""
-        aiAttachment = nil
+        aiAttachments.removeAll()
         aiError = nil
         isAIResponding = true
         let history = aiMessages
@@ -1379,7 +2149,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func clearAIConversation() {
         aiMessages.removeAll()
-        aiAttachment = nil
+        aiAttachments.removeAll()
         aiError = nil
     }
 
@@ -1438,6 +2208,11 @@ final class TerminalStore: ObservableObject {
     private static let tabBarVisibilityKey = "isTabBarVisible"
     private static let graphicalModeKey = "graphicalMode"
     private static let graphicalViewModeKey = "graphicalViewMode"
+    private static let graphicalShowsHiddenFilesKey = "graphicalShowsHiddenFiles"
+    private static let graphicalSortOptionKey = "graphicalSortOption"
+    private static let graphicalGroupOptionKey = "graphicalGroupOption"
+    private static let graphicalSortDirectionKey = "graphicalSortDirection"
+    private static let graphicalFoldersFirstKey = "graphicalFoldersFirst"
     private static let listingBackendKey = "listingBackend"
     private static let autocolorTabsKey = "autocolorTabs"
     private static let automaticTabColors = [
@@ -1451,7 +2226,9 @@ final class TerminalStore: ObservableObject {
 
     @Published var groups: [TerminalTabGroup] = []
     let aiSettings = AISettings()
+    let scheduledJobs: ScheduledJobStore
     @Published var isSettingsVisible = false
+    @Published var isScheduledJobsVisible = false
     @Published var selectedGroupID: UUID?
     @Published var selectedID: UUID?
     @Published var tabOrientation: TabOrientation {
@@ -1479,6 +2256,55 @@ final class TerminalStore: ObservableObject {
             }
         }
     }
+    @Published var graphicalShowsHiddenFiles: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                graphicalShowsHiddenFiles,
+                forKey: Self.graphicalShowsHiddenFilesKey
+            )
+            for tab in groups.lazy.flatMap(\.tabs) {
+                tab.setGraphicalShowsHiddenFiles(graphicalShowsHiddenFiles)
+            }
+        }
+    }
+    @Published var graphicalSortOption: GraphicalSortOption {
+        didSet {
+            UserDefaults.standard.set(graphicalSortOption.rawValue, forKey: Self.graphicalSortOptionKey)
+            for tab in groups.lazy.flatMap(\.tabs) {
+                tab.setGraphicalSortOption(graphicalSortOption)
+            }
+        }
+    }
+    @Published var graphicalGroupOption: GraphicalGroupOption {
+        didSet {
+            UserDefaults.standard.set(graphicalGroupOption.rawValue, forKey: Self.graphicalGroupOptionKey)
+            for tab in groups.lazy.flatMap(\.tabs) {
+                tab.setGraphicalGroupOption(graphicalGroupOption)
+            }
+        }
+    }
+    @Published var graphicalSortDirection: GraphicalSortDirection {
+        didSet {
+            UserDefaults.standard.set(
+                graphicalSortDirection.rawValue,
+                forKey: Self.graphicalSortDirectionKey
+            )
+            for tab in groups.lazy.flatMap(\.tabs) {
+                tab.setGraphicalSortDirection(graphicalSortDirection)
+            }
+        }
+    }
+    @Published var graphicalFoldersFirst: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                graphicalFoldersFirst,
+                forKey: Self.graphicalFoldersFirstKey
+            )
+            for tab in groups.lazy.flatMap(\.tabs) {
+                tab.setGraphicalFoldersFirst(graphicalFoldersFirst)
+            }
+        }
+    }
     @Published var listingBackend: ListingBackend {
         didSet {
             UserDefaults.standard.set(listingBackend.rawValue, forKey: Self.listingBackendKey)
@@ -1490,7 +2316,8 @@ final class TerminalStore: ObservableObject {
     private var timer: Timer?
     private var lastAutomaticTabColorIndex: Int?
 
-    init() {
+    init(scheduledJobs: ScheduledJobStore? = nil) {
+        self.scheduledJobs = scheduledJobs ?? ScheduledJobStore()
         tabOrientation = TabOrientation(
             rawValue: UserDefaults.standard.string(forKey: Self.orientationKey) ?? ""
         ) ?? .horizontal
@@ -1508,12 +2335,32 @@ final class TerminalStore: ObservableObject {
         graphicalViewMode = GraphicalViewMode(
             rawValue: UserDefaults.standard.string(forKey: Self.graphicalViewModeKey) ?? ""
         ) ?? .icons
+        graphicalShowsHiddenFiles = UserDefaults.standard.bool(
+            forKey: Self.graphicalShowsHiddenFilesKey
+        )
+        graphicalSortOption = GraphicalSortOption(
+            rawValue: UserDefaults.standard.string(forKey: Self.graphicalSortOptionKey) ?? ""
+        ) ?? .name
+        graphicalGroupOption = GraphicalGroupOption(
+            rawValue: UserDefaults.standard.string(forKey: Self.graphicalGroupOptionKey) ?? ""
+        ) ?? .none
+        graphicalSortDirection = GraphicalSortDirection(
+            rawValue: UserDefaults.standard.string(forKey: Self.graphicalSortDirectionKey) ?? ""
+        ) ?? .ascending
+        if UserDefaults.standard.object(forKey: Self.graphicalFoldersFirstKey) == nil {
+            graphicalFoldersFirst = true
+        } else {
+            graphicalFoldersFirst = UserDefaults.standard.bool(forKey: Self.graphicalFoldersFirstKey)
+        }
         listingBackend = ListingBackend(
             rawValue: UserDefaults.standard.string(forKey: Self.listingBackendKey) ?? ""
         ) ?? .eza
         newGroup()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
+        }
+        self.scheduledJobs.setExecutor { [weak self] job in
+            self?.launchScheduledJob(job)
         }
     }
 
@@ -1537,7 +2384,8 @@ final class TerminalStore: ObservableObject {
         graphicalMode = enabled
     }
 
-    func newGroup(startingIn directory: String? = nil) {
+    @discardableResult
+    func newGroup(startingIn directory: String? = nil) -> TerminalSession {
         let usedNumbers = Set(groups.compactMap { group -> Int? in
             guard group.name.hasPrefix("Group ") else { return nil }
             return Int(group.name.dropFirst("Group ".count))
@@ -1548,18 +2396,23 @@ final class TerminalStore: ObservableObject {
         groups.append(group)
         selectedGroupID = group.id
         selectedID = tab.id
+        return tab
     }
 
-    func newTab(in groupID: UUID? = nil, startingIn directory: String? = nil) {
+    @discardableResult
+    func newTab(
+        in groupID: UUID? = nil,
+        startingIn directory: String? = nil
+    ) -> TerminalSession {
         guard let index = groupIndex(for: groupID ?? selectedGroupID) else {
-            newGroup(startingIn: directory)
-            return
+            return newGroup(startingIn: directory)
         }
         let tab = makeTab(startingIn: directory)
         groups[index].tabs.append(tab)
         groups[index].isCollapsed = false
         selectedGroupID = groups[index].id
         selectedID = tab.id
+        return tab
     }
 
     func selectGroup(_ id: UUID) {
@@ -1633,6 +2486,11 @@ final class TerminalStore: ObservableObject {
     private func makeTab(startingIn directory: String? = nil) -> TerminalSession {
         let tab = TerminalSession(workingDirectory: directory)
         tab.setGraphicalViewMode(graphicalViewMode, refresh: false)
+        tab.setGraphicalShowsHiddenFiles(graphicalShowsHiddenFiles, refresh: false)
+        tab.setGraphicalSortOption(graphicalSortOption, refresh: false)
+        tab.setGraphicalGroupOption(graphicalGroupOption, refresh: false)
+        tab.setGraphicalSortDirection(graphicalSortDirection, refresh: false)
+        tab.setGraphicalFoldersFirst(graphicalFoldersFirst, refresh: false)
         tab.setListingBackend(listingBackend, refresh: false)
         tab.setGraphicalMode(graphicalMode)
         guard autocolorTabs else { return tab }
@@ -1654,7 +2512,96 @@ final class TerminalStore: ObservableObject {
     }
 
     private func poll() {
+        scheduledJobs.launchDueJobs()
         for tab in groups.lazy.flatMap(\.tabs) { tab.poll() }
+    }
+
+    private func launchScheduledJob(_ job: ScheduledJob) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            var temporaryDirectory: URL?
+            do {
+                let command = try await job.script.executionCommand()
+                let workingDirectory = try self.prepareWorkingDirectory(for: job)
+                if job.runLocation == .temporaryFolder {
+                    temporaryDirectory = workingDirectory
+                }
+                let launchCommand = if let temporaryDirectory {
+                    Self.temporaryJobCommand(
+                        command,
+                        workingDirectory: temporaryDirectory
+                    )
+                } else {
+                    command
+                }
+                let tab = self.newTab(startingIn: workingDirectory.path)
+                tab.rename(to: "Scheduled · \(job.summary)")
+                try await tab.executeScheduledScript(launchCommand)
+                self.scheduledJobs.markLaunched(job.id)
+            } catch is CancellationError {
+                if let temporaryDirectory {
+                    try? FileManager.default.removeItem(at: temporaryDirectory)
+                }
+                self.scheduledJobs.markFailed(job.id, message: "The scheduled launch was cancelled.")
+            } catch {
+                if let temporaryDirectory {
+                    try? FileManager.default.removeItem(at: temporaryDirectory)
+                }
+                self.scheduledJobs.markFailed(job.id, message: error.localizedDescription)
+            }
+        }
+    }
+
+    private func prepareWorkingDirectory(for job: ScheduledJob) throws -> URL {
+        switch job.runLocation {
+        case .selectedFolder:
+            var isDirectory = ObjCBool(false)
+            guard FileManager.default.fileExists(
+                atPath: job.workingDirectory,
+                isDirectory: &isDirectory
+            ), isDirectory.boolValue else {
+                throw ScheduledJobError.invalidWorkingDirectory(job.workingDirectory)
+            }
+            return URL(fileURLWithPath: job.workingDirectory, isDirectory: true)
+                .standardizedFileURL
+        case .temporaryFolder:
+            let directory = URL(fileURLWithPath: "/tmp", isDirectory: true).appending(
+                path: "air-job-\(job.id.uuidString.lowercased())-\(UUID().uuidString.lowercased())",
+                directoryHint: .isDirectory
+            )
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: false
+            )
+            return directory
+        }
+    }
+
+    nonisolated static func temporaryJobCommand(
+        _ command: String,
+        workingDirectory: URL
+    ) -> String {
+        var delimiter = "__AIR_TEMP_JOB_\(UUID().uuidString.replacing("-", with: ""))__"
+        while command.split(whereSeparator: \Character.isNewline).contains(Substring(delimiter)) {
+            delimiter += "_"
+        }
+        let directory = TerminalSession.shellQuoted(workingDirectory.path)
+        let home = TerminalSession.shellQuoted(FileManager.default.homeDirectoryForCurrentUser.path)
+        return """
+        /bin/bash <<'\(delimiter)'
+        __air_job_cleanup() {
+          cd /
+          rm -rf -- \(directory)
+        }
+        trap __air_job_cleanup EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        cd -- \(directory)
+        \(command)
+        \(delimiter)
+        cd -- \(home)
+        """
     }
 
     private func groupIndex(for id: UUID?) -> Int? {

@@ -1,4 +1,4 @@
-# Terminal Tabs
+# Air
 
 A small native macOS terminal with independent shell tabs. Each tab owns a PTY and a [`GhosttyTerminal`](https://lib.ghostty.org/vt/). libghostty-vt handles VT parsing, screen state, colors, styles, cursor state, and title updates. AppKit handles rendering and input.
 
@@ -17,7 +17,7 @@ You need macOS 14+, Swift 6, Git, Rust via rustup, and the Zig version required 
 The first run fetches Ghostty, eza, and lstr; builds `libghostty-vt.dylib` plus pinned eza and lstr executables; and launches the app. eza's EUPL-1.2 license and lstr's MIT license are copied beside the executables at `.build/bin/eza-LICENSE.txt` and `.build/bin/lstr-LICENSE.txt`. If the Ghostty library already exists elsewhere:
 
 ```sh
-LIBGHOSTTY_VT_PATH=/path/to/libghostty-vt.dylib swift run TerminalTabs
+LIBGHOSTTY_VT_PATH=/path/to/libghostty-vt.dylib swift run Air
 ```
 
 ## Shortcuts

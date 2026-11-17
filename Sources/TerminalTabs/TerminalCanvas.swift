@@ -25,11 +25,32 @@ struct TerminalCanvas: NSViewRepresentable {
 
 final class TerminalNSView: NSView,
     @MainActor QLPreviewPanelDataSource,
-    @MainActor QLPreviewPanelDelegate {
-    private struct BlockContents {
+    @MainActor QLPreviewPanelDelegate,
+    NSDraggingSource {
+    static let blockContentPadding: CGFloat = 20
+    static let blockSpacing: CGFloat = 10
+    private static let blockOuterMargin: CGFloat = 8
+    private static let terminalContentInset: CGFloat = 10
+
+    private struct BlockContents: Equatable {
+        let id: TerminalBlockID
         let command: String
         let output: String
         let workingDirectory: String
+    }
+
+    private enum BlockAction: Equatable {
+        case toggleFold
+        case copy
+        case attach
+    }
+
+    private struct BlockActionHitTarget: Equatable {
+        let action: BlockAction
+        let blockID: TerminalBlockID
+        let block: BlockContents?
+        let rect: NSRect
+        let isEnabled: Bool
     }
 
     private struct ImageHitTarget: Equatable {
@@ -51,7 +72,13 @@ final class TerminalNSView: NSView,
     private var selectedBlockHistoryRow: UInt64?
     private var selectedGraphicalPlacementID: UInt32?
     private var hoveredGraphicalPlacementID: UInt32?
+    private var dropTargetGraphicalPlacementID: UInt32?
+    private var graphicalDragCandidate: (placementID: UInt32, origin: NSPoint)?
+    private var hoveredBlockAction: BlockActionHitTarget?
+    private var textSelectionAnchor: TerminalTextPosition?
+    private var textSelection: TerminalTextSelection?
     private var imageHitTargets: [ImageHitTarget] = []
+    private var blockActionHitTargets: [BlockActionHitTarget] = []
     private var graphicalTrackingArea: NSTrackingArea?
     private var imageCache: [UInt32: CGImage] = [:]
     private var folderBloomCache: [UInt32: CGImage] = [:]
@@ -84,6 +111,7 @@ final class TerminalNSView: NSView,
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = NSColor(red: 0.024, green: 0.067, blue: 0.094, alpha: 1).cgColor
+        registerForDraggedTypes([.fileURL])
     }
 
     @available(*, unavailable)
@@ -125,7 +153,8 @@ final class TerminalNSView: NSView,
 
     override func layout() {
         super.layout()
-        let cols = UInt16(max(1, min(Int(UInt16.max), Int((bounds.width - 20) / cellWidth))))
+        let horizontalInsets = 2 * (Self.blockOuterMargin + Self.blockContentPadding)
+        let cols = UInt16(max(1, min(Int(UInt16.max), Int((bounds.width - horizontalInsets) / cellWidth))))
         let rows = UInt16(max(1, min(Int(UInt16.max), Int(bounds.height / cellHeight))))
         if (cols, rows) != lastGrid {
             lastGrid = (cols, rows)
@@ -137,23 +166,110 @@ final class TerminalNSView: NSView,
     override func mouseDown(with event: NSEvent) {
         focusTerminal()
         let point = convert(event.locationInWindow, from: nil)
+        if let target = blockActionHitTargets.last(where: { $0.rect.contains(point) }) {
+            graphicalDragCandidate = nil
+            textSelectionAnchor = nil
+            textSelection = nil
+            selectedGraphicalPlacementID = nil
+            if target.isEnabled { performBlockAction(target) }
+            return
+        }
         if let target = imageHitTargets.last(where: { $0.rect.contains(point) }),
            let item = session.graphicalItem(for: target.placementID) {
+            textSelectionAnchor = nil
+            textSelection = nil
             selectedBlockHistoryRow = nil
             selectedGraphicalPlacementID = target.placementID
+            graphicalDragCandidate = (target.placementID, point)
             needsDisplay = true
             if event.clickCount >= 2 {
                 session.activateGraphicalItem(item)
             }
             return
         }
+        textSelection = nil
+        graphicalDragCandidate = nil
+        textSelectionAnchor = terminalPosition(at: point)
         selectedGraphicalPlacementID = nil
-        selectBlock(at: Int(point.y / cellHeight))
+        selectBlock(atVisualY: point.y)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        if let candidate = graphicalDragCandidate {
+            let point = convert(event.locationInWindow, from: nil)
+            let distance = hypot(point.x - candidate.origin.x, point.y - candidate.origin.y)
+            guard distance >= 4,
+                  let item = session.graphicalItem(for: candidate.placementID),
+                  let target = imageHitTargets.last(where: {
+                      $0.placementID == candidate.placementID
+                  }) else { return }
+            graphicalDragCandidate = nil
+            let url = URL(fileURLWithPath: item.path)
+            let draggingItem = NSDraggingItem(pasteboardWriter: url as NSURL)
+            let icon = NSWorkspace.shared.icon(forFile: item.path)
+            icon.size = NSSize(width: 48, height: 48)
+            let frame = NSRect(
+                x: point.x - 24,
+                y: point.y - 24,
+                width: 48,
+                height: 48
+            )
+            draggingItem.setDraggingFrame(frame, contents: icon)
+            selectedGraphicalPlacementID = target.placementID
+            beginDraggingSession(with: [draggingItem], event: event, source: self)
+            return
+        }
+        guard let anchor = textSelectionAnchor else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        guard let extent = terminalPosition(at: point), extent != anchor else { return }
+        textSelection = TerminalTextSelection(anchor: anchor, extent: extent)
+        selectedBlockHistoryRow = nil
+        selectedGraphicalPlacementID = nil
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        graphicalDragCandidate = nil
+        textSelectionAnchor = nil
+    }
+
+    func draggingSession(
+        _ session: NSDraggingSession,
+        sourceOperationMaskFor context: NSDraggingContext
+    ) -> NSDragOperation {
+        .move
+    }
+
+    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        updateDropTarget(for: sender)
+    }
+
+    override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        updateDropTarget(for: sender)
+    }
+
+    override func draggingExited(_ sender: (any NSDraggingInfo)?) {
+        clearDropTarget()
+    }
+
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        defer { clearDropTarget() }
+        guard let placementID = dropTargetGraphicalPlacementID,
+              let item = session.graphicalItem(for: placementID) else { return false }
+        return session.moveGraphicalItems(draggedFileURLs(from: sender), into: item)
+    }
+
+    override func concludeDragOperation(_ sender: (any NSDraggingInfo)?) {
+        clearDropTarget()
     }
 
     override func resetCursorRects() {
         super.resetCursorRects()
+        addCursorRect(bounds, cursor: .iBeam)
         for target in imageHitTargets {
+            addCursorRect(target.rect, cursor: .pointingHand)
+        }
+        for target in blockActionHitTargets where target.isEnabled {
             addCursorRect(target.rect, cursor: .pointingHand)
         }
     }
@@ -173,15 +289,51 @@ final class TerminalNSView: NSView,
 
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        let hovered = imageHitTargets.last(where: { $0.rect.contains(point) })?.placementID
-        guard hovered != hoveredGraphicalPlacementID else { return }
-        hoveredGraphicalPlacementID = hovered
+        let hoveredGraphical = imageHitTargets.last(where: { $0.rect.contains(point) })?.placementID
+        let hoveredAction = blockActionHitTargets.last(where: { $0.rect.contains(point) })
+        guard hoveredGraphical != hoveredGraphicalPlacementID
+                || hoveredAction != hoveredBlockAction else { return }
+        hoveredGraphicalPlacementID = hoveredGraphical
+        hoveredBlockAction = hoveredAction
         needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
-        guard hoveredGraphicalPlacementID != nil else { return }
+        guard hoveredGraphicalPlacementID != nil || hoveredBlockAction != nil else { return }
         hoveredGraphicalPlacementID = nil
+        hoveredBlockAction = nil
+        needsDisplay = true
+    }
+
+    private func updateDropTarget(for sender: any NSDraggingInfo) -> NSDragOperation {
+        guard session.graphicalMode else {
+            clearDropTarget()
+            return []
+        }
+        let point = convert(sender.draggingLocation, from: nil)
+        let urls = draggedFileURLs(from: sender)
+        let placementID = imageHitTargets.reversed().first { target in
+            guard target.rect.contains(point),
+                  let item = session.graphicalItem(for: target.placementID) else { return false }
+            return session.canMoveGraphicalItems(urls, into: item)
+        }?.placementID
+        if placementID != dropTargetGraphicalPlacementID {
+            dropTargetGraphicalPlacementID = placementID
+            needsDisplay = true
+        }
+        return placementID == nil ? [] : .move
+    }
+
+    private func draggedFileURLs(from sender: any NSDraggingInfo) -> [URL] {
+        sender.draggingPasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL] ?? []
+    }
+
+    private func clearDropTarget() {
+        guard dropTargetGraphicalPlacementID != nil else { return }
+        dropTargetGraphicalPlacementID = nil
         needsDisplay = true
     }
 
@@ -212,17 +364,41 @@ final class TerminalNSView: NSView,
         }
 
         contextGraphicalItem = nil
-        contextBlock = blockContents(at: Int(point.y / cellHeight))
+        contextBlock = blockContents(atVisualY: point.y)
 
         let menu = NSMenu()
-        menu.addItem(menuItem("Copy Output", action: #selector(copyOutput), enabled: contextBlock != nil))
+        menu.addItem(menuItem(
+            "Copy",
+            action: #selector(copyTerminalSelection),
+            enabled: selectedTerminalText()?.isEmpty == false
+        ))
+        menu.addItem(.separator())
+        menu.addItem(menuItem(
+            "Copy Output",
+            action: #selector(copyOutput),
+            enabled: contextBlock != nil,
+            systemImage: "doc.on.doc"
+        ))
         menu.addItem(menuItem("Copy Command", action: #selector(copyCommand), enabled: contextBlock != nil))
         menu.addItem(menuItem("Copy Working Directory", action: #selector(copyWorkingDirectory), enabled: contextBlock != nil))
+        if let contextBlock {
+            menu.addItem(menuItem(
+                session.isTerminalBlockCollapsed(contextBlock.id) ? "Expand Block" : "Collapse Block",
+                action: #selector(toggleContextBlockFold),
+                enabled: true,
+                systemImage: session.isTerminalBlockCollapsed(contextBlock.id)
+                    ? "chevron.right"
+                    : "chevron.down"
+            ))
+        }
         menu.addItem(.separator())
         menu.addItem(menuItem(
             "Attach Output to AI Chat",
             action: #selector(attachOutputToAI),
-            enabled: contextBlock != nil || session.canAttachGraphicalOutputToAI
+            enabled: contextBlock.map {
+                !session.hasPendingAIAttachment(for: $0.id)
+            } ?? session.canAttachGraphicalOutputToAI,
+            systemImage: "sparkles"
         ))
         menu.addItem(.separator())
         menu.addItem(menuItem("Paste", action: #selector(pasteIntoTerminal),
@@ -232,8 +408,20 @@ final class TerminalNSView: NSView,
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard event.modifierFlags.contains(.command) else { return false }
+        if event.charactersIgnoringModifiers == "c" {
+            if let selectedText = selectedTerminalText(), !selectedText.isEmpty {
+                copyToPasteboard(selectedText)
+                return true
+            }
+            if let selectedGraphicalPlacementID,
+               let item = session.graphicalItem(for: selectedGraphicalPlacementID) {
+                session.copyGraphicalItem(item)
+                return true
+            }
+        }
         if event.charactersIgnoringModifiers == "v",
            let value = NSPasteboard.general.string(forType: .string) {
+            clearTextSelection()
             session.sendUserInput(Data(value.utf8))
             return true
         }
@@ -251,7 +439,10 @@ final class TerminalNSView: NSView,
             super.keyDown(with: event)
             return
         }
-        if let data = TerminalInput.sequence(for: event) { session.sendUserInput(data) }
+        if let data = TerminalInput.sequence(for: event) {
+            clearTextSelection()
+            session.sendUserInput(data)
+        }
     }
 
     nonisolated override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
@@ -298,31 +489,62 @@ final class TerminalNSView: NSView,
         }
 
         let ranges = blockRanges(frame: frame, cells: cells)
-        let rowOffsets = Array(repeating: CGFloat.zero, count: Int(frame.rows))
-        let blockFill = NSColor(red: 0.035, green: 0.094, blue: 0.122, alpha: 1)
-        let blockSeparator = NSColor(red: 0.20, green: 0.55, blue: 0.62, alpha: 0.20)
-        let selectedFill = NSColor(red: 0.050, green: 0.135, blue: 0.165, alpha: 1)
-        let selectedSeparator = NSColor(red: 0.32, green: 0.84, blue: 0.88, alpha: 0.34)
+        let visualLayout = blockVisualLayout(frame: frame, cells: cells, ranges: ranges)
+        let rowOffsets = visualLayout.rowOffsets
+        var rowLeadingOffsets = Array(
+            repeating: Self.terminalContentInset,
+            count: Int(frame.rows)
+        )
         for range in ranges {
-            let rect = Self.blockBackgroundRect(
-                for: range,
-                cellHeight: cellHeight,
-                width: bounds.width
+            for row in range where rowLeadingOffsets.indices.contains(row) {
+                rowLeadingOffsets[row] = Self.blockContentLeadingOffset
+            }
+        }
+        let blockFill = NSColor(red: 0.035, green: 0.094, blue: 0.122, alpha: 1)
+        let blockBorder = NSColor(red: 0.20, green: 0.55, blue: 0.62, alpha: 0.25)
+        let selectedFill = NSColor(red: 0.050, green: 0.135, blue: 0.165, alpha: 1)
+        let selectedBorder = NSColor(red: 0.32, green: 0.84, blue: 0.88, alpha: 0.48)
+        for (index, range) in ranges.enumerated() {
+            let verticalFrame = visualLayout.blockFrames[index]
+            let rect = NSRect(
+                x: Self.blockOuterMargin,
+                y: verticalFrame.minY,
+                width: max(0, bounds.width - Self.blockOuterMargin * 2),
+                height: verticalFrame.height
             )
             let isSelected = frame.scroll_offset + UInt64(range.lowerBound) == selectedBlockHistoryRow
+            let fillPath = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
             (isSelected ? selectedFill : blockFill).setFill()
-            rect.fill()
-            (isSelected ? selectedSeparator : blockSeparator).setFill()
-            NSRect(x: 0, y: rect.maxY - 1, width: bounds.width, height: 1).fill()
+            fillPath.fill()
+
+            let borderPath = NSBezierPath(
+                roundedRect: rect.insetBy(dx: 0.5, dy: 0.5),
+                xRadius: 5.5,
+                yRadius: 5.5
+            )
+            (isSelected ? selectedBorder : blockBorder).setStroke()
+            borderPath.lineWidth = 1
+            borderPath.stroke()
         }
-        updateGraphicalHitTargets(frame, rowOffsets: rowOffsets)
+        updateBlockActionHitTargets(
+            frame: frame,
+            cells: cells,
+            ranges: ranges,
+            visualLayout: visualLayout
+        )
+        updateGraphicalHitTargets(
+            frame,
+            rowOffsets: rowOffsets,
+            rowLeadingOffsets: rowLeadingOffsets,
+            hiddenRows: visualLayout.hiddenRows
+        )
         drawGraphicalItemSurfaces()
 
-        for y in 0..<Int(frame.rows) {
+        for y in 0..<Int(frame.rows) where !visualLayout.hiddenRows.contains(y) {
             let isInBlock = ranges.contains { $0.contains(y) }
             for x in 0..<Int(frame.cols) {
                 let cell = cells[y * Int(frame.cols) + x]
-                let rect = NSRect(x: CGFloat(x) * cellWidth + 10,
+                let rect = NSRect(x: CGFloat(x) * cellWidth + rowLeadingOffsets[y],
                                   y: CGFloat(y) * cellHeight + rowOffsets[y],
                                   width: cellWidth + 0.5, height: cellHeight)
                 let hasDefaultBackground = cell.bg_r == 6 && cell.bg_g == 17 && cell.bg_b == 24
@@ -330,6 +552,15 @@ final class TerminalNSView: NSView,
                     || (!session.graphicalMode && !isInBlock)
                 if shouldDrawBackground {
                     color(cell.bg_r, cell.bg_g, cell.bg_b).setFill()
+                    rect.fill()
+                }
+                let historyRow = frame.scroll_offset + UInt64(y)
+                if textSelection?.contains(
+                    row: historyRow,
+                    column: x,
+                    totalColumns: Int(frame.cols)
+                ) == true {
+                    NSColor(srgbRed: 0.29, green: 0.82, blue: 0.80, alpha: 0.34).setFill()
                     rect.fill()
                 }
                 guard cell.text_len > 0, cell.style & UInt16(GT_STYLE_INVISIBLE) == 0 else { continue }
@@ -357,12 +588,21 @@ final class TerminalNSView: NSView,
 
         // Keep labels crisp by painting the item surfaces before terminal text,
         // then composite the antialiased icons over the completed cell grid.
-        drawImages(frame, rowOffsets: rowOffsets)
+        drawImages(
+            frame,
+            rowOffsets: rowOffsets,
+            rowLeadingOffsets: rowLeadingOffsets,
+            hiddenRows: visualLayout.hiddenRows
+        )
+        drawBlockActions()
 
-        if frame.cursor_visible {
+        if frame.cursor_visible, !visualLayout.hiddenRows.contains(Int(frame.cursor_y)) {
             let cursorRow = Int(frame.cursor_y)
             let cursorOffset = rowOffsets.indices.contains(cursorRow) ? rowOffsets[cursorRow] : 0
-            let cursor = NSRect(x: CGFloat(frame.cursor_x) * cellWidth + 10,
+            let cursorLeadingOffset = rowLeadingOffsets.indices.contains(cursorRow)
+                ? rowLeadingOffsets[cursorRow]
+                : Self.terminalContentInset
+            let cursor = NSRect(x: CGFloat(frame.cursor_x) * cellWidth + cursorLeadingOffset,
                                 y: CGFloat(frame.cursor_y) * cellHeight + cursorOffset,
                                 width: cellWidth, height: cellHeight)
             color(frame.cursor_r, frame.cursor_g, frame.cursor_b).withAlphaComponent(0.72).setFill()
@@ -382,11 +622,95 @@ final class TerminalNSView: NSView,
         width: CGFloat
     ) -> NSRect {
         NSRect(
-            x: 0,
+            x: blockOuterMargin,
             y: CGFloat(range.lowerBound) * cellHeight,
-            width: width,
+            width: max(0, width - blockOuterMargin * 2),
             height: CGFloat(range.count) * cellHeight
         )
+    }
+
+    static var blockContentLeadingOffset: CGFloat {
+        blockOuterMargin + blockContentPadding
+    }
+
+    private func terminalPosition(at point: NSPoint) -> TerminalTextPosition? {
+        guard let handle = session.handle,
+              let framePointer = gt_session_frame(handle),
+              let cells = framePointer.pointee.cells else { return nil }
+        let frame = framePointer.pointee
+        guard frame.rows > 0, frame.cols > 0 else { return nil }
+        let ranges = blockRanges(frame: frame, cells: cells)
+        let visualLayout = blockVisualLayout(frame: frame, cells: cells, ranges: ranges)
+        guard let row = visualLayout.row(at: point.y, cellHeight: cellHeight, nearest: true) else {
+            return nil
+        }
+        let leadingOffset = ranges.contains(where: { $0.contains(row) })
+            ? Self.blockContentLeadingOffset
+            : Self.terminalContentInset
+        let column = min(
+            max(0, Int(floor((point.x - leadingOffset) / cellWidth))),
+            Int(frame.cols) - 1
+        )
+        return TerminalTextPosition(
+            row: frame.scroll_offset + UInt64(row),
+            column: column
+        )
+    }
+
+    private func blockVisualLayout(
+        frame: GTFrame,
+        cells: UnsafePointer<GTCell>,
+        ranges: [Range<Int>]
+    ) -> TerminalBlockVisualLayout {
+        var lastContentRow = frame.cursor_visible ? Int(frame.cursor_y) : 0
+        for row in 0..<Int(frame.rows) where rowHasVisibleContent(row, frame: frame, cells: cells) {
+            lastContentRow = max(lastContentRow, row)
+        }
+        if let finalRange = ranges.last {
+            lastContentRow = max(lastContentRow, finalRange.upperBound - 1)
+        }
+        return TerminalBlockVisualLayout.make(
+            ranges: ranges,
+            rowCount: Int(frame.rows),
+            cellHeight: cellHeight,
+            viewportHeight: bounds.height,
+            lastContentRow: lastContentRow,
+            collapsedRangeStarts: Set(ranges.compactMap { range in
+                let blockID = TerminalBlockID(
+                    sessionID: session.id,
+                    historyRow: frame.scroll_offset + UInt64(range.lowerBound)
+                )
+                return session.isTerminalBlockCollapsed(blockID) ? range.lowerBound : nil
+            }),
+            contentPadding: Self.blockContentPadding,
+            blockSpacing: Self.blockSpacing
+        )
+    }
+
+    private func selectedTerminalText() -> String? {
+        guard let textSelection,
+              let handle = session.handle,
+              let framePointer = gt_session_frame(handle),
+              let cells = framePointer.pointee.cells else { return nil }
+        let frame = framePointer.pointee
+        let columns = Int(frame.cols)
+        let rows = (0..<Int(frame.rows)).map { row in
+            (0..<columns).map { column in
+                cellText(cells[row * columns + column])
+            }
+        }
+        return TerminalTextSelectionExtractor.text(
+            cellRows: rows,
+            firstRow: frame.scroll_offset,
+            selection: textSelection
+        )
+    }
+
+    private func clearTextSelection() {
+        guard textSelection != nil || textSelectionAnchor != nil else { return }
+        textSelection = nil
+        textSelectionAnchor = nil
+        needsDisplay = true
     }
 
     private func drawGraphicalBackdrop(in context: CGContext?) {
@@ -407,20 +731,175 @@ final class TerminalNSView: NSView,
         )
     }
 
-    private func updateGraphicalHitTargets(_ frame: GTFrame, rowOffsets: [CGFloat]) {
+    private func updateBlockActionHitTargets(
+        frame: GTFrame,
+        cells: UnsafePointer<GTCell>,
+        ranges: [Range<Int>],
+        visualLayout: TerminalBlockVisualLayout
+    ) {
+        let previousTargets = blockActionHitTargets
+        let buttonSize: CGFloat = 22
+        let buttonGap: CGFloat = 4
+        let trailingInset: CGFloat = 10
+        var targets: [BlockActionHitTarget] = []
+
+        for (index, range) in ranges.enumerated() {
+            guard visualLayout.blockFrames.indices.contains(index) else { continue }
+            let blockFrame = visualLayout.blockFrames[index]
+            let blockID = TerminalBlockID(
+                sessionID: session.id,
+                historyRow: frame.scroll_offset + UInt64(range.lowerBound)
+            )
+            let attachRect = NSRect(
+                x: bounds.maxX - Self.blockOuterMargin - trailingInset - buttonSize,
+                y: blockFrame.minY,
+                width: buttonSize,
+                height: buttonSize
+            )
+            let copyRect = attachRect.offsetBy(dx: -(buttonSize + buttonGap), dy: 0)
+            let foldRect = copyRect.offsetBy(dx: -(buttonSize + buttonGap), dy: 0)
+            if range.count > 1 {
+                targets.append(BlockActionHitTarget(
+                    action: .toggleFold,
+                    blockID: blockID,
+                    block: nil,
+                    rect: foldRect,
+                    isEnabled: true
+                ))
+            }
+            if let block = blockContents(for: range, frame: frame, cells: cells) {
+                targets.append(BlockActionHitTarget(
+                    action: .copy,
+                    blockID: blockID,
+                    block: block,
+                    rect: copyRect,
+                    isEnabled: true
+                ))
+                targets.append(BlockActionHitTarget(
+                    action: .attach,
+                    blockID: blockID,
+                    block: block,
+                    rect: attachRect,
+                    isEnabled: !session.hasPendingAIAttachment(for: block.id)
+                ))
+            }
+        }
+
+        blockActionHitTargets = targets
+        if let hoveredBlockAction,
+           !targets.contains(where: {
+               $0.action == hoveredBlockAction.action && $0.blockID == hoveredBlockAction.blockID
+           }) {
+            self.hoveredBlockAction = nil
+        }
+        invalidateCursorRectsIfChanged(from: previousTargets)
+    }
+
+    private func drawBlockActions() {
+        for target in blockActionHitTargets {
+            let isHovered = hoveredBlockAction?.action == target.action
+                && hoveredBlockAction?.blockID == target.blockID
+            let isAttached = target.action == .attach && !target.isEnabled
+            let buttonRect = target.rect.insetBy(dx: 2, dy: 2)
+            let background = NSBezierPath(
+                roundedRect: buttonRect,
+                xRadius: 5,
+                yRadius: 5
+            )
+            if isHovered, target.isEnabled {
+                NSColor.white.withAlphaComponent(0.11).setFill()
+            } else if isAttached {
+                NSColor(srgbRed: 0.27, green: 0.83, blue: 0.81, alpha: 0.12).setFill()
+            } else {
+                NSColor.white.withAlphaComponent(0.045).setFill()
+            }
+            background.fill()
+            NSColor.white.withAlphaComponent(isHovered ? 0.16 : 0.07).setStroke()
+            background.lineWidth = 1
+            background.stroke()
+
+            let symbolName: String
+            switch target.action {
+            case .toggleFold:
+                symbolName = session.isTerminalBlockCollapsed(target.blockID)
+                    ? "chevron.right"
+                    : "chevron.down"
+            case .copy:
+                symbolName = "doc.on.doc"
+            case .attach:
+                symbolName = isAttached ? "checkmark.circle.fill" : "paperclip"
+            }
+            guard let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) else {
+                continue
+            }
+            let tint = isAttached
+                ? NSColor(srgbRed: 0.43, green: 0.95, blue: 0.91, alpha: 0.92)
+                : NSColor.white.withAlphaComponent(target.isEnabled ? 0.72 : 0.30)
+            let configuration = NSImage.SymbolConfiguration(pointSize: 11, weight: .medium)
+                .applying(.init(hierarchicalColor: tint))
+            let configuredImage = image.withSymbolConfiguration(configuration) ?? image
+            let iconRect = NSRect(
+                x: buttonRect.midX - 6,
+                y: buttonRect.midY - 6,
+                width: 12,
+                height: 12
+            )
+            configuredImage.draw(
+                in: iconRect,
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1,
+                respectFlipped: true,
+                hints: [.interpolation: NSImageInterpolation.high]
+            )
+        }
+    }
+
+    private func performBlockAction(_ target: BlockActionHitTarget) {
+        selectedBlockHistoryRow = target.blockID.historyRow
+        switch target.action {
+        case .toggleFold:
+            session.toggleTerminalBlockCollapsed(target.blockID)
+        case .copy:
+            guard let block = target.block else { return }
+            copyToPasteboard(block.output.isEmpty ? block.command : block.output)
+        case .attach:
+            guard let block = target.block else { return }
+            session.attachToAI(
+                command: block.command,
+                output: session.fullOutput(for: block.command) ?? block.output,
+                workingDirectory: block.workingDirectory,
+                sourceBlockID: block.id
+            )
+        }
+        needsDisplay = true
+    }
+
+    private func updateGraphicalHitTargets(
+        _ frame: GTFrame,
+        rowOffsets: [CGFloat],
+        rowLeadingOffsets: [CGFloat],
+        hiddenRows: Set<Int>
+    ) {
         let previousTargets = imageHitTargets
         guard session.graphicalMode, let images = frame.images, frame.image_count > 0 else {
             imageHitTargets = []
             selectedGraphicalPlacementID = nil
             hoveredGraphicalPlacementID = nil
+            dropTargetGraphicalPlacementID = nil
             invalidateCursorRectsIfChanged(from: previousTargets)
             return
         }
 
         imageHitTargets = (0..<Int(frame.image_count)).compactMap { index in
             let placement = images[index]
-            guard placement.placement_id != 0 else { return nil }
-            let imageRect = imageRect(for: placement, rowOffsets: rowOffsets)
+            guard placement.placement_id != 0,
+                  !hiddenRows.contains(Int(placement.viewport_row)) else { return nil }
+            let imageRect = imageRect(
+                for: placement,
+                rowOffsets: rowOffsets,
+                rowLeadingOffsets: rowLeadingOffsets
+            )
             let layout = session.graphicalItemHitLayout(for: placement.placement_id)
             let tileStartX = max(6, imageRect.minX - cellWidth * CGFloat(layout.0))
             return ImageHitTarget(
@@ -445,13 +924,19 @@ final class TerminalNSView: NSView,
            !imageHitTargets.contains(where: { $0.placementID == hoveredGraphicalPlacementID }) {
             self.hoveredGraphicalPlacementID = nil
         }
+        if let dropTargetGraphicalPlacementID,
+           !imageHitTargets.contains(where: { $0.placementID == dropTargetGraphicalPlacementID }) {
+            self.dropTargetGraphicalPlacementID = nil
+        }
         invalidateCursorRectsIfChanged(from: previousTargets)
     }
 
     private func drawGraphicalItemSurfaces() {
         guard session.graphicalMode else { return }
         for target in imageHitTargets {
-            if target.placementID == selectedGraphicalPlacementID {
+            if target.placementID == dropTargetGraphicalPlacementID {
+                drawGraphicalDropTarget(in: target.rect)
+            } else if target.placementID == selectedGraphicalPlacementID {
                 drawGraphicalSelection(in: target.rect)
             } else if target.placementID == hoveredGraphicalPlacementID {
                 drawGraphicalHover(in: target.rect)
@@ -459,13 +944,20 @@ final class TerminalNSView: NSView,
         }
     }
 
-    private func imageRect(for placement: GTImage, rowOffsets: [CGFloat]) -> NSRect {
+    private func imageRect(
+        for placement: GTImage,
+        rowOffsets: [CGFloat],
+        rowLeadingOffsets: [CGFloat]
+    ) -> NSRect {
         let placementRow = Int(placement.viewport_row)
         let rowOffset = rowOffsets.indices.contains(placementRow) ? rowOffsets[placementRow] : 0
+        let leadingOffset = rowLeadingOffsets.indices.contains(placementRow)
+            ? rowLeadingOffsets[placementRow]
+            : Self.terminalContentInset
         return NSRect(
             x: CGFloat(placement.viewport_col) * cellWidth
                 + CGFloat(placement.cell_offset_x)
-                + 10,
+                + leadingOffset,
             y: CGFloat(placement.viewport_row) * cellHeight
                 + CGFloat(placement.cell_offset_y)
                 + rowOffset,
@@ -474,13 +966,23 @@ final class TerminalNSView: NSView,
         )
     }
 
-    private func drawImages(_ frame: GTFrame, rowOffsets: [CGFloat]) {
+    private func drawImages(
+        _ frame: GTFrame,
+        rowOffsets: [CGFloat],
+        rowLeadingOffsets: [CGFloat],
+        hiddenRows: Set<Int>
+    ) {
         guard let images = frame.images, frame.image_count > 0 else { return }
         for index in 0..<Int(frame.image_count) {
             let placement = images[index]
+            guard !hiddenRows.contains(Int(placement.viewport_row)) else { continue }
             guard let cgImage = cachedImage(for: placement) else { continue }
             let displayedImage = folderBloomImage(for: placement, baseImage: cgImage) ?? cgImage
-            let rect = imageRect(for: placement, rowOffsets: rowOffsets)
+            let rect = imageRect(
+                for: placement,
+                rowOffsets: rowOffsets,
+                rowLeadingOffsets: rowLeadingOffsets
+            )
             NSImage(cgImage: displayedImage, size: rect.size).draw(
                 in: rect,
                 from: .zero,
@@ -539,6 +1041,16 @@ final class TerminalNSView: NSView,
         )
         border.lineWidth = 1
         border.stroke()
+    }
+
+    private func drawGraphicalDropTarget(in rect: NSRect) {
+        let highlight = rect.insetBy(dx: 2, dy: 1)
+        let path = NSBezierPath(roundedRect: highlight, xRadius: 8, yRadius: 8)
+        NSColor(srgbRed: 0.22, green: 0.82, blue: 0.78, alpha: 0.24).setFill()
+        path.fill()
+        NSColor(srgbRed: 0.48, green: 1.0, blue: 0.93, alpha: 0.98).setStroke()
+        path.lineWidth = 2
+        path.stroke()
     }
 
     private func selectionGlowImage(for size: NSSize, scale: CGFloat) -> CGImage? {
@@ -630,6 +1142,15 @@ final class TerminalNSView: NSView,
         }
     }
 
+    private func invalidateCursorRectsIfChanged(from previousTargets: [BlockActionHitTarget]) {
+        guard previousTargets != blockActionHitTargets else { return }
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, let window = self.window else { return }
+            window.invalidateCursorRects(for: self)
+        }
+    }
+
     private func color(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> NSColor {
         NSColor(red: CGFloat(r) / 255, green: CGFloat(g) / 255, blue: CGFloat(b) / 255, alpha: 1)
     }
@@ -647,10 +1168,18 @@ final class TerminalNSView: NSView,
         NSBezierPath(roundedRect: rect, xRadius: 1.5, yRadius: 1.5).fill()
     }
 
-    private func menuItem(_ title: String, action: Selector, enabled: Bool) -> NSMenuItem {
+    private func menuItem(
+        _ title: String,
+        action: Selector,
+        enabled: Bool,
+        systemImage: String? = nil
+    ) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
         item.target = self
         item.isEnabled = enabled
+        if let systemImage {
+            item.image = NSImage(systemSymbolName: systemImage, accessibilityDescription: title)
+        }
         return item
     }
 
@@ -667,6 +1196,7 @@ final class TerminalNSView: NSView,
         let canModify = item.name != ".." && item.path != "/"
 
         menu.addItem(menuItem("Open", action: #selector(openGraphicalItem), enabled: true))
+        menu.addItem(menuItem("List", action: #selector(listGraphicalDirectory), enabled: true))
         menu.addItem(menuItem(
             "Open in New Tab",
             action: #selector(openGraphicalFolderInNewTab),
@@ -718,6 +1248,15 @@ final class TerminalNSView: NSView,
         let menu = NSMenu()
         menu.addItem(menuItem("Open", action: #selector(openGraphicalItem), enabled: true))
         menu.addItem(openWithMenuItem(for: item))
+        if session.graphicalItemCanDisplayAsText(item) {
+            menu.addItem(menuItem(
+                "Cat",
+                action: #selector(catGraphicalFile),
+                enabled: true,
+                systemImage: "doc.text"
+            ))
+        }
+        menu.addItem(.separator())
         menu.addItem(menuItem("Copy", action: #selector(copyGraphicalItem), enabled: true))
         menu.addItem(menuItem(
             "Paste",
@@ -797,7 +1336,7 @@ final class TerminalNSView: NSView,
         return (name as NSString).deletingPathExtension
     }
 
-    private func selectBlock(at row: Int) {
+    private func selectBlock(atVisualY visualY: CGFloat) {
         guard let handle = session.handle, let framePointer = gt_session_frame(handle),
               let cells = framePointer.pointee.cells else {
             selectedBlockHistoryRow = nil
@@ -805,8 +1344,9 @@ final class TerminalNSView: NSView,
             return
         }
         let frame = framePointer.pointee
-        selectedBlockHistoryRow = blockRanges(frame: frame, cells: cells)
-            .last(where: { $0.contains(row) })
+        let ranges = blockRanges(frame: frame, cells: cells)
+        selectedBlockHistoryRow = blockVisualLayout(frame: frame, cells: cells, ranges: ranges)
+            .blockRange(at: visualY)
             .map { frame.scroll_offset + UInt64($0.lowerBound) }
         needsDisplay = true
     }
@@ -814,10 +1354,26 @@ final class TerminalNSView: NSView,
     @objc private func copyOutput() { copyToPasteboard(contextBlock?.output) }
     @objc private func copyCommand() { copyToPasteboard(contextBlock?.command) }
     @objc private func copyWorkingDirectory() { copyToPasteboard(contextBlock?.workingDirectory) }
+    @objc private func toggleContextBlockFold() {
+        guard let contextBlock else { return }
+        session.toggleTerminalBlockCollapsed(contextBlock.id)
+        needsDisplay = true
+    }
+    @objc private func copyTerminalSelection() { copyToPasteboard(selectedTerminalText()) }
 
     @objc private func openGraphicalItem() {
         guard let contextGraphicalItem else { return }
         session.activateGraphicalItem(contextGraphicalItem)
+    }
+
+    @objc private func listGraphicalDirectory() {
+        guard let contextGraphicalItem else { return }
+        session.listGraphicalDirectory(contextGraphicalItem)
+    }
+
+    @objc private func catGraphicalFile() {
+        guard let contextGraphicalItem else { return }
+        session.catGraphicalFile(contextGraphicalItem)
     }
 
     @objc private func openGraphicalFolderInNewTab() {
@@ -882,6 +1438,7 @@ final class TerminalNSView: NSView,
         let source = URL(fileURLWithPath: contextGraphicalItem.path)
         Task { @MainActor [weak self] in
             do {
+                try await TerminalSession.ensureUbiquitousItemIsAvailable(at: source)
                 _ = try await GraphicalFileOperations.compress(source)
                 self?.session.showCurrentDirectoryGraphically()
             } catch {
@@ -895,6 +1452,7 @@ final class TerminalNSView: NSView,
         let source = URL(fileURLWithPath: contextGraphicalItem.path)
         Task { @MainActor [weak self] in
             do {
+                try await TerminalSession.ensureUbiquitousItemIsAvailable(at: source)
                 _ = try await NSWorkspace.shared.duplicate([source])
                 self?.session.showCurrentDirectoryGraphically()
             } catch {
@@ -905,11 +1463,20 @@ final class TerminalNSView: NSView,
 
     @objc private func quickLookGraphicalItem() {
         guard let contextGraphicalItem else { return }
-        quickLookURL = URL(fileURLWithPath: contextGraphicalItem.path)
-        focusTerminal()
-        guard let panel = QLPreviewPanel.shared() else { return }
-        panel.updateController()
-        panel.makeKeyAndOrderFront(nil)
+        let url = URL(fileURLWithPath: contextGraphicalItem.path)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await TerminalSession.ensureUbiquitousItemIsAvailable(at: url)
+                self.quickLookURL = url
+                self.focusTerminal()
+                guard let panel = QLPreviewPanel.shared() else { return }
+                panel.updateController()
+                panel.makeKeyAndOrderFront(nil)
+            } catch {
+                self.presentOperationError(error)
+            }
+        }
     }
 
     @objc private func moveGraphicalItemToTrash() {
@@ -957,12 +1524,20 @@ final class TerminalNSView: NSView,
         _ item: GraphicalFileItem,
         applicationURL: URL
     ) {
-        let configuration = NSWorkspace.OpenConfiguration()
-        NSWorkspace.shared.open(
-            [URL(fileURLWithPath: item.path)],
-            withApplicationAt: applicationURL,
-            configuration: configuration
-        )
+        let url = URL(fileURLWithPath: item.path)
+        Task { @MainActor [weak self] in
+            do {
+                try await TerminalSession.ensureUbiquitousItemIsAvailable(at: url)
+                let configuration = NSWorkspace.OpenConfiguration()
+                try await NSWorkspace.shared.open(
+                    [url],
+                    withApplicationAt: applicationURL,
+                    configuration: configuration
+                )
+            } catch {
+                self?.presentOperationError(error)
+            }
+        }
     }
 
     @objc private func copyGraphicalItem() {
@@ -980,7 +1555,8 @@ final class TerminalNSView: NSView,
             session.attachToAI(
                 command: block.command,
                 output: session.fullOutput(for: block.command) ?? block.output,
-                workingDirectory: block.workingDirectory
+                workingDirectory: block.workingDirectory,
+                sourceBlockID: block.id
             )
         } else {
             session.attachGraphicalOutputToAI()
@@ -1011,25 +1587,40 @@ final class TerminalNSView: NSView,
     }
 
     private func blockRanges(frame: GTFrame, cells: UnsafePointer<GTCell>) -> [Range<Int>] {
-        var starts: [Int] = []
-        for y in 0..<Int(frame.rows) {
-            if frame.row_semantics?[y] == 1 { starts.append(y) }
+        let rowCount = Int(frame.rows)
+        let semantics = (0..<rowCount).map { frame.row_semantics?[$0] ?? 0 }
+        var visibleRows = (0..<rowCount).map {
+            rowHasVisibleContent($0, frame: frame, cells: cells)
         }
-        return starts.enumerated().map { index, start in
-            var limit = index + 1 < starts.count ? starts[index + 1] : Int(frame.rows)
-            if index == starts.count - 1, frame.cursor_visible, Int(frame.cursor_y) > start {
-                // The shell has drawn its next prompt, but it is not marked as
-                // a new semantic prompt until typing begins. Keep that row out
-                // of the completed command block.
-                limit = min(limit, Int(frame.cursor_y))
+        if let images = frame.images {
+            for index in 0..<Int(frame.image_count) {
+                let placement = images[index]
+                let layoutRowHeight: Int
+                if session.graphicalItem(for: placement.placement_id) != nil {
+                    layoutRowHeight = session.graphicalItemHitLayout(
+                        for: placement.placement_id
+                    ).2
+                } else {
+                    layoutRowHeight = 1
+                }
+                guard let range = TerminalGraphicalRowCoverage.range(
+                    placementRow: Int(placement.viewport_row),
+                    cellOffsetY: CGFloat(placement.cell_offset_y),
+                    pixelHeight: CGFloat(placement.pixel_height),
+                    layoutRowHeight: layoutRowHeight,
+                    rowCount: rowCount,
+                    cellHeight: cellHeight
+                ) else { continue }
+                for row in range {
+                    visibleRows[row] = true
+                }
             }
-
-            var end = limit
-            while end > start + 1 && !rowHasVisibleContent(end - 1, frame: frame, cells: cells) {
-                end -= 1
-            }
-            return start..<max(start + 1, end)
         }
+        return TerminalBlockRangeResolver.ranges(
+            rowSemantics: semantics,
+            visibleRows: visibleRows,
+            cursorRow: frame.cursor_visible ? Int(frame.cursor_y) : nil
+        )
     }
 
     private func rowHasVisibleContent(_ row: Int, frame: GTFrame, cells: UnsafePointer<GTCell>) -> Bool {
@@ -1047,7 +1638,18 @@ final class TerminalNSView: NSView,
         guard let range = ranges.last(where: { $0.contains(row) }) else {
             return nil
         }
+        return blockContents(for: range, frame: frame, cells: cells)
+    }
 
+    private func blockContents(
+        for range: Range<Int>,
+        frame: GTFrame,
+        cells: UnsafePointer<GTCell>
+    ) -> BlockContents? {
+        let blockID = TerminalBlockID(
+            sessionID: session.id,
+            historyRow: frame.scroll_offset + UInt64(range.lowerBound)
+        )
         var commandRows: [String] = []
         for y in range {
             var text = ""
@@ -1057,12 +1659,46 @@ final class TerminalNSView: NSView,
             }
             if !text.isEmpty { commandRows.append(text) }
         }
-        let command = commandRows.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        var command = commandRows.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        var renderedCommandRows: Set<Int> = []
+        if command.isEmpty {
+            let containsGraphicalImage = frame.images.map { images in
+                (0..<Int(frame.image_count)).contains { index in
+                    images[index].placement_id != 0
+                        && range.contains(Int(images[index].viewport_row))
+                }
+            } ?? false
+            if containsGraphicalImage, let attachment = session.graphicalBlockAttachment() {
+                return BlockContents(
+                    id: blockID,
+                    command: attachment.command,
+                    output: attachment.output,
+                    workingDirectory: attachment.workingDirectory
+                )
+            }
+            let visibleRows = range.map { row in
+                (0..<Int(frame.cols)).map { column in
+                    cellText(cells[row * Int(frame.cols) + column])
+                }.joined().replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
+            }
+            guard let recordedCommand = session.submittedCommand(
+                matchingRenderedText: visibleRows.joined()
+            ) else { return nil }
+            command = recordedCommand
+
+            var renderedPrefix = ""
+            for (index, visibleRow) in visibleRows.enumerated() {
+                renderedPrefix += visibleRow
+                renderedCommandRows.insert(range.lowerBound + index)
+                if renderedPrefix.contains(command) { break }
+            }
+        }
         guard !command.isEmpty else { return nil }
 
         var outputRows: [String] = []
         if range.lowerBound + 1 < range.upperBound {
             for y in (range.lowerBound + 1)..<range.upperBound {
+                if renderedCommandRows.contains(y) { continue }
                 let containsCommandInput = (0..<Int(frame.cols)).contains { x in
                     cells[y * Int(frame.cols) + x].semantic_content == UInt8(GT_SEMANTIC_INPUT)
                 }
@@ -1074,8 +1710,23 @@ final class TerminalNSView: NSView,
         }
         while outputRows.first?.isEmpty == true { outputRows.removeFirst() }
         while outputRows.last?.isEmpty == true { outputRows.removeLast() }
-        return BlockContents(command: command, output: outputRows.joined(separator: "\n"),
-                             workingDirectory: session.workingDirectory(for: command))
+        return BlockContents(
+            id: blockID,
+            command: command,
+            output: outputRows.joined(separator: "\n"),
+            workingDirectory: session.workingDirectory(for: command)
+        )
+    }
+
+    private func blockContents(atVisualY visualY: CGFloat) -> BlockContents? {
+        guard let handle = session.handle,
+              let framePointer = gt_session_frame(handle),
+              let cells = framePointer.pointee.cells else { return nil }
+        let frame = framePointer.pointee
+        let ranges = blockRanges(frame: frame, cells: cells)
+        guard let range = blockVisualLayout(frame: frame, cells: cells, ranges: ranges)
+            .blockRange(at: visualY) else { return nil }
+        return blockContents(for: range, frame: frame, cells: cells)
     }
 
     private func cellText(_ cell: GTCell) -> String {

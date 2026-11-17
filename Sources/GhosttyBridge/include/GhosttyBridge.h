@@ -83,6 +83,10 @@ const char *gt_runtime_error(void);
 GTSession *gt_session_create(uint16_t cols, uint16_t rows, const char **error);
 GTSession *gt_session_create_at(uint16_t cols, uint16_t rows,
                                 const char *working_directory, const char **error);
+GTSession *gt_session_create_configured(uint16_t cols, uint16_t rows,
+                                        const char *working_directory,
+                                        const char *shell_integration_directory,
+                                        const char **error);
 void gt_session_destroy(GTSession *session);
 
 /** Read pending PTY output into Ghostty. Returns true when the screen changed. */

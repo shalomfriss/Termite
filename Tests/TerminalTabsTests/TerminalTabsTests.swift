@@ -1,8 +1,8 @@
 import XCTest
 import GhosttyBridge
-@testable import TerminalTabs
+@testable import Air
 
-final class TerminalTabsTests: XCTestCase {
+final class AirTests: XCTestCase {
     func testAIBlockAttachmentIncludesTerminalContext() {
         let attachment = TerminalBlockAttachment(
             command: "swift test",
@@ -25,8 +25,61 @@ final class TerminalTabsTests: XCTestCase {
         let session = TerminalSession(cols: 40, rows: 10)
         session.attachToAI(command: "ls", output: "Package.swift", workingDirectory: "/tmp")
         XCTAssertTrue(session.isAIChatVisible)
-        XCTAssertEqual(session.aiAttachment?.command, "ls")
-        XCTAssertEqual(session.aiAttachment?.output, "Package.swift")
+        guard case .terminalBlock(let attachment) = session.aiAttachments.first else {
+            return XCTFail("Expected a terminal block attachment")
+        }
+        XCTAssertEqual(attachment.command, "ls")
+        XCTAssertEqual(attachment.output, "Package.swift")
+
+        session.attachToAI(command: "pwd", output: "/tmp", workingDirectory: "/tmp")
+        XCTAssertEqual(session.aiAttachments.count, 2)
+    }
+
+    @MainActor
+    func testSameTerminalBlockCannotBeAttachedTwice() {
+        let session = TerminalSession(cols: 40, rows: 10)
+        let firstBlock = TerminalBlockID(sessionID: session.id, historyRow: 12)
+        let secondBlock = TerminalBlockID(sessionID: session.id, historyRow: 18)
+
+        XCTAssertTrue(session.attachToAI(
+            command: "pwd",
+            output: "/tmp",
+            workingDirectory: "/tmp",
+            sourceBlockID: firstBlock
+        ))
+        XCTAssertFalse(session.attachToAI(
+            command: "pwd",
+            output: "/tmp",
+            workingDirectory: "/tmp",
+            sourceBlockID: firstBlock
+        ))
+        XCTAssertEqual(session.aiAttachments.count, 1)
+        XCTAssertTrue(session.hasPendingAIAttachment(for: firstBlock))
+
+        XCTAssertTrue(session.attachToAI(
+            command: "pwd",
+            output: "/tmp",
+            workingDirectory: "/tmp",
+            sourceBlockID: secondBlock
+        ))
+        XCTAssertEqual(session.aiAttachments.count, 2)
+    }
+
+    @MainActor
+    func testFilesAndFoldersCanBeAttachedToAI() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "terminal-tabs-ai-drop-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appending(path: "notes.txt")
+        try Data("important context".utf8).write(to: file)
+
+        let session = TerminalSession(cols: 40, rows: 10)
+        XCTAssertTrue(session.attachFilesToAI([file, root]))
+        XCTAssertEqual(session.aiAttachments.count, 2)
+        let promptContent = session.aiAttachments.map(\.promptContent).joined()
+        XCTAssertTrue(promptContent.contains("important context"))
+        XCTAssertTrue(promptContent.contains("notes.txt"))
     }
 
     func testGraphicalDirectoryListingCreatesAIAttachment() {
@@ -121,6 +174,158 @@ final class TerminalTabsTests: XCTestCase {
         XCTAssertTrue(wrapped.joined().hasSuffix("…e"))
     }
 
+    func testGraphicalRowHighlightFitsRenderedContent() {
+        let width = TerminalSession.graphicalRowHitWidth(
+            textColumn: 4,
+            renderedTextCount: 12,
+            terminalColumns: 80
+        )
+
+        XCTAssertEqual(width, 17)
+        XCTAssertLessThan(width, 78)
+        XCTAssertEqual(
+            TerminalSession.graphicalRowHitWidth(
+                textColumn: 4,
+                renderedTextCount: 120,
+                terminalColumns: 80
+            ),
+            78
+        )
+    }
+
+    func testActivePromptReceivesBlockBeforeTypingBegins() {
+        let ranges = TerminalBlockRangeResolver.ranges(
+            rowSemantics: [0, 1, 0, 0, 0, 0],
+            visibleRows: [false, true, true, true, true, false],
+            cursorRow: 4
+        )
+
+        XCTAssertEqual(ranges, [1..<4, 4..<5])
+    }
+
+    func testLeadingGraphicalOutputReceivesBlockBeforeFirstPrompt() {
+        let ranges = TerminalBlockRangeResolver.ranges(
+            rowSemantics: [0, 0, 1, 0],
+            visibleRows: [true, true, true, false],
+            cursorRow: 2
+        )
+
+        XCTAssertEqual(ranges, [0..<2, 2..<3])
+    }
+
+    func testGraphicalRowCoverageContainsImageAndLabelRows() {
+        let range = TerminalGraphicalRowCoverage.range(
+            placementRow: 0,
+            cellOffsetY: 4,
+            pixelHeight: 32,
+            layoutRowHeight: 3,
+            rowCount: 8,
+            cellHeight: 20
+        )
+
+        XCTAssertEqual(range, 0..<3)
+    }
+
+    func testGraphicalRowCoverageIncludesNegativeImageOffset() {
+        let range = TerminalGraphicalRowCoverage.range(
+            placementRow: 2,
+            cellOffsetY: -6,
+            pixelHeight: 20,
+            layoutRowHeight: 1,
+            rowCount: 8,
+            cellHeight: 20
+        )
+
+        XCTAssertEqual(range, 1..<3)
+    }
+
+    func testCollapsedBlockLayoutHidesOutputAndPreservesSpacing() {
+        let layout = TerminalBlockVisualLayout.make(
+            ranges: [0..<3, 3..<5],
+            rowCount: 8,
+            cellHeight: 20,
+            viewportHeight: 500,
+            lastContentRow: 5,
+            collapsedRangeStarts: [0]
+        )
+
+        XCTAssertEqual(layout.hiddenRows, [1, 2])
+        XCTAssertEqual(layout.blockFrames[0].height, 60)
+        XCTAssertEqual(layout.blockFrames[1].minY - layout.blockFrames[0].maxY, 10)
+        XCTAssertEqual(layout.rowOffsets[3], 30)
+        XCTAssertEqual(layout.row(at: 40, cellHeight: 20, nearest: false), 0)
+    }
+
+    func testFinderStyleArrangementSortsAndGroupsItems() {
+        let now = Date()
+        let items = [
+            GraphicalFileItem(
+                path: "/tmp/small.txt",
+                name: "small.txt",
+                kind: .file,
+                size: 8,
+                modified: now.addingTimeInterval(-3_600),
+                kindDescription: "Plain Text Document"
+            ),
+            GraphicalFileItem(
+                path: "/tmp/Folder",
+                name: "Folder",
+                kind: .directory,
+                size: 512,
+                modified: now,
+                kindDescription: "Folder"
+            ),
+            GraphicalFileItem(
+                path: "/tmp/large.zip",
+                name: "large.zip",
+                kind: .file,
+                size: 2_000_000,
+                modified: now.addingTimeInterval(-7_200),
+                kindDescription: "ZIP Archive",
+                tags: ["Work"]
+            ),
+        ]
+
+        let sorted = TerminalSession.graphicalSections(
+            items,
+            sortBy: .size,
+            groupBy: .none,
+            direction: .descending,
+            foldersFirst: false
+        )
+        XCTAssertEqual(sorted.flatMap(\.items).map(\.name), ["large.zip", "Folder", "small.txt"])
+
+        let grouped = TerminalSession.graphicalSections(
+            items,
+            sortBy: .name,
+            groupBy: .kind,
+            direction: .ascending,
+            foldersFirst: true
+        )
+        XCTAssertEqual(Set(grouped.compactMap(\.title)), ["Folder", "Plain Text Document", "ZIP Archive"])
+        XCTAssertEqual(GraphicalSortOption.allCases.count, 8)
+    }
+
+    func testTerminalTextSelectionExtractsForwardAndReverseRanges() {
+        let rows = [
+            ["a", "b", "c", "d", " "],
+            ["e", "f", "g", "h", " "],
+        ]
+        let selection = TerminalTextSelection(
+            anchor: TerminalTextPosition(row: 8, column: 2),
+            extent: TerminalTextPosition(row: 7, column: 1)
+        )
+
+        XCTAssertEqual(
+            TerminalTextSelectionExtractor.text(
+                cellRows: rows,
+                firstRow: 7,
+                selection: selection
+            ),
+            "bcd\nefg"
+        )
+    }
+
     func testGraphicalPasteDestinationDoesNotOverwriteExistingFile() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("terminal-tabs-paste-\(UUID().uuidString)", isDirectory: true)
@@ -136,6 +341,33 @@ final class TerminalTabsTests: XCTestCase {
     }
 
     @MainActor
+    func testGraphicalDragMovesFileIntoFolderWithoutOverwriting() throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("terminal-tabs-drag-\(UUID().uuidString)", isDirectory: true)
+        let destination = root.appendingPathComponent("Destination", isDirectory: true)
+        let source = root.appendingPathComponent("note.txt")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        try Data("drag me".utf8).write(to: source)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let session = TerminalSession(cols: 20, rows: 8)
+        session.graphicalMode = true
+        let destinationItem = GraphicalFileItem(
+            path: destination.path,
+            name: destination.lastPathComponent,
+            kind: .directory
+        )
+
+        XCTAssertTrue(session.canMoveGraphicalItems([source], into: destinationItem))
+        XCTAssertTrue(session.moveGraphicalItems([source], into: destinationItem))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("note.txt").path
+        ))
+    }
+
+    @MainActor
     func testGraphicalCopyAndPasteCopiesFolderContents() throws {
         if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
         let root = FileManager.default.temporaryDirectory
@@ -147,7 +379,7 @@ final class TerminalTabsTests: XCTestCase {
         try Data("contents".utf8).write(to: source.appendingPathComponent("file.txt"))
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let pasteboard = NSPasteboard(name: .init("TerminalTabsTests.\(UUID().uuidString)"))
+        let pasteboard = NSPasteboard(name: .init("AirTests.\(UUID().uuidString)"))
         defer { pasteboard.clearContents() }
         let session = TerminalSession(cols: 20, rows: 8)
         session.copyGraphicalItem(
@@ -190,10 +422,20 @@ final class TerminalTabsTests: XCTestCase {
         session.activateGraphicalItem(
             GraphicalFileItem(path: target, name: "Scripts", kind: .directory)
         )
-        for _ in 0..<100 where session.workingDirectory != target {
+        var exposedInternalCommand = false
+        for _ in 0..<300 where session.isGraphicalNavigationInProgress {
             try await Task.sleep(for: .milliseconds(20))
             session.poll()
+            if let frame = gt_session_frame(try XCTUnwrap(session.handle))?.pointee {
+                exposedInternalCommand = exposedInternalCommand
+                    || visibleFrameText(frame).contains("cd --")
+            }
         }
+        XCTAssertFalse(session.isGraphicalNavigationInProgress)
+        XCTAssertFalse(
+            exposedInternalCommand,
+            "Double-click navigation must not draw its internal cd command"
+        )
         XCTAssertEqual(session.workingDirectory, target)
 
         var navigatedImageCount = 0
@@ -225,16 +467,116 @@ final class TerminalTabsTests: XCTestCase {
     }
 
     @MainActor
-    func testEnablingGraphicalModeImmediatelyShowsCurrentDirectory() async throws {
+    func testRapidGraphicalNavigationCancelsStaleRequestAndRemainsUsable() async throws {
         if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
-        let session = TerminalSession(cols: 80, rows: 24)
-        for _ in 0..<30 {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "terminal-tabs-navigation-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let first = root.appending(path: "First", directoryHint: .isDirectory)
+        let second = root.appending(path: "Second", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: first, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let session = TerminalSession(cols: 60, rows: 16)
+        for _ in 0..<50 {
             try await Task.sleep(for: .milliseconds(20))
             session.poll()
         }
+        session.graphicalMode = true
+        session.activateGraphicalItem(GraphicalFileItem(
+            path: first.path,
+            name: first.lastPathComponent,
+            kind: .directory
+        ))
+        session.activateGraphicalItem(GraphicalFileItem(
+            path: second.path,
+            name: second.lastPathComponent,
+            kind: .directory
+        ))
+
+        for _ in 0..<300 where session.isGraphicalNavigationInProgress {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+        }
+        XCTAssertFalse(session.isGraphicalNavigationInProgress)
+        XCTAssertEqual(session.workingDirectory, second.path)
+        XCTAssertNil(session.graphicalOperationIssue)
+
+        session.activateGraphicalItem(GraphicalFileItem(
+            path: first.path,
+            name: first.lastPathComponent,
+            kind: .directory
+        ))
+        for _ in 0..<300 where session.isGraphicalNavigationInProgress {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+        }
+        XCTAssertFalse(session.isGraphicalNavigationInProgress)
+        XCTAssertEqual(session.workingDirectory, first.path)
+        XCTAssertNil(session.graphicalOperationIssue)
+    }
+
+    @MainActor
+    func testGraphicalNavigationConcealsItsInternalCommand() throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let session = TerminalSession(cols: 60, rows: 12)
+        let handle = try XCTUnwrap(session.handle)
+        let marker = "cd -- /private/tmp/graphical-navigation-probe"
+
+        TerminalSession.graphicalNavigationConcealSequence.withUnsafeBytes { bytes in
+            guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return }
+            _ = gt_session_feed_output(
+                handle,
+                base,
+                TerminalSession.graphicalNavigationConcealSequence.count
+            )
+        }
+        Data(marker.utf8).withUnsafeBytes { bytes in
+            guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return }
+            _ = gt_session_feed_output(handle, base, marker.utf8.count)
+        }
+
+        let frame = try XCTUnwrap(gt_session_frame(handle)).pointee
+        XCTAssertFalse(
+            visibleFrameText(frame).contains(marker),
+            "The shell command used by graphical navigation must never be drawn"
+        )
+
+        TerminalSession.graphicalNavigationRevealSequence.withUnsafeBytes { bytes in
+            guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return }
+            _ = gt_session_feed_output(
+                handle,
+                base,
+                TerminalSession.graphicalNavigationRevealSequence.count
+            )
+        }
+        let visibleMarker = "navigation-finished"
+        Data(visibleMarker.utf8).withUnsafeBytes { bytes in
+            guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return }
+            _ = gt_session_feed_output(handle, base, visibleMarker.utf8.count)
+        }
+        let revealedFrame = try XCTUnwrap(gt_session_frame(handle)).pointee
+        XCTAssertTrue(visibleFrameText(revealedFrame).contains(visibleMarker))
+    }
+
+    func testLocalFilePassesICloudAvailabilityPreparation() async throws {
+        let file = FileManager.default.temporaryDirectory
+            .appending(path: "terminal-tabs-local-\(UUID().uuidString).txt")
+        try Data("local".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        try await TerminalSession.ensureUbiquitousItemIsAvailable(at: file)
+
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "local")
+    }
+
+    @MainActor
+    func testEnablingGraphicalModeImmediatelyShowsCurrentDirectory() async throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let session = TerminalSession(cols: 80, rows: 24)
         session.setGraphicalMode(true)
         var imageCount = 0
-        for _ in 0..<100 where imageCount == 0 {
+        for _ in 0..<250 where imageCount == 0 {
             try await Task.sleep(for: .milliseconds(20))
             session.poll()
             imageCount = gt_session_frame(try XCTUnwrap(session.handle)).map {
@@ -248,6 +590,46 @@ final class TerminalTabsTests: XCTestCase {
         XCTAssertEqual(hitLayout.0, 3)
         XCTAssertEqual(hitLayout.1, 10)
         XCTAssertLessThanOrEqual(hitLayout.2, 4)
+
+        for _ in 0..<15 {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+        }
+        let settledFrame = try XCTUnwrap(gt_session_frame(try XCTUnwrap(session.handle))).pointee
+        let visibleRows = (0..<Int(settledFrame.rows)).map {
+            rowText(frame: settledFrame, row: $0).trimmingCharacters(in: .whitespacesAndNewlines)
+        }.filter { !$0.isEmpty }
+        if visibleRows.count >= 2 {
+            XCTAssertNotEqual(
+                visibleRows.last,
+                visibleRows.dropLast().last,
+                "A newly opened graphical terminal should show only one prompt"
+            )
+        }
+    }
+
+    func testShellPromptReadinessRecognizesCommonPromptStyles() {
+        XCTAssertTrue(TerminalSession.looksLikeShellPrompt("user@host project % "))
+        XCTAssertTrue(TerminalSession.looksLikeShellPrompt("project ❯"))
+        XCTAssertTrue(TerminalSession.looksLikeShellPrompt("$"))
+        XCTAssertFalse(TerminalSession.looksLikeShellPrompt("Loading shell configuration"))
+        XCTAssertFalse(TerminalSession.looksLikeShellPrompt(""))
+    }
+
+    @MainActor
+    func testAIPanelResizeKeepsBothPanesUsable() {
+        XCTAssertEqual(
+            ResizableTerminalAIPane.clampedPanelHeight(100, containerHeight: 800),
+            180
+        )
+        XCTAssertEqual(
+            ResizableTerminalAIPane.clampedPanelHeight(700, containerHeight: 800),
+            608
+        )
+        XCTAssertEqual(
+            ResizableTerminalAIPane.clampedPanelHeight(320, containerHeight: 800),
+            320
+        )
     }
 
     @MainActor
@@ -282,6 +664,7 @@ final class TerminalTabsTests: XCTestCase {
             } ?? 0
         }
         XCTAssertGreaterThan(imageCount, 0)
+        XCTAssertEqual(session.submittedCommand(matchingRenderedText: "prompt % ls"), "ls")
     }
 
     func testGraphicalModeRecognizesFileListingCommands() {
@@ -473,9 +856,38 @@ final class TerminalTabsTests: XCTestCase {
     @MainActor
     func testAdjacentBlockBackgroundsDoNotOverlap() {
         let first = TerminalNSView.blockBackgroundRect(for: 1..<3, cellHeight: 20, width: 400)
-        let second = TerminalNSView.blockBackgroundRect(for: 3..<5, cellHeight: 20, width: 400)
+        let layout = TerminalBlockVisualLayout.make(
+            ranges: [0..<3, 3..<5],
+            rowCount: 8,
+            cellHeight: 20,
+            viewportHeight: 500,
+            lastContentRow: 5
+        )
 
-        XCTAssertEqual(first.maxY, second.minY)
+        XCTAssertEqual(layout.blockFrames[0].minY, 0)
+        XCTAssertEqual(layout.blockFrames[0].height, 100)
+        XCTAssertEqual(layout.blockFrames[1].minY - layout.blockFrames[0].maxY, 10)
+        XCTAssertEqual(layout.rowOffsets[0], 20)
+        XCTAssertEqual(layout.rowOffsets[3], 70)
+        XCTAssertEqual(first.minX, 8)
+        XCTAssertEqual(first.maxX, 392)
+        XCTAssertEqual(
+            TerminalNSView.blockContentLeadingOffset - first.minX,
+            TerminalNSView.blockContentPadding
+        )
+    }
+
+    func testBlankTerminalRowsDoNotIncreaseBlockSpacing() {
+        let layout = TerminalBlockVisualLayout.make(
+            ranges: [0..<2, 4..<6],
+            rowCount: 8,
+            cellHeight: 20,
+            viewportHeight: 500,
+            lastContentRow: 5
+        )
+
+        XCTAssertEqual(layout.blockFrames[1].minY - layout.blockFrames[0].maxY, 10)
+        XCTAssertEqual(layout.hiddenRows, [2, 3])
     }
 
     @MainActor
@@ -496,6 +908,85 @@ final class TerminalTabsTests: XCTestCase {
     }
 
     @MainActor
+    func testGraphicalFileMenuIncludesCat() {
+        let session = TerminalSession(cols: 40, rows: 10)
+        let view = TerminalNSView(session: session)
+        let file = GraphicalFileItem(
+            path: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appending(path: "Package.swift").path,
+            name: "Package.swift",
+            kind: .file
+        )
+
+        let catItem = view.graphicalItemMenu(for: file).items.first { $0.title == "Cat" }
+
+        XCTAssertNotNil(catItem)
+        XCTAssertNotNil(catItem?.image)
+    }
+
+    @MainActor
+    func testGraphicalBinaryFileMenuOmitsCat() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "terminal-tabs-binary-menu-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let binary = root.appending(path: "payload.bin")
+        try Data([0x00, 0x01, 0x7F, 0xFF]).write(to: binary)
+
+        let session = TerminalSession(cols: 40, rows: 10)
+        let view = TerminalNSView(session: session)
+        let menu = view.graphicalItemMenu(for: GraphicalFileItem(
+            path: binary.path,
+            name: binary.lastPathComponent,
+            kind: .file
+        ))
+
+        XCTAssertFalse(menu.items.contains(where: { $0.title == "Cat" }))
+    }
+
+    @MainActor
+    func testCatGraphicalFileUsesQuotedTerminalCommand() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "terminal-tabs-cat-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let session = TerminalSession(cols: 40, rows: 10)
+        session.graphicalMode = true
+        let path = root.appending(path: "quote's.txt").path
+        try Data("readable text".utf8).write(to: URL(fileURLWithPath: path))
+
+        session.catGraphicalFile(GraphicalFileItem(
+            path: path,
+            name: "quote's.txt",
+            kind: .file
+        ))
+        for _ in 0..<50 where session.commandBlocks.last?.command == nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertEqual(session.commandBlocks.last?.command, "cat -- '\(path.replacingOccurrences(of: "'", with: "'\\''"))'")
+    }
+
+    @MainActor
+    func testCreatingGraphicalFolderUsesCurrentDirectoryAndAvoidsDuplicates() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "terminal-tabs-new-folder-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let session = TerminalSession(cols: 40, rows: 10, workingDirectory: root.path)
+        session.graphicalMode = true
+
+        let created = try session.createGraphicalFolder(named: "Design Assets")
+
+        XCTAssertEqual(created.deletingLastPathComponent().standardizedFileURL, root.standardizedFileURL)
+        var isDirectory = ObjCBool(false)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: created.path, isDirectory: &isDirectory))
+        XCTAssertTrue(isDirectory.boolValue)
+        XCTAssertThrowsError(try session.createGraphicalFolder(named: "Design Assets"))
+        XCTAssertThrowsError(try session.createGraphicalFolder(named: "nested/folder"))
+    }
+
+    @MainActor
     func testGraphicalFolderMenuMatchesFinderActions() throws {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "terminal-tabs-menu-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -512,6 +1003,7 @@ final class TerminalTabsTests: XCTestCase {
         let titles = Set(menu.items.map(\.title))
 
         XCTAssertTrue(titles.contains("Open"))
+        XCTAssertTrue(titles.contains("List"))
         XCTAssertTrue(titles.contains("Open in New Tab"))
         XCTAssertTrue(titles.contains("Show in Finder"))
         XCTAssertTrue(titles.contains("Get Info"))
@@ -598,6 +1090,25 @@ final class TerminalTabsTests: XCTestCase {
         XCTAssertTrue(expected.contains(session.workingDirectory), "actual cwd: \(session.workingDirectory)")
     }
 
+    func testGitBranchDetectionWalksParentDirectories() throws {
+        let root = FileManager.default.temporaryDirectory.appending(
+            path: "air-git-status-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        let nested = root.appending(path: "Sources/App", directoryHint: .isDirectory)
+        let gitDirectory = root.appending(path: ".git", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: gitDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let head = gitDirectory.appending(path: "HEAD")
+        try Data("ref: refs/heads/feature/status-bar\n".utf8).write(to: head)
+
+        XCTAssertEqual(TerminalSession.gitBranchName(at: nested.path), "feature/status-bar")
+
+        try Data("1234567890abcdef\n".utf8).write(to: head)
+        XCTAssertEqual(TerminalSession.gitBranchName(at: nested.path), "1234567")
+    }
+
     @MainActor
     func testTerminalSessionStartsInRequestedDirectory() throws {
         if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
@@ -634,6 +1145,246 @@ final class TerminalTabsTests: XCTestCase {
         store.close()
         XCTAssertEqual(store.tabs.count, 1)
         XCTAssertNotNil(store.selectedID)
+    }
+
+    @MainActor
+    func testScheduledJobStorePersistsAndLaunchesDueJobOnlyOnce() throws {
+        let suiteName = "AirTests.ScheduledJobs.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let storageKey = "jobs"
+        let store = ScheduledJobStore(userDefaults: defaults, storageKey: storageKey)
+        var launchedJobs: [ScheduledJob] = []
+        store.setExecutor { launchedJobs.append($0) }
+        let runDate = Date.now.addingTimeInterval(60)
+        let job = try store.schedule(
+            at: runDate,
+            script: "printf scheduled",
+            workingDirectory: FileManager.default.currentDirectoryPath
+        )
+
+        store.launchDueJobs(at: runDate.addingTimeInterval(-1))
+        XCTAssertTrue(launchedJobs.isEmpty)
+
+        store.launchDueJobs(at: runDate)
+        store.launchDueJobs(at: runDate.addingTimeInterval(1))
+        XCTAssertEqual(launchedJobs.map(\.id), [job.id])
+        XCTAssertEqual(store.jobs.first?.status, .launching)
+
+        store.markLaunched(job.id, at: runDate)
+        let restored = ScheduledJobStore(userDefaults: defaults, storageKey: storageKey)
+        XCTAssertEqual(restored.jobs.first?.id, job.id)
+        XCTAssertEqual(restored.jobs.first?.status, .launched)
+        XCTAssertEqual(restored.jobs.first?.launchedAt, runDate)
+    }
+
+    @MainActor
+    func testSavedWorkflowHasNoTimeAndRunsOnlyOnDemand() throws {
+        let suiteName = "AirTests.SavedWorkflow.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = ScheduledJobStore(userDefaults: defaults, storageKey: "jobs")
+        var launchedJobs: [ScheduledJob] = []
+        store.setExecutor { job in
+            launchedJobs.append(job)
+            store.markLaunched(job.id)
+        }
+        let job = try store.schedule(
+            timing: .manual,
+            at: nil,
+            script: .pasted("printf workflow", language: .bash),
+            workingDirectory: FileManager.default.currentDirectoryPath
+        )
+
+        store.launchDueJobs(at: .distantFuture)
+        XCTAssertTrue(launchedJobs.isEmpty)
+        XCTAssertEqual(store.jobs.first?.status, .saved)
+        XCTAssertNil(store.jobs.first?.scheduledAt)
+        XCTAssertEqual(store.scheduledCount, 0)
+
+        store.runNow(job.id)
+        XCTAssertEqual(launchedJobs.map(\.id), [job.id])
+        XCTAssertEqual(store.jobs.first?.status, .saved)
+        XCTAssertNil(store.jobs.first?.scheduledAt)
+
+        let restored = ScheduledJobStore(userDefaults: defaults, storageKey: "jobs")
+        XCTAssertEqual(restored.jobs.first?.timing, .manual)
+        XCTAssertEqual(restored.jobs.first?.status, .saved)
+        XCTAssertNil(restored.jobs.first?.scheduledAt)
+    }
+
+    func testScheduledScriptDetectionPrefersShebangAndBuildsFileCommand() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "air-script-detection-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let misleadingExtension = directory.appending(path: "automation.sh")
+        try Data("#!/usr/bin/env python3\nprint('ready')\n".utf8).write(to: misleadingExtension)
+        let extensionlessPython = directory.appending(path: "python-automation")
+        try Data("print('ready')\n".utf8).write(to: extensionlessPython)
+        let extensionlessShell = directory.appending(path: "shell-automation")
+        try Data("echo ready\n".utf8).write(to: extensionlessShell)
+
+        let language = try ScheduledScriptLanguage.detect(at: misleadingExtension)
+        let script = ScheduledJobScript.file(at: misleadingExtension, language: language)
+        let command = try await script.executionCommand()
+
+        XCTAssertEqual(language, .python)
+        XCTAssertEqual(try ScheduledScriptLanguage.detect(at: extensionlessPython), .python)
+        XCTAssertEqual(try ScheduledScriptLanguage.detect(at: extensionlessShell), .bash)
+        XCTAssertTrue(command.hasPrefix("/usr/bin/env python3 -- "))
+        XCTAssertTrue(command.contains("automation.sh"))
+    }
+
+    func testLegacyScheduledJobDecodesAsPastedBash() throws {
+        let id = UUID()
+        let date = Date.now
+        let data = try JSONSerialization.data(withJSONObject: [
+            "id": id.uuidString,
+            "scheduledAt": date.timeIntervalSinceReferenceDate,
+            "script": "echo legacy",
+            "workingDirectory": "/tmp",
+            "status": "scheduled",
+            "createdAt": date.timeIntervalSinceReferenceDate,
+        ])
+
+        let job = try JSONDecoder().decode(ScheduledJob.self, from: data)
+
+        XCTAssertEqual(job.id, id)
+        XCTAssertEqual(job.script.source, .pasted)
+        XCTAssertEqual(job.script.language, .bash)
+        XCTAssertEqual(job.script.pastedText, "echo legacy")
+        XCTAssertEqual(job.runLocation, .selectedFolder)
+        XCTAssertEqual(job.timing, .scheduled)
+        XCTAssertEqual(job.scheduledAt, date)
+    }
+
+    @MainActor
+    func testDueScheduledJobCreatesNewShellAndExecutesScript() async throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let suiteName = "AirTests.ScheduledShell.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let jobStore = ScheduledJobStore(userDefaults: defaults, storageKey: "jobs")
+        let terminalStore = TerminalStore(scheduledJobs: jobStore)
+        terminalStore.graphicalMode = false
+        let initialTabCount = terminalStore.groups.lazy.flatMap(\.tabs).count
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "terminal-tabs-scheduled-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let output = directory.appending(path: "result.txt")
+        let job = try jobStore.schedule(
+            at: .now.addingTimeInterval(-1),
+            script: "printf scheduled-job > result.txt",
+            workingDirectory: directory.path
+        )
+
+        jobStore.launchDueJobs()
+        for _ in 0..<400 where !FileManager.default.fileExists(atPath: output.path) {
+            try await Task.sleep(for: .milliseconds(20))
+            for tab in terminalStore.groups.lazy.flatMap(\.tabs) { tab.poll() }
+        }
+
+        XCTAssertEqual(terminalStore.groups.lazy.flatMap(\.tabs).count, initialTabCount + 1)
+        XCTAssertEqual(try String(contentsOf: output, encoding: .utf8), "scheduled-job")
+        XCTAssertEqual(jobStore.jobs.first(where: { $0.id == job.id })?.status, .launched)
+        XCTAssertTrue(terminalStore.selected?.title.hasPrefix("Scheduled ·") == true)
+    }
+
+    @MainActor
+    func testPastedPythonScheduledJobUsesPythonInterpreter() async throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let pythonProbe = Process()
+        pythonProbe.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        pythonProbe.arguments = ["python3", "--version"]
+        pythonProbe.standardOutput = FileHandle.nullDevice
+        pythonProbe.standardError = FileHandle.nullDevice
+        try pythonProbe.run()
+        pythonProbe.waitUntilExit()
+        guard pythonProbe.terminationStatus == 0 else {
+            throw XCTSkip("python3 is not available")
+        }
+
+        let suiteName = "AirTests.ScheduledPython.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let jobStore = ScheduledJobStore(userDefaults: defaults, storageKey: "jobs")
+        let terminalStore = TerminalStore(scheduledJobs: jobStore)
+        terminalStore.graphicalMode = false
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "air-scheduled-python-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let output = directory.appending(path: "python-result.txt")
+        let script = "from pathlib import Path\nPath('python-result.txt').write_text('python-ready')"
+        let job = try jobStore.schedule(
+            at: .now.addingTimeInterval(-1),
+            script: .pasted(script, language: .python),
+            workingDirectory: directory.path
+        )
+
+        jobStore.launchDueJobs()
+        for _ in 0..<400 where !FileManager.default.fileExists(atPath: output.path) {
+            try await Task.sleep(for: .milliseconds(20))
+            for tab in terminalStore.groups.lazy.flatMap(\.tabs) { tab.poll() }
+        }
+
+        XCTAssertEqual(try String(contentsOf: output, encoding: .utf8), "python-ready")
+        XCTAssertEqual(jobStore.jobs.first(where: { $0.id == job.id })?.status, .launched)
+    }
+
+    @MainActor
+    func testTemporaryScheduledJobRunsInTmpAndRemovesItsDirectory() async throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let suiteName = "AirTests.ScheduledTemporary.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let jobStore = ScheduledJobStore(userDefaults: defaults, storageKey: "jobs")
+        let terminalStore = TerminalStore(scheduledJobs: jobStore)
+        terminalStore.graphicalMode = false
+        let marker = URL(fileURLWithPath: "/tmp").appending(
+            path: "air-temp-job-marker-\(UUID().uuidString.lowercased()).txt"
+        )
+        defer { try? FileManager.default.removeItem(at: marker) }
+        let script = "printf '%s' \"$PWD\" > \(TerminalSession.shellQuoted(marker.path)); sleep 0.4"
+        let job = try jobStore.schedule(
+            at: .now.addingTimeInterval(-1),
+            script: .pasted(script, language: .bash),
+            runLocation: .temporaryFolder,
+            workingDirectory: FileManager.default.currentDirectoryPath
+        )
+        let directoryPrefix = "air-job-\(job.id.uuidString.lowercased())-"
+        var observedTemporaryDirectory: URL?
+
+        jobStore.launchDueJobs()
+        for _ in 0..<400 where observedTemporaryDirectory == nil {
+            try await Task.sleep(for: .milliseconds(20))
+            for tab in terminalStore.groups.lazy.flatMap(\.tabs) { tab.poll() }
+            observedTemporaryDirectory = try FileManager.default.contentsOfDirectory(
+                at: URL(fileURLWithPath: "/tmp", isDirectory: true),
+                includingPropertiesForKeys: nil
+            ).first { $0.lastPathComponent.hasPrefix(directoryPrefix) }
+        }
+        let temporaryDirectory = try XCTUnwrap(observedTemporaryDirectory)
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        for _ in 0..<400 where !FileManager.default.fileExists(atPath: marker.path)
+            || FileManager.default.fileExists(atPath: temporaryDirectory.path) {
+            try await Task.sleep(for: .milliseconds(20))
+            for tab in terminalStore.groups.lazy.flatMap(\.tabs) { tab.poll() }
+        }
+
+        let executedDirectory = try String(contentsOf: marker, encoding: .utf8)
+        XCTAssertTrue(executedDirectory.contains("/air-job-\(job.id.uuidString.lowercased())-"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryDirectory.path))
+        XCTAssertEqual(jobStore.jobs.first(where: { $0.id == job.id })?.status, .launched)
     }
 
     @MainActor
@@ -690,12 +1441,19 @@ final class TerminalTabsTests: XCTestCase {
     func testListingBackendPropagatesToExistingAndNewTabs() {
         let store = TerminalStore()
         let originalBackend = store.listingBackend
-        defer { store.listingBackend = originalBackend }
+        let originalShowsHiddenFiles = store.graphicalShowsHiddenFiles
+        defer {
+            store.listingBackend = originalBackend
+            store.graphicalShowsHiddenFiles = originalShowsHiddenFiles
+        }
 
         store.listingBackend = .lstr
+        store.graphicalShowsHiddenFiles = true
         XCTAssertEqual(store.selected?.listingBackend, .lstr)
+        XCTAssertEqual(store.selected?.graphicalShowsHiddenFiles, true)
         store.newTab()
         XCTAssertEqual(store.selected?.listingBackend, .lstr)
+        XCTAssertEqual(store.selected?.graphicalShowsHiddenFiles, true)
     }
 
     @MainActor
@@ -785,6 +1543,17 @@ final class TerminalTabsTests: XCTestCase {
         guard let cells = frame.cells, row >= 0, row < Int(frame.rows) else { return "" }
         return (0..<Int(frame.cols)).map { column in
             let cell = cells[row * Int(frame.cols) + column]
+            return withUnsafeBytes(of: cell.text) { raw in
+                String(decoding: raw.prefix(Int(cell.text_len)), as: UTF8.self)
+            }
+        }.joined()
+    }
+
+    private func visibleFrameText(_ frame: GTFrame) -> String {
+        guard let cells = frame.cells else { return "" }
+        return (0..<(Int(frame.cols) * Int(frame.rows))).map { index in
+            let cell = cells[index]
+            guard cell.style & UInt16(GT_STYLE_INVISIBLE) == 0 else { return "" }
             return withUnsafeBytes(of: cell.text) { raw in
                 String(decoding: raw.prefix(Int(cell.text_len)), as: UTF8.self)
             }

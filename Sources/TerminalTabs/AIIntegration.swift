@@ -15,41 +15,28 @@ enum AIConnectionMode: String, CaseIterable, Sendable {
     case apiKey
 }
 
-struct TerminalBlockAttachment: Equatable, Sendable {
-    let command: String
-    let output: String
-    let workingDirectory: String
-
-    var promptContent: String {
-        """
-        <terminal_block>
-        <working_directory>\(workingDirectory)</working_directory>
-        <command>\(command)</command>
-        <output>
-        \(output)
-        </output>
-        </terminal_block>
-        """
-    }
-}
-
 struct AIChatMessage: Identifiable, Equatable, Sendable {
     enum Role: String, Sendable { case user, assistant }
     let id: UUID
     let role: Role
     let text: String
-    let attachment: TerminalBlockAttachment?
+    let attachments: [AIInputAttachment]
 
-    init(id: UUID = UUID(), role: Role, text: String, attachment: TerminalBlockAttachment? = nil) {
+    init(
+        id: UUID = UUID(),
+        role: Role,
+        text: String,
+        attachments: [AIInputAttachment] = []
+    ) {
         self.id = id
         self.role = role
         self.text = text
-        self.attachment = attachment
+        self.attachments = attachments
     }
 
     var requestContent: String {
-        guard let attachment else { return text }
-        return text + "\n\n" + attachment.promptContent
+        guard !attachments.isEmpty else { return text }
+        return ([text] + attachments.map(\.promptContent)).joined(separator: "\n\n")
     }
 }
 
