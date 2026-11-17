@@ -1,6 +1,21 @@
 import Foundation
 
 struct TerminalBlockRangeResolver {
+    static func normalizedSemantics(
+        rowSemantics: [UInt8],
+        inputRows: [Bool]
+    ) -> [UInt8] {
+        var result = rowSemantics
+        let rowCount = min(result.count, inputRows.count)
+        for row in 0..<rowCount where inputRows[row] {
+            let continuesPreviousInput = row > 0 && inputRows[row - 1]
+            if !continuesPreviousInput {
+                result[row] = 1
+            }
+        }
+        return result
+    }
+
     static func ranges(
         rowSemantics: [UInt8],
         visibleRows: [Bool],

@@ -1593,7 +1593,16 @@ final class TerminalNSView: NSView,
 
     private func blockRanges(frame: GTFrame, cells: UnsafePointer<GTCell>) -> [Range<Int>] {
         let rowCount = Int(frame.rows)
-        let semantics = (0..<rowCount).map { frame.row_semantics?[$0] ?? 0 }
+        let inputRows = (0..<rowCount).map { row in
+            (0..<Int(frame.cols)).contains { column in
+                cells[row * Int(frame.cols) + column].semantic_content
+                    == UInt8(GT_SEMANTIC_INPUT)
+            }
+        }
+        let semantics = TerminalBlockRangeResolver.normalizedSemantics(
+            rowSemantics: (0..<rowCount).map { frame.row_semantics?[$0] ?? 0 },
+            inputRows: inputRows
+        )
         var visibleRows = (0..<rowCount).map {
             rowHasVisibleContent($0, frame: frame, cells: cells)
         }

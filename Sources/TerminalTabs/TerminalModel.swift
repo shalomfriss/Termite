@@ -886,11 +886,21 @@ final class TerminalSession: ObservableObject, Identifiable {
         let prompt = try await waitForVisiblePrompt(handle: handle)
         try Task.checkCancellation()
 
-        // Clear the concealed cd and prompt, then restore ordinary rendering
-        // before drawing the graphical listing and its preserved prompt.
-        feedTerminalOutput("\r\u{1B}[2J\u{1B}[H", handle: handle)
+        // Clear the concealed cd and prompt, then restore ordinary rendering.
+        // Keep existing blocks and begin a fresh semantic block at this row for
+        // the newly opened directory.
+        feedTerminalOutput("\r\u{1B}[J", handle: handle)
         feedTerminalOutput(Self.graphicalNavigationRevealSequence, handle: handle)
         shouldRestoreVisibleOutput = false
+        gt_session_mark_input(handle)
+        // Ghostty only retains a semantic row when it owns at least one cell.
+        // Keep that sentinel invisible and outside the listing's content area.
+        feedTerminalOutput(
+            "\u{1B}[8m\u{1B}[\(terminalColumns)G \u{1B}[28m\r",
+            handle: handle
+        )
+        gt_session_mark_output(handle)
+        revision &+= 1
         let request = FileListingRequest(
             path: target,
             showsHidden: graphicalShowsHiddenFiles,

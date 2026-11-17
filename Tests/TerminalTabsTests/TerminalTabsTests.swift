@@ -563,6 +563,58 @@ final class AirTests: XCTestCase {
         XCTAssertEqual(GraphicalViewMode.allCases, [.icons, .list])
     }
 
+    @MainActor
+    func testGraphicalNavigationStartsANewSemanticBlock() async throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let root = FileManager.default.temporaryDirectory.appending(
+            path: "air-graphical-block-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        let child = root.appending(path: "Child", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+        try Data("content".utf8).write(to: child.appending(path: "item.txt"))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let session = TerminalSession(cols: 60, rows: 40, workingDirectory: root.path)
+        for _ in 0..<50 {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+        }
+        session.setGraphicalMode(true)
+        for _ in 0..<100 where session.graphicalItemCount == nil {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+        }
+        let initialFrame = try XCTUnwrap(gt_session_frame(try XCTUnwrap(session.handle))).pointee
+        let initialBlockCount = TerminalBlockRangeResolver.normalizedSemantics(
+            rowSemantics: (0..<Int(initialFrame.rows)).map {
+                initialFrame.row_semantics?[$0] ?? 0
+            },
+            inputRows: semanticInputRows(in: initialFrame)
+        ).count { $0 == 1 }
+
+        session.activateGraphicalItem(GraphicalFileItem(
+            path: child.path,
+            name: child.lastPathComponent,
+            kind: .directory
+        ))
+        for _ in 0..<300 where session.isGraphicalNavigationInProgress {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+        }
+
+        let navigatedFrame = try XCTUnwrap(gt_session_frame(try XCTUnwrap(session.handle))).pointee
+        let navigatedBlockCount = TerminalBlockRangeResolver.normalizedSemantics(
+            rowSemantics: (0..<Int(navigatedFrame.rows)).map {
+                navigatedFrame.row_semantics?[$0] ?? 0
+            },
+            inputRows: semanticInputRows(in: navigatedFrame)
+        ).count { $0 == 1 }
+        XCTAssertGreaterThan(navigatedBlockCount, initialBlockCount)
+        XCTAssertGreaterThan(Int(navigatedFrame.image_count), 0)
+        XCTAssertEqual(session.workingDirectory, child.path)
+    }
+
     func testLocalFilePassesICloudAvailabilityPreparation() async throws {
         let file = FileManager.default.temporaryDirectory
             .appending(path: "terminal-tabs-local-\(UUID().uuidString).txt")
@@ -1562,6 +1614,16 @@ final class AirTests: XCTestCase {
                 String(decoding: raw.prefix(Int(cell.text_len)), as: UTF8.self)
             }
         }.joined()
+    }
+
+    private func semanticInputRows(in frame: GTFrame) -> [Bool] {
+        guard let cells = frame.cells else { return [] }
+        return (0..<Int(frame.rows)).map { row in
+            (0..<Int(frame.cols)).contains { column in
+                cells[row * Int(frame.cols) + column].semantic_content
+                    == UInt8(GT_SEMANTIC_INPUT)
+            }
+        }
     }
 
 }
