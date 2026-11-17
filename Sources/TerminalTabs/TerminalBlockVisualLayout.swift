@@ -15,7 +15,8 @@ struct TerminalBlockVisualLayout {
         lastContentRow: Int,
         collapsedRangeStarts: Set<Int> = [],
         contentPadding: CGFloat = 20,
-        blockSpacing: CGFloat = 10
+        blockSpacing: CGFloat = 10,
+        topInset: CGFloat = 0
     ) -> TerminalBlockVisualLayout {
         guard rowCount > 0 else {
             return TerminalBlockVisualLayout(
@@ -29,7 +30,7 @@ struct TerminalBlockVisualLayout {
 
         var rowOffsets = Array(repeating: CGFloat.zero, count: rowCount)
         var hiddenRows: Set<Int> = []
-        var accumulatedOffset: CGFloat = 0
+        var accumulatedOffset: CGFloat = ranges.isEmpty ? 0 : topInset
         var rangeIndex = 0
         for row in 0..<rowCount {
             if rangeIndex < ranges.count, row == ranges[rangeIndex].lowerBound {

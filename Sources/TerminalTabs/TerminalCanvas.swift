@@ -29,6 +29,8 @@ final class TerminalNSView: NSView,
     NSDraggingSource {
     static let blockContentPadding: CGFloat = 20
     static let blockSpacing: CGFloat = 10
+    static let blockTopInset: CGFloat = 20
+    static let blockCornerRadius: CGFloat = 4
     private static let blockOuterMargin: CGFloat = 8
     private static let terminalContentInset: CGFloat = 10
 
@@ -513,14 +515,18 @@ final class TerminalNSView: NSView,
                 height: verticalFrame.height
             )
             let isSelected = frame.scroll_offset + UInt64(range.lowerBound) == selectedBlockHistoryRow
-            let fillPath = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+            let fillPath = NSBezierPath(
+                roundedRect: rect,
+                xRadius: Self.blockCornerRadius,
+                yRadius: Self.blockCornerRadius
+            )
             (isSelected ? selectedFill : blockFill).setFill()
             fillPath.fill()
 
             let borderPath = NSBezierPath(
                 roundedRect: rect.insetBy(dx: 0.5, dy: 0.5),
-                xRadius: 5.5,
-                yRadius: 5.5
+                xRadius: Self.blockCornerRadius - 0.5,
+                yRadius: Self.blockCornerRadius - 0.5
             )
             (isSelected ? selectedBorder : blockBorder).setStroke()
             borderPath.lineWidth = 1
@@ -683,7 +689,8 @@ final class TerminalNSView: NSView,
                 return session.isTerminalBlockCollapsed(blockID) ? range.lowerBound : nil
             }),
             contentPadding: Self.blockContentPadding,
-            blockSpacing: Self.blockSpacing
+            blockSpacing: Self.blockSpacing,
+            topInset: Self.blockTopInset
         )
     }
 

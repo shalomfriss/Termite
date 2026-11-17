@@ -917,14 +917,16 @@ final class AirTests: XCTestCase {
             rowCount: 8,
             cellHeight: 20,
             viewportHeight: 500,
-            lastContentRow: 5
+            lastContentRow: 5,
+            topInset: TerminalNSView.blockTopInset
         )
 
-        XCTAssertEqual(layout.blockFrames[0].minY, 0)
+        XCTAssertEqual(layout.blockFrames[0].minY, 20)
         XCTAssertEqual(layout.blockFrames[0].height, 100)
         XCTAssertEqual(layout.blockFrames[1].minY - layout.blockFrames[0].maxY, 10)
-        XCTAssertEqual(layout.rowOffsets[0], 20)
-        XCTAssertEqual(layout.rowOffsets[3], 70)
+        XCTAssertEqual(layout.rowOffsets[0], 40)
+        XCTAssertEqual(layout.rowOffsets[3], 90)
+        XCTAssertEqual(TerminalNSView.blockCornerRadius, 4)
         XCTAssertEqual(first.minX, 8)
         XCTAssertEqual(first.maxX, 392)
         XCTAssertEqual(
