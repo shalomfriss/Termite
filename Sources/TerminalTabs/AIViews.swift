@@ -169,7 +169,9 @@ struct AppSettingsView: View {
             HStack {
                 Text("Settings").font(.title2.weight(.semibold))
                 Spacer()
-                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+                    .help("Close Settings")
             }
 
             ScrollView {
@@ -275,6 +277,7 @@ struct AppSettingsView: View {
                 Spacer()
                 if connectionMode.wrappedValue == .apiKey, connected {
                     Button("Disconnect", role: .destructive) { settings.disconnect(provider) }
+                        .help("Remove the saved \(provider.title) API key")
                 }
             }
             LabeledContent("Connection") {
@@ -294,7 +297,11 @@ struct AppSettingsView: View {
                         .foregroundStyle(.secondary)
                     Spacer()
                     Button("Refresh") { Task { await settings.refreshLoginStatus() } }
+                        .help("Refresh \(provider.title) sign-in status")
                     Button(loggedIn ? "Sign In Again" : "Sign In") { settings.startLogin(provider) }
+                        .help(loggedIn
+                              ? "Sign in to \(provider.title) again"
+                              : "Sign in to \(provider.title)")
                 }
             } else {
                 SecureField(connected ? "Enter a new key to replace the saved key" : placeholder, text: key)
@@ -312,6 +319,9 @@ struct AppSettingsView: View {
                         }
                     }
                     .disabled(key.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .help(connected
+                          ? "Replace the saved \(provider.title) API key"
+                          : "Connect \(provider.title) with this API key")
                 }
             }
         }

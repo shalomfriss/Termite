@@ -21,9 +21,11 @@ struct ScheduledJobsView: View {
                 Spacer()
                 if jobStore.jobs.contains(where: { $0.status == .launched || $0.status == .failed }) {
                     Button("Clear Finished", action: jobStore.deleteFinishedJobs)
+                        .help("Remove finished and failed jobs")
                 }
                 Button("New Job", systemImage: "plus", action: createJob)
                     .buttonStyle(.borderedProminent)
+                    .help("Create a scheduled job or saved workflow")
             }
             .padding()
 
@@ -59,6 +61,7 @@ struct ScheduledJobsView: View {
                 Spacer()
                 Button("Close", action: dismiss.callAsFunction)
                     .keyboardShortcut(.cancelAction)
+                    .help("Close Jobs & Workflows")
             }
             .padding()
         }

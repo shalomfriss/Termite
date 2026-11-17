@@ -561,6 +561,7 @@ struct TerminalTabButton: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
+            .help("Close \(tab.title)")
         }
         .foregroundStyle(selected ? TerminalTheme.text : TerminalTheme.mutedText)
         .padding(.leading, 12)

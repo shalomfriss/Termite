@@ -29,9 +29,11 @@ struct NewFolderPopover: View {
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel, action: dismiss.callAsFunction)
+                    .help("Cancel folder creation")
                 Button("Create", systemImage: "folder.badge.plus", action: create)
                     .keyboardShortcut(.defaultAction)
                     .disabled(trimmedName.isEmpty)
+                    .help("Create this folder")
             }
         }
         .padding(16)

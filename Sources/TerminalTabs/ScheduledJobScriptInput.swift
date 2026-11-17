@@ -41,6 +41,7 @@ struct ScheduledJobScriptInput: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     Button("Choose Script…", systemImage: "doc", action: chooseScript)
+                        .help("Choose a script file to run")
                 }
             }
         }

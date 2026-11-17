@@ -23,6 +23,7 @@ struct ScheduledJobDirectoryPicker: View {
                             .truncationMode(.middle)
                             .frame(maxWidth: .infinity, alignment: .leading)
                         Button("Choose Folder…", systemImage: "folder", action: chooseDirectory)
+                            .help("Choose the working directory")
                     }
                 }
             } else {

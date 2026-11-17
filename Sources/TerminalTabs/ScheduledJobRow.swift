@@ -43,9 +43,12 @@ struct ScheduledJobRow: View {
                     systemImage: "play.fill",
                     action: runNow
                 )
+                .help("Run this job in a new shell")
                 Button("Edit", systemImage: "pencil", action: edit)
+                    .help("Edit this job or workflow")
                 Spacer()
                 Button("Delete", systemImage: "trash", role: .destructive, action: delete)
+                    .help("Delete this job or workflow")
             }
             .controlSize(.small)
             .disabled(job.status == .launching)

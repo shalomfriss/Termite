@@ -109,9 +109,11 @@ struct ScheduledJobEditor: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Cancel", role: .cancel, action: dismiss.callAsFunction)
+                    .help("Discard changes and close")
                 Button(isEditing ? "Save" : primaryActionTitle, action: saveJob)
                     .buttonStyle(.borderedProminent)
                     .disabled(!canSave)
+                    .help(isEditing ? "Save changes" : primaryActionHelp)
             }
             .padding()
         }
@@ -143,6 +145,10 @@ struct ScheduledJobEditor: View {
 
     private var primaryActionTitle: String {
         timing == .scheduled ? "Schedule" : "Save Workflow"
+    }
+
+    private var primaryActionHelp: String {
+        timing == .scheduled ? "Schedule this job" : "Save this workflow without a time"
     }
 
     private var footerMessage: String {

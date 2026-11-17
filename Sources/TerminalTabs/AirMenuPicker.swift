@@ -35,6 +35,7 @@ struct AirMenuPicker<Option: Hashable>: View {
                         Text(optionTitle(option))
                     }
                 }
+                .help("Select \(optionTitle(option))")
             }
         } label: {
             HStack(spacing: 8) {
@@ -72,6 +73,7 @@ struct AirMenuPicker<Option: Hashable>: View {
         .fixedSize()
         .onHover { isHovering = $0 }
         .animation(.easeOut(duration: 0.14), value: isHovering)
+        .help("\(title): \(optionTitle(selection))")
         .accessibilityLabel(title)
         .accessibilityValue(optionTitle(selection))
     }

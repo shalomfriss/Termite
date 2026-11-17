@@ -81,6 +81,7 @@ final class TerminalNSView: NSView,
     private var textSelection: TerminalTextSelection?
     private var imageHitTargets: [ImageHitTarget] = []
     private var blockActionHitTargets: [BlockActionHitTarget] = []
+    private var blockActionToolTipTags: [NSView.ToolTipTag] = []
     private var graphicalTrackingArea: NSTrackingArea?
     private var imageCache: [UInt32: CGImage] = [:]
     private var folderBloomCache: [UInt32: CGImage] = [:]
@@ -793,6 +794,7 @@ final class TerminalNSView: NSView,
         }
 
         blockActionHitTargets = targets
+        if previousTargets != targets { refreshBlockActionToolTips() }
         if let hoveredBlockAction,
            !targets.contains(where: {
                $0.action == hoveredBlockAction.action && $0.blockID == hoveredBlockAction.blockID
@@ -836,7 +838,10 @@ final class TerminalNSView: NSView,
             case .attach:
                 symbolName = isAttached ? "checkmark.circle.fill" : "paperclip"
             }
-            guard let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) else {
+            guard let image = NSImage(
+                systemSymbolName: symbolName,
+                accessibilityDescription: blockActionHelp(for: target)
+            ) else {
                 continue
             }
             let tint = isAttached
@@ -862,6 +867,28 @@ final class TerminalNSView: NSView,
         }
     }
 
+    private func refreshBlockActionToolTips() {
+        for tag in blockActionToolTipTags { removeToolTip(tag) }
+        blockActionToolTipTags = blockActionHitTargets.map { target in
+            addToolTip(
+                target.rect,
+                owner: blockActionHelp(for: target) as NSString,
+                userData: nil
+            )
+        }
+    }
+
+    private func blockActionHelp(for target: BlockActionHitTarget) -> String {
+        switch target.action {
+        case .toggleFold:
+            session.isTerminalBlockCollapsed(target.blockID) ? "Expand block" : "Collapse block"
+        case .copy:
+            "Copy block output"
+        case .attach:
+            target.isEnabled ? "Attach block to AI Chat" : "Already attached to AI Chat"
+        }
+    }
+
     private func performBlockAction(_ target: BlockActionHitTarget) {
         selectedBlockHistoryRow = target.blockID.historyRow
         switch target.action {
@@ -879,6 +906,7 @@ final class TerminalNSView: NSView,
                 sourceBlockID: block.id
             )
         }
+        refreshBlockActionToolTips()
         needsDisplay = true
     }
 

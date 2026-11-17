@@ -19,6 +19,7 @@ struct AIAttachmentChip: View {
                 Button("Remove attachment", systemImage: "xmark.circle.fill", action: onRemove)
                     .labelStyle(.iconOnly)
                     .buttonStyle(.plain)
+                    .help("Remove \(attachment.title) from AI input")
             }
         }
         .font(.system(size: 11, design: .monospaced))
