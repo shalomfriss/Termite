@@ -2172,6 +2172,13 @@ enum TabOrientation: String, CaseIterable {
     case horizontal
     case vertical
 
+    var title: String {
+        switch self {
+        case .horizontal: "Horizontal"
+        case .vertical: "Vertical"
+        }
+    }
+
     var panelTitle: String {
         switch self {
         case .horizontal: "Top Panel"

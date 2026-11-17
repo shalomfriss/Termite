@@ -10,13 +10,13 @@ struct AIConversationPanel: View {
             HStack(spacing: 8) {
                 Image(systemName: "sparkles")
                 Text("Terminal AI").font(.system(size: 12, weight: .semibold))
-                Picker("Provider", selection: $settings.provider) {
-                    ForEach(AIProvider.allCases) { provider in
-                        Text(provider.title).tag(provider)
-                    }
-                }
-                .labelsHidden()
-                .frame(width: 110)
+                AirMenuPicker(
+                    "Provider",
+                    selection: $settings.provider,
+                    options: AIProvider.allCases,
+                    minimumWidth: 110,
+                    optionTitle: { $0.title }
+                )
                 Text(settings.connectionMode(for: settings.provider) == .signIn
                      ? "Account login"
                      : settings.selectedModel)
@@ -176,11 +176,15 @@ struct AppSettingsView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     GroupBox("Tabs") {
                         VStack(alignment: .leading, spacing: 10) {
-                            Picker("Orientation", selection: $store.tabOrientation) {
-                                Text("Horizontal").tag(TabOrientation.horizontal)
-                                Text("Vertical").tag(TabOrientation.vertical)
+                            LabeledContent("Orientation") {
+                                AirMenuPicker(
+                                    "Orientation",
+                                    selection: $store.tabOrientation,
+                                    options: TabOrientation.allCases,
+                                    minimumWidth: 150,
+                                    optionTitle: { $0.title }
+                                )
                             }
-                            .pickerStyle(.segmented)
                             Toggle(
                                 "Show \(store.tabOrientation.panelName)",
                                 isOn: $store.isTabBarVisible
@@ -192,12 +196,15 @@ struct AppSettingsView: View {
 
                     GroupBox("Directory listings") {
                         VStack(alignment: .leading, spacing: 8) {
-                            Picker("Backend", selection: $store.listingBackend) {
-                                ForEach(ListingBackend.allCases) { backend in
-                                    Text(backend.title).tag(backend)
-                                }
+                            LabeledContent("Backend") {
+                                AirMenuPicker(
+                                    "Directory listing backend",
+                                    selection: $store.listingBackend,
+                                    options: ListingBackend.allCases,
+                                    minimumWidth: 150,
+                                    optionTitle: { $0.title }
+                                )
                             }
-                            .pickerStyle(.segmented)
                             Text(store.listingBackend.detail)
                                 .font(.system(size: 10))
                                 .foregroundStyle(.secondary)
@@ -270,11 +277,15 @@ struct AppSettingsView: View {
                     Button("Disconnect", role: .destructive) { settings.disconnect(provider) }
                 }
             }
-            Picker("Connection", selection: connectionMode) {
-                Text("Sign in").tag(AIConnectionMode.signIn)
-                Text("API key").tag(AIConnectionMode.apiKey)
+            LabeledContent("Connection") {
+                AirMenuPicker(
+                    "Connection",
+                    selection: connectionMode,
+                    options: AIConnectionMode.allCases,
+                    minimumWidth: 150,
+                    optionTitle: { $0.title }
+                )
             }
-            .pickerStyle(.segmented)
 
             if connectionMode.wrappedValue == .signIn {
                 HStack {

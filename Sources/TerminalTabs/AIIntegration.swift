@@ -13,6 +13,13 @@ enum AIProvider: String, CaseIterable, Identifiable, Sendable {
 enum AIConnectionMode: String, CaseIterable, Sendable {
     case signIn
     case apiKey
+
+    var title: String {
+        switch self {
+        case .signIn: "Sign in"
+        case .apiKey: "API key"
+        }
+    }
 }
 
 struct AIChatMessage: Identifiable, Equatable, Sendable {
