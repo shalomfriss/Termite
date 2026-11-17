@@ -752,12 +752,17 @@ final class TerminalNSView: NSView,
             )
             let attachRect = NSRect(
                 x: bounds.maxX - Self.blockOuterMargin - trailingInset - buttonSize,
-                y: blockFrame.minY,
+                y: blockFrame.minY + 5,
                 width: buttonSize,
                 height: buttonSize
             )
             let copyRect = attachRect.offsetBy(dx: -(buttonSize + buttonGap), dy: 0)
-            let foldRect = copyRect.offsetBy(dx: -(buttonSize + buttonGap), dy: 0)
+            let foldRect = NSRect(
+                x: copyRect.minX - buttonSize - buttonGap,
+                y: blockFrame.minY,
+                width: buttonSize,
+                height: buttonSize
+            )
             if range.count > 1 {
                 targets.append(BlockActionHitTarget(
                     action: .toggleFold,
