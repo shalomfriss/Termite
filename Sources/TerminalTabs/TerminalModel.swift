@@ -112,6 +112,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published var graphicalOperationIssue: GraphicalOperationIssue?
     @Published var tabAccentColor: NSColor?
     @Published private(set) var gitBranch: String? = nil
+    @Published private(set) var gitBranches: [String] = []
     var graphicalViewMode: GraphicalViewMode = .icons
     var graphicalShowsHiddenFiles = false
     var graphicalSortOption: GraphicalSortOption = .name
@@ -136,6 +137,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var graphicalNavigationTask: Task<Void, Never>?
     private var graphicalStartupTask: Task<Void, Never>?
     private var graphicalNavigationGeneration: UInt = 0
+    private var gitBranchDirectory: String?
 
     init(
         cols: UInt16 = 100,
@@ -226,12 +228,88 @@ final class TerminalSession: ObservableObject, Identifiable {
         refreshGitBranch()
     }
 
-    private func refreshGitBranch() {
+    private func refreshGitBranch(forceBranches: Bool = false) {
         let branch = Self.gitBranchName(at: workingDirectory)
+        let shouldRefreshBranches = forceBranches
+            || gitBranchDirectory != workingDirectory
+            || branch != gitBranch
         if branch != gitBranch { gitBranch = branch }
+        guard shouldRefreshBranches else { return }
+        let branches = Self.gitLocalBranchNames(at: workingDirectory)
+        if branches != gitBranches { gitBranches = branches }
+        gitBranchDirectory = workingDirectory
+    }
+
+    func refreshGitBranches() {
+        refreshGitBranch(forceBranches: true)
+    }
+
+    func switchGitBranch(to branch: String) {
+        guard branch != gitBranch, gitBranches.contains(branch) else { return }
+        sendUserInput(Data(Self.gitSwitchCommand(for: branch).utf8))
+        sendUserInput(Data([0x0D]))
+    }
+
+    nonisolated static func gitSwitchCommand(for branch: String) -> String {
+        "git switch -- \(shellQuoted(branch))"
     }
 
     nonisolated static func gitBranchName(at path: String) -> String? {
+        guard let metadata = gitMetadata(at: path),
+              let head = try? String(
+                  contentsOf: metadata.gitDirectory.appending(path: "HEAD"),
+                  encoding: .utf8
+              ).trimmingCharacters(in: .whitespacesAndNewlines),
+              !head.isEmpty else { return nil }
+        if head.hasPrefix("ref: refs/heads/") {
+            return String(head.dropFirst("ref: refs/heads/".count))
+        }
+        return String(head.prefix(7))
+    }
+
+    nonisolated static func gitLocalBranchNames(at path: String) -> [String] {
+        guard let metadata = gitMetadata(at: path) else { return [] }
+        let fileManager = FileManager.default
+        let headsDirectory = metadata.commonDirectory.appending(path: "refs/heads")
+        var branches = Set<String>()
+
+        if let enumerator = fileManager.enumerator(atPath: headsDirectory.path) {
+            for case let relativePath as String in enumerator {
+                let url = headsDirectory.appending(path: relativePath)
+                guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+                    continue
+                }
+                branches.insert(relativePath)
+            }
+        }
+
+        if let packedRefs = try? String(
+            contentsOf: metadata.commonDirectory.appending(path: "packed-refs"),
+            encoding: .utf8
+        ) {
+            for line in packedRefs.split(whereSeparator: \Character.isNewline) {
+                let fields = line.split(whereSeparator: \Character.isWhitespace)
+                guard fields.count >= 2 else { continue }
+                let reference = String(fields[1])
+                guard reference.hasPrefix("refs/heads/") else { continue }
+                branches.insert(String(reference.dropFirst("refs/heads/".count)))
+            }
+        }
+
+        if let current = gitBranchName(at: path),
+           let head = try? String(
+               contentsOf: metadata.gitDirectory.appending(path: "HEAD"),
+               encoding: .utf8
+           ), head.hasPrefix("ref: refs/heads/") {
+            branches.insert(current)
+        }
+
+        return branches.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
+    nonisolated private static func gitMetadata(
+        at path: String
+    ) -> (gitDirectory: URL, commonDirectory: URL)? {
         let fileManager = FileManager.default
         var directory = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
 
@@ -255,15 +333,20 @@ final class TerminalSession: ObservableObject, Identifiable {
                     return nil
                 }
 
-                guard let head = try? String(
-                    contentsOf: gitDirectory.appending(path: "HEAD"),
+                let commonDirectory: URL
+                if let commonPath = try? String(
+                    contentsOf: gitDirectory.appending(path: "commondir"),
                     encoding: .utf8
                 ).trimmingCharacters(in: .whitespacesAndNewlines),
-                !head.isEmpty else { return nil }
-                if head.hasPrefix("ref: refs/heads/") {
-                    return String(head.dropFirst("ref: refs/heads/".count))
+                !commonPath.isEmpty {
+                    commonDirectory = URL(
+                        fileURLWithPath: commonPath,
+                        relativeTo: gitDirectory
+                    ).standardizedFileURL
+                } else {
+                    commonDirectory = gitDirectory
                 }
-                return String(head.prefix(7))
+                return (gitDirectory, commonDirectory)
             }
 
             let parent = directory.deletingLastPathComponent().standardizedFileURL

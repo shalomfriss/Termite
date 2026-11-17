@@ -49,17 +49,8 @@ struct TerminalSurface: View {
 
             Spacer(minLength: 12)
 
-            if let branch = session.gitBranch {
-                Label(branch, systemImage: "arrow.triangle.branch")
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help("Git branch: \(branch)")
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(TerminalTheme.cyan.opacity(0.08), in: .capsule)
-                    .overlay {
-                        Capsule().stroke(TerminalTheme.cyan.opacity(0.15), lineWidth: 1)
-                    }
+            if session.gitBranch != nil {
+                GitBranchMenu(session: session)
             }
         }
         .font(.caption2.monospaced())

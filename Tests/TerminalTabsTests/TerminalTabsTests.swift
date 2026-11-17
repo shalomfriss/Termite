@@ -1160,8 +1160,27 @@ final class AirTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let head = gitDirectory.appending(path: "HEAD")
         try Data("ref: refs/heads/feature/status-bar\n".utf8).write(to: head)
+        let featureRef = gitDirectory.appending(path: "refs/heads/feature/status-bar")
+        let mainRef = gitDirectory.appending(path: "refs/heads/main")
+        try FileManager.default.createDirectory(
+            at: featureRef.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("1234567890abcdef\n".utf8).write(to: featureRef)
+        try Data("1234567890abcdef\n".utf8).write(to: mainRef)
+        try Data(
+            "# pack-refs with: peeled fully-peeled sorted\n1234567890abcdef refs/heads/release/1.0\n".utf8
+        ).write(to: gitDirectory.appending(path: "packed-refs"))
 
         XCTAssertEqual(TerminalSession.gitBranchName(at: nested.path), "feature/status-bar")
+        XCTAssertEqual(
+            TerminalSession.gitLocalBranchNames(at: nested.path),
+            ["feature/status-bar", "main", "release/1.0"]
+        )
+        XCTAssertEqual(
+            TerminalSession.gitSwitchCommand(for: "feature/one's-work"),
+            "git switch -- 'feature/one'\\''s-work'"
+        )
 
         try Data("1234567890abcdef\n".utf8).write(to: head)
         XCTAssertEqual(TerminalSession.gitBranchName(at: nested.path), "1234567")
