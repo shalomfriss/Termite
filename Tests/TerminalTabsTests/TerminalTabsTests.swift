@@ -326,6 +326,32 @@ final class AirTests: XCTestCase {
         )
     }
 
+    func testTerminalLinkDetectionFindsBrowserURLsAndTrimsSentencePunctuation() {
+        let text = "Open https://example.com/docs?q=air#links). now"
+        let matches = TerminalLinkDetector.links(in: text.map(String.init))
+
+        XCTAssertEqual(matches.count, 1)
+        XCTAssertEqual(matches.first?.url.absoluteString, "https://example.com/docs?q=air#links")
+        XCTAssertEqual(matches.first?.columns, 5..<41)
+    }
+
+    func testTerminalLinkDetectionMapsWideCellsAndSupportsWWWAddresses() {
+        let cells = ["🚀", "", " "] + "www.example.com/path".map(String.init)
+        let matches = TerminalLinkDetector.links(in: cells)
+
+        XCTAssertEqual(matches.count, 1)
+        XCTAssertEqual(matches.first?.url.absoluteString, "https://www.example.com/path")
+        XCTAssertEqual(matches.first?.columns, 3..<23)
+    }
+
+    func testTerminalLinkDetectionKeepsBalancedURLParentheses() {
+        let value = "https://en.wikipedia.org/wiki/Function_(mathematics)"
+        let matches = TerminalLinkDetector.links(in: value.map(String.init))
+
+        XCTAssertEqual(matches.first?.url.absoluteString, value)
+        XCTAssertEqual(matches.first?.columns, 0..<value.count)
+    }
+
     func testGraphicalPasteDestinationDoesNotOverwriteExistingFile() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("terminal-tabs-paste-\(UUID().uuidString)", isDirectory: true)

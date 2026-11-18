@@ -60,8 +60,16 @@ final class TerminalNSView: NSView,
         let rect: NSRect
     }
 
+    private struct LinkHitTarget: Equatable {
+        let url: URL
+        let row: Int
+        let columns: Range<Int>
+        let rect: NSRect
+    }
+
     var session: TerminalSession
     var openDirectoryInNewTab: (URL) -> Void
+    var openURL: (URL) -> Void
     private let font = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
     private let boldFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .semibold)
     private let italicFont: NSFont
@@ -77,11 +85,15 @@ final class TerminalNSView: NSView,
     private var dropTargetGraphicalPlacementID: UInt32?
     private var graphicalDragCandidate: (placementID: UInt32, origin: NSPoint)?
     private var hoveredBlockAction: BlockActionHitTarget?
+    private var hoveredLink: LinkHitTarget?
+    private var linkActivationCandidate: LinkHitTarget?
     private var textSelectionAnchor: TerminalTextPosition?
     private var textSelection: TerminalTextSelection?
     private var imageHitTargets: [ImageHitTarget] = []
     private var blockActionHitTargets: [BlockActionHitTarget] = []
+    private var linkHitTargets: [LinkHitTarget] = []
     private var blockActionToolTipTags: [NSView.ToolTipTag] = []
+    private var linkToolTipTags: [NSView.ToolTipTag] = []
     private var graphicalTrackingArea: NSTrackingArea?
     private var imageCache: [UInt32: CGImage] = [:]
     private var folderBloomCache: [UInt32: CGImage] = [:]
@@ -103,10 +115,14 @@ final class TerminalNSView: NSView,
 
     init(
         session: TerminalSession,
-        openDirectoryInNewTab: @escaping (URL) -> Void = { _ in }
+        openDirectoryInNewTab: @escaping (URL) -> Void = { _ in },
+        openURL: @escaping (URL) -> Void = { url in
+            _ = NSWorkspace.shared.open(url)
+        }
     ) {
         self.session = session
         self.openDirectoryInNewTab = openDirectoryInNewTab
+        self.openURL = openURL
         let descriptor = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular).fontDescriptor
             .withSymbolicTraits(.italic)
         italicFont = NSFont(descriptor: descriptor, size: 14) ?? font
@@ -171,6 +187,7 @@ final class TerminalNSView: NSView,
         let point = convert(event.locationInWindow, from: nil)
         if let target = blockActionHitTargets.last(where: { $0.rect.contains(point) }) {
             graphicalDragCandidate = nil
+            linkActivationCandidate = nil
             textSelectionAnchor = nil
             textSelection = nil
             selectedGraphicalPlacementID = nil
@@ -179,6 +196,7 @@ final class TerminalNSView: NSView,
         }
         if let target = imageHitTargets.last(where: { $0.rect.contains(point) }),
            let item = session.graphicalItem(for: target.placementID) {
+            linkActivationCandidate = nil
             textSelectionAnchor = nil
             textSelection = nil
             selectedBlockHistoryRow = nil
@@ -190,14 +208,24 @@ final class TerminalNSView: NSView,
             }
             return
         }
+        if let target = linkHitTargets.last(where: { $0.rect.contains(point) }) {
+            graphicalDragCandidate = nil
+            linkActivationCandidate = target
+            textSelection = nil
+            textSelectionAnchor = terminalPosition(at: point)
+            selectedGraphicalPlacementID = nil
+            return
+        }
         textSelection = nil
         graphicalDragCandidate = nil
+        linkActivationCandidate = nil
         textSelectionAnchor = terminalPosition(at: point)
         selectedGraphicalPlacementID = nil
         selectBlock(atVisualY: point.y)
     }
 
     override func mouseDragged(with event: NSEvent) {
+        linkActivationCandidate = nil
         if let candidate = graphicalDragCandidate {
             let point = convert(event.locationInWindow, from: nil)
             let distance = hypot(point.x - candidate.origin.x, point.y - candidate.origin.y)
@@ -232,6 +260,10 @@ final class TerminalNSView: NSView,
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let linkActivationCandidate {
+            openURL(linkActivationCandidate.url)
+            self.linkActivationCandidate = nil
+        }
         graphicalDragCandidate = nil
         textSelectionAnchor = nil
     }
@@ -275,6 +307,9 @@ final class TerminalNSView: NSView,
         for target in blockActionHitTargets where target.isEnabled {
             addCursorRect(target.rect, cursor: .pointingHand)
         }
+        for target in linkHitTargets {
+            addCursorRect(target.rect, cursor: .pointingHand)
+        }
     }
 
     override func updateTrackingAreas() {
@@ -294,17 +329,23 @@ final class TerminalNSView: NSView,
         let point = convert(event.locationInWindow, from: nil)
         let hoveredGraphical = imageHitTargets.last(where: { $0.rect.contains(point) })?.placementID
         let hoveredAction = blockActionHitTargets.last(where: { $0.rect.contains(point) })
+        let hoveredLink = linkHitTargets.last(where: { $0.rect.contains(point) })
         guard hoveredGraphical != hoveredGraphicalPlacementID
-                || hoveredAction != hoveredBlockAction else { return }
+                || hoveredAction != hoveredBlockAction
+                || hoveredLink != self.hoveredLink else { return }
         hoveredGraphicalPlacementID = hoveredGraphical
         hoveredBlockAction = hoveredAction
+        self.hoveredLink = hoveredLink
         needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
-        guard hoveredGraphicalPlacementID != nil || hoveredBlockAction != nil else { return }
+        guard hoveredGraphicalPlacementID != nil
+                || hoveredBlockAction != nil
+                || hoveredLink != nil else { return }
         hoveredGraphicalPlacementID = nil
         hoveredBlockAction = nil
+        hoveredLink = nil
         needsDisplay = true
     }
 
@@ -545,6 +586,13 @@ final class TerminalNSView: NSView,
             rowLeadingOffsets: rowLeadingOffsets,
             hiddenRows: visualLayout.hiddenRows
         )
+        updateLinkHitTargets(
+            frame: frame,
+            cells: cells,
+            rowOffsets: rowOffsets,
+            rowLeadingOffsets: rowLeadingOffsets,
+            hiddenRows: visualLayout.hiddenRows
+        )
         drawGraphicalItemSurfaces()
 
         for y in 0..<Int(frame.rows) where !visualLayout.hiddenRows.contains(y) {
@@ -580,9 +628,21 @@ final class TerminalNSView: NSView,
                 if cell.style & UInt16(GT_STYLE_BOLD) != 0 { chosenFont = boldFont }
                 else if cell.style & UInt16(GT_STYLE_ITALIC) != 0 { chosenFont = italicFont }
                 else { chosenFont = font }
+                let link = linkHitTargets.first {
+                    $0.row == y && $0.columns.contains(x)
+                }
+                if let link {
+                    let isHovered = link == hoveredLink
+                    foreground = NSColor(
+                        srgbRed: isHovered ? 0.48 : 0.38,
+                        green: isHovered ? 0.96 : 0.84,
+                        blue: isHovered ? 0.96 : 0.86,
+                        alpha: 1
+                    )
+                }
                 (text as NSString).draw(at: NSPoint(x: rect.minX, y: rect.minY + 1),
                                         withAttributes: [.font: chosenFont, .foregroundColor: foreground])
-                if cell.style & UInt16(GT_STYLE_UNDERLINE_MASK) != 0 {
+                if link != nil || cell.style & UInt16(GT_STYLE_UNDERLINE_MASK) != 0 {
                     foreground.setFill()
                     NSRect(x: rect.minX, y: rect.maxY - 2, width: rect.width, height: 1).fill()
                 }
@@ -910,6 +970,61 @@ final class TerminalNSView: NSView,
         needsDisplay = true
     }
 
+    private func updateLinkHitTargets(
+        frame: GTFrame,
+        cells: UnsafePointer<GTCell>,
+        rowOffsets: [CGFloat],
+        rowLeadingOffsets: [CGFloat],
+        hiddenRows: Set<Int>
+    ) {
+        let previousTargets = linkHitTargets
+        let columnCount = Int(frame.cols)
+        var targets: [LinkHitTarget] = []
+        for row in 0..<Int(frame.rows) where !hiddenRows.contains(row) {
+            let rowCells = (0..<columnCount).map { column in
+                cellText(cells[row * columnCount + column])
+            }
+            for match in TerminalLinkDetector.links(in: rowCells) {
+                guard !match.columns.isEmpty,
+                      rowOffsets.indices.contains(row),
+                      rowLeadingOffsets.indices.contains(row) else { continue }
+                targets.append(LinkHitTarget(
+                    url: match.url,
+                    row: row,
+                    columns: match.columns,
+                    rect: NSRect(
+                        x: CGFloat(match.columns.lowerBound) * cellWidth
+                            + rowLeadingOffsets[row],
+                        y: CGFloat(row) * cellHeight + rowOffsets[row],
+                        width: CGFloat(match.columns.count) * cellWidth,
+                        height: cellHeight
+                    )
+                ))
+            }
+        }
+
+        linkHitTargets = targets
+        if previousTargets != targets { refreshLinkToolTips() }
+        if let hoveredLink, !targets.contains(hoveredLink) {
+            self.hoveredLink = nil
+        }
+        if let linkActivationCandidate, !targets.contains(linkActivationCandidate) {
+            self.linkActivationCandidate = nil
+        }
+        invalidateCursorRectsIfChanged(from: previousTargets)
+    }
+
+    private func refreshLinkToolTips() {
+        for tag in linkToolTipTags { removeToolTip(tag) }
+        linkToolTipTags = linkHitTargets.map { target in
+            addToolTip(
+                target.rect,
+                owner: "Open \(target.url.absoluteString)" as NSString,
+                userData: nil
+            )
+        }
+    }
+
     private func updateGraphicalHitTargets(
         _ frame: GTFrame,
         rowOffsets: [CGFloat],
@@ -1179,6 +1294,15 @@ final class TerminalNSView: NSView,
 
     private func invalidateCursorRectsIfChanged(from previousTargets: [BlockActionHitTarget]) {
         guard previousTargets != blockActionHitTargets else { return }
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, let window = self.window else { return }
+            window.invalidateCursorRects(for: self)
+        }
+    }
+
+    private func invalidateCursorRectsIfChanged(from previousTargets: [LinkHitTarget]) {
+        guard previousTargets != linkHitTargets else { return }
         Task { @MainActor [weak self] in
             await Task.yield()
             guard let self, let window = self.window else { return }
