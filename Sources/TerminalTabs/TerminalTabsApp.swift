@@ -35,24 +35,31 @@ struct AirApp: App {
             CommandGroup(replacing: .appSettings) {
                 Button("Settings…") { store.isSettingsVisible = true }
                     .keyboardShortcut(",", modifiers: .command)
+                    .help("Open Air settings")
             }
             CommandGroup(replacing: .newItem) {
                 Button("New Tab") { store.newTab() }
                     .keyboardShortcut("t", modifiers: .command)
+                    .help("Create a new terminal tab")
                 Button("New Tab Group") { store.newGroup() }
                     .keyboardShortcut("t", modifiers: [.command, .shift])
+                    .help("Create a new tab group")
             }
             CommandGroup(after: .newItem) {
                 Button("Close Tab") { store.close() }
                     .keyboardShortcut("w", modifiers: .command)
+                    .help("Close the current tab")
                 Button("Next Tab") { store.selectNext(delta: 1) }
                     .keyboardShortcut("]", modifiers: [.command, .shift])
+                    .help("Select the next tab")
                 Button("Previous Tab") { store.selectNext(delta: -1) }
                     .keyboardShortcut("[", modifiers: [.command, .shift])
+                    .help("Select the previous tab")
                 Divider()
                 ForEach(0..<9, id: \.self) { index in
                     Button("Select Tab \(index + 1)") { store.select(index) }
                         .keyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: .command)
+                        .help("Select tab \(index + 1)")
                 }
             }
             CommandMenu("Tab Layout") {
@@ -60,24 +67,30 @@ struct AirApp: App {
                     store.isTabBarVisible.toggle()
                 }
                 .keyboardShortcut("b", modifiers: [.command, .shift])
+                .help(store.tabPanelVisibilityActionTitle)
                 Divider()
                 Button("Horizontal Tabs") { store.tabOrientation = .horizontal }
+                    .help("Place tab groups across the top")
                 Button("Vertical Tabs") { store.tabOrientation = .vertical }
+                    .help("Place tab groups in the side panel")
             }
             CommandMenu("AI") {
                 Button("Open AI Chat") {
                     store.selected?.isAIChatVisible = true
                 }
                 .keyboardShortcut("i", modifiers: [.command, .shift])
+                .help("Open Terminal AI")
                 Button("Clear AI Conversation") {
                     store.selected?.clearAIConversation()
                 }
+                .help("Clear messages from Terminal AI")
             }
             CommandMenu("Jobs") {
                 Button("Scheduled Jobs…", systemImage: "clock") {
                     store.isScheduledJobsVisible = true
                 }
                 .keyboardShortcut("j", modifiers: [.command, .shift])
+                .help("Open Jobs & Workflows")
             }
         }
     }
@@ -127,9 +140,11 @@ struct TerminalWindow: View {
         .alert("Rename Tab Group", isPresented: $isRenamingGroup) {
             TextField("Group name", text: $groupNameDraft)
             Button("Cancel", role: .cancel) {}
+                .help("Cancel renaming this tab group")
             Button("Rename") {
                 if let renameGroupID { store.renameGroup(renameGroupID, to: groupNameDraft) }
             }
+            .help("Save the new tab group name")
         }
         .sheet(isPresented: $store.isSettingsVisible) {
             AppSettingsView(store: store, settings: store.aiSettings)
@@ -175,7 +190,6 @@ struct VerticalPanelHeader: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Spacer().frame(width: 72)
             Button {
                 store.isTabBarVisible.toggle()
             } label: {
@@ -201,6 +215,7 @@ struct VerticalPanelHeader: View {
             TabSettingsMenu(store: store)
             Spacer().frame(width: 8)
         }
+        .padding(.leading, 8)
         .frame(height: 38)
         .background(TerminalTheme.surface)
         .overlay(alignment: .bottom) {
@@ -379,8 +394,11 @@ struct VerticalTabSidebar: View {
                                 Button(group.isCollapsed ? "Expand Group" : "Collapse Group") {
                                     store.toggleGroupCollapsed(group.id)
                                 }
+                                .help(group.isCollapsed ? "Expand this tab group" : "Collapse this tab group")
                                 Button("Rename Group") { rename(group) }
+                                    .help("Rename this tab group")
                                 Button("Close Group", role: .destructive) { store.closeGroup(group.id) }
+                                    .help("Close this tab group and its tabs")
                             }
 
                             if !group.isCollapsed {
@@ -475,8 +493,11 @@ struct GroupButton: View {
         .help(group.isCollapsed ? "Expand \(group.name)" : "Collapse \(group.name)")
         .contextMenu {
             Button(group.isCollapsed ? "Expand Group" : "Collapse Group", action: toggleCollapsed)
+                .help(group.isCollapsed ? "Expand this tab group" : "Collapse this tab group")
             Button("Rename Group", action: rename)
+                .help("Rename this tab group")
             Button("Close Group", role: .destructive, action: close)
+                .help("Close this tab group and its tabs")
         }
     }
 }
@@ -594,7 +615,9 @@ struct TerminalTabButton: View {
         .onTapGesture(perform: select)
         .contextMenu {
             Button("Rename Tab", action: beginRename)
+                .help("Rename this tab")
             Button("Close Tab", action: close)
+                .help("Close this tab")
         }
         .padding(.horizontal, vertical ? 6 : 0)
     }

@@ -29,8 +29,10 @@ struct NewFolderPopover: View {
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel, action: dismiss.callAsFunction)
+                    .buttonStyle(.airSecondary)
                     .help("Cancel folder creation")
                 Button("Create", systemImage: "folder.badge.plus", action: create)
+                    .buttonStyle(.airPrimary)
                     .keyboardShortcut(.defaultAction)
                     .disabled(trimmedName.isEmpty)
                     .help("Create this folder")
@@ -38,6 +40,7 @@ struct NewFolderPopover: View {
         }
         .padding(16)
         .frame(width: 300)
+        .background(TerminalTheme.backdrop)
         .onAppear {
             folderName = suggestedName
             isNameFocused = true

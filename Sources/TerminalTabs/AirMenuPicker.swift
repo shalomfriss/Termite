@@ -38,27 +38,35 @@ struct AirMenuPicker<Option: Hashable>: View {
                 .help("Select \(optionTitle(option))")
             }
         } label: {
-            HStack(spacing: 8) {
+            HStack(spacing: 0) {
                 Text(optionTitle(selection))
                     .lineLimit(1)
+                    .padding(.leading, 11)
+                    .padding(.trailing, 10)
                 Spacer(minLength: 8)
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 8, weight: .bold))
-                    .foregroundStyle(TerminalTheme.cyanMuted)
+                Rectangle()
+                    .fill(.white.opacity(0.10))
+                    .frame(width: 1, height: 16)
+                ZStack {
+                    TerminalTheme.cyan.opacity(isHovering ? 0.16 : 0.09)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .heavy))
+                        .foregroundStyle(isHovering ? TerminalTheme.cyan : TerminalTheme.cyanMuted)
+                }
+                .frame(width: 30, height: 28)
             }
             .font(.system(size: 11, weight: .medium))
             .foregroundStyle(TerminalTheme.text)
-            .padding(.horizontal, 10)
             .frame(minWidth: minimumWidth)
-            .frame(height: 28)
+            .frame(height: 30)
             .background(
                 isHovering
                     ? TerminalTheme.raised
-                    : TerminalTheme.raised.opacity(0.72),
-                in: .rect(cornerRadius: 6)
+                    : TerminalTheme.raised.opacity(0.78),
+                in: .rect(cornerRadius: 7)
             )
             .overlay {
-                RoundedRectangle(cornerRadius: 6)
+                RoundedRectangle(cornerRadius: 7)
                     .stroke(
                         isHovering
                             ? TerminalTheme.cyan.opacity(0.42)

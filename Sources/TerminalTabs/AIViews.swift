@@ -170,6 +170,7 @@ struct AppSettingsView: View {
                 Text("Settings").font(.title2.weight(.semibold))
                 Spacer()
                 Button("Done") { dismiss() }
+                    .buttonStyle(.airPrimary)
                     .keyboardShortcut(.defaultAction)
                     .help("Close Settings")
             }
@@ -277,6 +278,7 @@ struct AppSettingsView: View {
                 Spacer()
                 if connectionMode.wrappedValue == .apiKey, connected {
                     Button("Disconnect", role: .destructive) { settings.disconnect(provider) }
+                        .buttonStyle(.airDestructive)
                         .help("Remove the saved \(provider.title) API key")
                 }
             }
@@ -297,8 +299,10 @@ struct AppSettingsView: View {
                         .foregroundStyle(.secondary)
                     Spacer()
                     Button("Refresh") { Task { await settings.refreshLoginStatus() } }
+                        .buttonStyle(.airSecondary)
                         .help("Refresh \(provider.title) sign-in status")
                     Button(loggedIn ? "Sign In Again" : "Sign In") { settings.startLogin(provider) }
+                        .buttonStyle(.airPrimary)
                         .help(loggedIn
                               ? "Sign in to \(provider.title) again"
                               : "Sign in to \(provider.title)")
@@ -318,6 +322,7 @@ struct AppSettingsView: View {
                             self.error = error.localizedDescription
                         }
                     }
+                    .buttonStyle(.airPrimary)
                     .disabled(key.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     .help(connected
                           ? "Replace the saved \(provider.title) API key"
