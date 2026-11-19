@@ -109,6 +109,11 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published var aiError: String?
     @Published var graphicalMode = false
     @Published private(set) var isGraphicalNavigationInProgress = false
+    @Published private(set) var isAlternateScreen = false
+    @Published private(set) var isMouseReporting = false
+    @Published private(set) var isFocusReporting = false
+    @Published private(set) var isCursorAtPrompt = false
+    @Published private(set) var isBracketedPasteEnabled = false
     @Published var graphicalOperationIssue: GraphicalOperationIssue?
     @Published var tabAccentColor: NSColor?
     @Published private(set) var gitBranch: String? = nil
@@ -126,6 +131,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var shellWorkingDirectory = FileManager.default.currentDirectoryPath
     private(set) var commandBlocks: [TerminalCommandBlock] = []
     private var collapsedTerminalBlockIDs: Set<TerminalBlockID> = []
+    private var bookmarkedTerminalBlockIDs: Set<TerminalBlockID> = []
     private var commandLine = CommandLineTracker()
     private var isMarkingInput = false
     private var terminalColumns = 100
@@ -196,7 +202,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         if gt_session_poll(handle) {
             revision &+= 1
             refreshFrame()
-            refreshCapturedCommandOutput()
+            if !isAlternateScreen { refreshCapturedCommandOutput() }
         }
         isRunning = gt_session_is_running(handle)
     }
@@ -204,6 +210,11 @@ final class TerminalSession: ObservableObject, Identifiable {
     func refreshFrame() {
         guard let handle, let frame = gt_session_frame(handle) else { return }
         terminalColumns = Int(frame.pointee.cols)
+        isAlternateScreen = frame.pointee.alternate_screen
+        isMouseReporting = frame.pointee.mouse_reporting
+        isFocusReporting = frame.pointee.focus_reporting
+        isCursorAtPrompt = frame.pointee.cursor_at_prompt
+        isBracketedPasteEnabled = frame.pointee.bracketed_paste
         if let pointer = frame.pointee.title {
             let value = String(cString: pointer).unicodeScalars.filter { scalar in
                 !CharacterSet.controlCharacters.contains(scalar)
@@ -419,6 +430,10 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func sendUserInput(_ data: Data) {
         guard let handle else { return }
+        if isAlternateScreen {
+            write(data)
+            return
+        }
         _ = gt_session_scroll_to_bottom(handle)
         var pending = Data()
         for byte in data {
@@ -943,7 +958,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         // so graphical navigation never exposes the implementation command.
         feedTerminalOutput(Self.graphicalNavigationConcealSequence, handle: handle)
         var shouldRestoreVisibleOutput = true
+        var shouldRestoreEcho = gt_session_set_echo(handle, false)
         defer {
+            if shouldRestoreEcho { _ = gt_session_set_echo(handle, true) }
             if shouldRestoreVisibleOutput,
                generation == graphicalNavigationGeneration {
                 feedTerminalOutput(Self.graphicalNavigationRevealSequence, handle: handle)
@@ -966,6 +983,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         guard reachedTarget else { throw GraphicalOperationError.navigationTimedOut(target) }
         try await drainShellOutput(handle: handle)
+        if shouldRestoreEcho {
+            _ = gt_session_set_echo(handle, true)
+            shouldRestoreEcho = false
+        }
         let prompt = try await waitForVisiblePrompt(handle: handle)
         try Task.checkCancellation()
 
@@ -2077,6 +2098,51 @@ final class TerminalSession: ObservableObject, Identifiable {
             collapsedTerminalBlockIDs.remove(id)
         }
         revision &+= 1
+    }
+
+    func isTerminalBlockBookmarked(_ id: TerminalBlockID) -> Bool {
+        bookmarkedTerminalBlockIDs.contains(id)
+    }
+
+    func toggleTerminalBlockBookmarked(_ id: TerminalBlockID) {
+        if !bookmarkedTerminalBlockIDs.insert(id).inserted {
+            bookmarkedTerminalBlockIDs.remove(id)
+        }
+        revision &+= 1
+    }
+
+    var canRunBlockCommand: Bool {
+        !isAlternateScreen && isRunning
+    }
+
+    func reinputBlockCommand(_ command: String) {
+        guard canRunBlockCommand, !command.isEmpty else { return }
+        sendUserInput(Data(command.utf8))
+    }
+
+    func rerunBlockCommand(_ command: String) {
+        guard canRunBlockCommand, !command.isEmpty else { return }
+        sendUserInput(Data(command.utf8))
+        sendUserInput(Data([0x0D]))
+    }
+
+    func clearTerminalView() {
+        guard !isAlternateScreen else { return }
+        sendUserInput(Data([0x0C]))
+    }
+
+    func paste(_ value: String) {
+        guard !value.isEmpty else { return }
+        if isBracketedPasteEnabled {
+            write(Data("\u{1B}[200~\(value)\u{1B}[201~".utf8))
+        } else {
+            sendUserInput(Data(value.utf8))
+        }
+    }
+
+    func sendFocus(_ focused: Bool) {
+        guard let handle else { return }
+        _ = gt_session_send_focus(handle, focused)
     }
 
     func submittedCommand(matchingRenderedText text: String) -> String? {

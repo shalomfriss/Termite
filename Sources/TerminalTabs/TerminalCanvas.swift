@@ -19,7 +19,10 @@ struct TerminalCanvas: NSViewRepresentable {
     func updateNSView(_ view: TerminalNSView, context: Context) {
         view.session = session
         view.openDirectoryInNewTab = openDirectoryInNewTab
+        view.syncApplicationFocusReporting()
+        view.needsLayout = true
         view.needsDisplay = true
+        view.window?.invalidateCursorRects(for: view)
     }
 }
 
@@ -43,6 +46,8 @@ final class TerminalNSView: NSView,
 
     private enum BlockAction: Equatable {
         case toggleFold
+        case toggleBookmark
+        case rerun
         case copy
         case attach
     }
@@ -76,10 +81,11 @@ final class TerminalNSView: NSView,
     private let cellWidth: CGFloat
     private let cellHeight: CGFloat = 20
     private var lastGrid = (cols: UInt16(0), rows: UInt16(0))
+    private var wasFocusReportingEnabled = false
     private var windowKeyObserver: NSObjectProtocol?
     private var contextBlock: BlockContents?
     private var contextGraphicalItem: GraphicalFileItem?
-    private var selectedBlockHistoryRow: UInt64?
+    private var selectedBlockHistoryRows: Set<UInt64> = []
     private var selectedGraphicalPlacementID: UInt32?
     private var hoveredGraphicalPlacementID: UInt32?
     private var dropTargetGraphicalPlacementID: UInt32?
@@ -146,6 +152,17 @@ final class TerminalNSView: NSView,
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var isFlipped: Bool { true }
 
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted { session.sendFocus(true) }
+        return accepted
+    }
+
+    override func resignFirstResponder() -> Bool {
+        session.sendFocus(false)
+        return super.resignFirstResponder()
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if let windowKeyObserver {
@@ -170,9 +187,18 @@ final class TerminalNSView: NSView,
         window.makeFirstResponder(self)
     }
 
+    func syncApplicationFocusReporting() {
+        guard let window else { return }
+        defer { wasFocusReportingEnabled = session.isFocusReporting }
+        guard session.isFocusReporting, !wasFocusReportingEnabled else { return }
+        session.sendFocus(window.firstResponder === self)
+    }
+
     override func layout() {
         super.layout()
-        let horizontalInsets = 2 * (Self.blockOuterMargin + Self.blockContentPadding)
+        let horizontalInsets = session.isAlternateScreen
+            ? 2 * Self.terminalContentInset
+            : 2 * (Self.blockOuterMargin + Self.blockContentPadding)
         let cols = UInt16(max(1, min(Int(UInt16.max), Int((bounds.width - horizontalInsets) / cellWidth))))
         let rows = UInt16(max(1, min(Int(UInt16.max), Int(bounds.height / cellHeight))))
         if (cols, rows) != lastGrid {
@@ -184,6 +210,11 @@ final class TerminalNSView: NSView,
 
     override func mouseDown(with event: NSEvent) {
         focusTerminal()
+        if forwardMouseEvent(event, action: Int32(GT_MOUSE_ACTION_PRESS)) {
+            textSelectionAnchor = nil
+            textSelection = nil
+            return
+        }
         let point = convert(event.locationInWindow, from: nil)
         if let target = blockActionHitTargets.last(where: { $0.rect.contains(point) }) {
             graphicalDragCandidate = nil
@@ -199,7 +230,7 @@ final class TerminalNSView: NSView,
             linkActivationCandidate = nil
             textSelectionAnchor = nil
             textSelection = nil
-            selectedBlockHistoryRow = nil
+            selectedBlockHistoryRows.removeAll()
             selectedGraphicalPlacementID = target.placementID
             graphicalDragCandidate = (target.placementID, point)
             needsDisplay = true
@@ -221,10 +252,16 @@ final class TerminalNSView: NSView,
         linkActivationCandidate = nil
         textSelectionAnchor = terminalPosition(at: point)
         selectedGraphicalPlacementID = nil
-        selectBlock(atVisualY: point.y)
+        selectBlock(atVisualY: point.y, modifiers: event.modifierFlags)
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if forwardMouseEvent(
+            event,
+            action: Int32(GT_MOUSE_ACTION_MOTION),
+            forcedButton: Int32(GT_MOUSE_BUTTON_LEFT),
+            anyButtonPressed: true
+        ) { return }
         linkActivationCandidate = nil
         if let candidate = graphicalDragCandidate {
             let point = convert(event.locationInWindow, from: nil)
@@ -254,18 +291,57 @@ final class TerminalNSView: NSView,
         let point = convert(event.locationInWindow, from: nil)
         guard let extent = terminalPosition(at: point), extent != anchor else { return }
         textSelection = TerminalTextSelection(anchor: anchor, extent: extent)
-        selectedBlockHistoryRow = nil
+        selectedBlockHistoryRows.removeAll()
         selectedGraphicalPlacementID = nil
         needsDisplay = true
     }
 
     override func mouseUp(with event: NSEvent) {
+        if forwardMouseEvent(
+            event,
+            action: Int32(GT_MOUSE_ACTION_RELEASE),
+            anyButtonPressed: false
+        ) { return }
         if let linkActivationCandidate {
             openURL(linkActivationCandidate.url)
             self.linkActivationCandidate = nil
         }
         graphicalDragCandidate = nil
         textSelectionAnchor = nil
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        focusTerminal()
+        if !forwardMouseEvent(event, action: Int32(GT_MOUSE_ACTION_PRESS)) {
+            super.rightMouseDown(with: event)
+        }
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        if !forwardMouseEvent(
+            event,
+            action: Int32(GT_MOUSE_ACTION_RELEASE),
+            anyButtonPressed: false
+        ) {
+            super.rightMouseUp(with: event)
+        }
+    }
+
+    override func otherMouseDown(with event: NSEvent) {
+        focusTerminal()
+        if !forwardMouseEvent(event, action: Int32(GT_MOUSE_ACTION_PRESS)) {
+            super.otherMouseDown(with: event)
+        }
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        if !forwardMouseEvent(
+            event,
+            action: Int32(GT_MOUSE_ACTION_RELEASE),
+            anyButtonPressed: false
+        ) {
+            super.otherMouseUp(with: event)
+        }
     }
 
     func draggingSession(
@@ -300,7 +376,10 @@ final class TerminalNSView: NSView,
 
     override func resetCursorRects() {
         super.resetCursorRects()
-        addCursorRect(bounds, cursor: .iBeam)
+        addCursorRect(
+            bounds,
+            cursor: session.isAlternateScreen && session.isMouseReporting ? .arrow : .iBeam
+        )
         for target in imageHitTargets {
             addCursorRect(target.rect, cursor: .pointingHand)
         }
@@ -326,6 +405,12 @@ final class TerminalNSView: NSView,
     }
 
     override func mouseMoved(with event: NSEvent) {
+        if forwardMouseEvent(
+            event,
+            action: Int32(GT_MOUSE_ACTION_MOTION),
+            forcedButton: Int32(GT_MOUSE_BUTTON_NONE),
+            anyButtonPressed: false
+        ) { return }
         let point = convert(event.locationInWindow, from: nil)
         let hoveredGraphical = imageHitTargets.last(where: { $0.rect.contains(point) })?.placementID
         let hoveredAction = blockActionHitTargets.last(where: { $0.rect.contains(point) })
@@ -390,8 +475,72 @@ final class TerminalNSView: NSView,
         }
         let rows = Int(amount.rounded(.awayFromZero))
         if rows != 0 {
+            if session.isAlternateScreen, session.isMouseReporting {
+                let button = rows > 0
+                    ? Int32(GT_MOUSE_BUTTON_SCROLL_UP)
+                    : Int32(GT_MOUSE_BUTTON_SCROLL_DOWN)
+                for _ in 0..<min(10, abs(rows)) {
+                    _ = forwardMouseEvent(
+                        event,
+                        action: Int32(GT_MOUSE_ACTION_PRESS),
+                        forcedButton: button,
+                        anyButtonPressed: false
+                    )
+                }
+                return
+            }
+            if session.isAlternateScreen {
+                let sequence = rows > 0 ? Data("\u{1B}[A".utf8) : Data("\u{1B}[B".utf8)
+                for _ in 0..<min(10, abs(rows)) { session.sendUserInput(sequence) }
+                return
+            }
             session.scroll(rows: -rows)
             needsDisplay = true
+        }
+    }
+
+    private func forwardMouseEvent(
+        _ event: NSEvent,
+        action: Int32,
+        forcedButton: Int32? = nil,
+        anyButtonPressed: Bool? = nil
+    ) -> Bool {
+        guard session.isAlternateScreen,
+              session.isMouseReporting,
+              !event.modifierFlags.contains(.shift),
+              let handle = session.handle else { return false }
+        let point = convert(event.locationInWindow, from: nil)
+        let button = forcedButton ?? terminalMouseButton(for: event)
+        var modifiers: UInt16 = 0
+        if event.modifierFlags.contains(.shift) { modifiers |= UInt16(GT_MOD_SHIFT) }
+        if event.modifierFlags.contains(.control) { modifiers |= UInt16(GT_MOD_CONTROL) }
+        if event.modifierFlags.contains(.option) { modifiers |= UInt16(GT_MOD_ALT) }
+        if event.modifierFlags.contains(.command) { modifiers |= UInt16(GT_MOD_SUPER) }
+        let isPressed = anyButtonPressed
+            ?? (action != Int32(GT_MOUSE_ACTION_RELEASE))
+        return gt_session_send_mouse(
+            handle,
+            action,
+            button,
+            modifiers,
+            Float(point.x),
+            Float(point.y),
+            UInt32(max(1, bounds.width.rounded(.up))),
+            UInt32(max(1, bounds.height.rounded(.up))),
+            UInt32(max(1, cellWidth.rounded(.up))),
+            UInt32(cellHeight),
+            UInt32(Self.terminalContentInset),
+            0,
+            isPressed
+        )
+    }
+
+    private func terminalMouseButton(for event: NSEvent) -> Int32 {
+        switch event.buttonNumber {
+        case 0: Int32(GT_MOUSE_BUTTON_LEFT)
+        case 1: Int32(GT_MOUSE_BUTTON_RIGHT)
+        case 2: Int32(GT_MOUSE_BUTTON_MIDDLE)
+        default: Int32(GT_MOUSE_BUTTON_NONE)
         }
     }
 
@@ -400,7 +549,7 @@ final class TerminalNSView: NSView,
         let point = convert(event.locationInWindow, from: nil)
         if let target = imageHitTargets.last(where: { $0.rect.contains(point) }),
            let item = session.graphicalItem(for: target.placementID) {
-            selectedBlockHistoryRow = nil
+            selectedBlockHistoryRows.removeAll()
             selectedGraphicalPlacementID = target.placementID
             needsDisplay = true
             contextBlock = nil
@@ -409,6 +558,11 @@ final class TerminalNSView: NSView,
 
         contextGraphicalItem = nil
         contextBlock = blockContents(atVisualY: point.y)
+        if let contextBlock,
+           !selectedBlockHistoryRows.contains(contextBlock.id.historyRow) {
+            selectedBlockHistoryRows = [contextBlock.id.historyRow]
+            needsDisplay = true
+        }
 
         let menu = NSMenu()
         menu.addItem(menuItem(
@@ -418,14 +572,42 @@ final class TerminalNSView: NSView,
         ))
         menu.addItem(.separator())
         menu.addItem(menuItem(
+            "Run Command Again",
+            action: #selector(rerunCommand),
+            enabled: contextBlock != nil && session.canRunBlockCommand,
+            systemImage: "arrow.clockwise"
+        ))
+        menu.addItem(menuItem(
+            "Reinput Command",
+            action: #selector(reinputCommand),
+            enabled: contextBlock != nil && session.canRunBlockCommand,
+            systemImage: "text.cursor"
+        ))
+        menu.addItem(.separator())
+        menu.addItem(menuItem(
             "Copy Output",
             action: #selector(copyOutput),
             enabled: contextBlock != nil,
             systemImage: "doc.on.doc"
         ))
         menu.addItem(menuItem("Copy Command", action: #selector(copyCommand), enabled: contextBlock != nil))
+        menu.addItem(menuItem(
+            "Copy Command and Output",
+            action: #selector(copyCommandAndOutput),
+            enabled: contextBlock != nil
+        ))
         menu.addItem(menuItem("Copy Working Directory", action: #selector(copyWorkingDirectory), enabled: contextBlock != nil))
         if let contextBlock {
+            menu.addItem(menuItem(
+                session.isTerminalBlockBookmarked(contextBlock.id)
+                    ? "Remove Bookmark"
+                    : "Bookmark Block",
+                action: #selector(toggleContextBlockBookmark),
+                enabled: true,
+                systemImage: session.isTerminalBlockBookmarked(contextBlock.id)
+                    ? "bookmark.fill"
+                    : "bookmark"
+            ))
             menu.addItem(menuItem(
                 session.isTerminalBlockCollapsed(contextBlock.id) ? "Expand Block" : "Collapse Block",
                 action: #selector(toggleContextBlockFold),
@@ -436,12 +618,15 @@ final class TerminalNSView: NSView,
             ))
         }
         menu.addItem(.separator())
+        let selectedBlocks = selectedBlockContents()
         menu.addItem(menuItem(
-            "Attach Output to AI Chat",
+            selectedBlocks.count > 1
+                ? "Attach Selected Blocks to AI Chat"
+                : "Attach Output to AI Chat",
             action: #selector(attachOutputToAI),
-            enabled: contextBlock.map {
+            enabled: selectedBlocks.contains {
                 !session.hasPendingAIAttachment(for: $0.id)
-            } ?? session.canAttachGraphicalOutputToAI,
+            } || (contextBlock == nil && session.canAttachGraphicalOutputToAI),
             systemImage: "sparkles"
         ))
         menu.addItem(.separator())
@@ -452,7 +637,43 @@ final class TerminalNSView: NSView,
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard event.modifierFlags.contains(.command) else { return false }
-        if event.charactersIgnoringModifiers == "c" {
+        let characters = event.charactersIgnoringModifiers?.lowercased()
+        if event.keyCode == 126 || event.keyCode == 125 {
+            selectRelativeBlock(
+                event.keyCode == 126 ? -1 : 1,
+                extending: event.modifierFlags.contains(.shift)
+            )
+            return true
+        }
+        if characters == "a", !session.isAlternateScreen {
+            selectAllVisibleBlocks()
+            return true
+        }
+        if characters == "b", !selectedBlockHistoryRows.isEmpty {
+            for block in selectedBlockContents() {
+                session.toggleTerminalBlockBookmarked(block.id)
+            }
+            needsDisplay = true
+            return true
+        }
+        if characters == "i", session.canRunBlockCommand,
+           let block = selectedBlockContents().last {
+            session.reinputBlockCommand(block.command)
+            return true
+        }
+        if characters == "k", !session.isAlternateScreen {
+            selectedBlockHistoryRows.removeAll()
+            session.clearTerminalView()
+            return true
+        }
+        if characters == "c" {
+            if event.modifierFlags.contains(.shift), !selectedBlockHistoryRows.isEmpty {
+                copySelectedBlocks(
+                    commandOnly: !event.modifierFlags.contains(.option),
+                    outputOnly: event.modifierFlags.contains(.option)
+                )
+                return true
+            }
             if let selectedText = selectedTerminalText(), !selectedText.isEmpty {
                 copyToPasteboard(selectedText)
                 return true
@@ -462,11 +683,15 @@ final class TerminalNSView: NSView,
                 session.copyGraphicalItem(item)
                 return true
             }
+            if !selectedBlockHistoryRows.isEmpty {
+                copySelectedBlocks(commandOnly: false, outputOnly: false)
+                return true
+            }
         }
-        if event.charactersIgnoringModifiers == "v",
+        if characters == "v",
            let value = NSPasteboard.general.string(forType: .string) {
             clearTextSelection()
-            session.sendUserInput(Data(value.utf8))
+            session.paste(value)
             return true
         }
         return false
@@ -525,11 +750,16 @@ final class TerminalNSView: NSView,
         let frame = framePointer.pointee
         guard let cells = frame.cells else { return }
         let context = NSGraphicsContext.current?.cgContext
-        if session.graphicalMode {
+        if session.graphicalMode && !frame.alternate_screen {
             drawGraphicalBackdrop(in: context)
         } else {
             context?.setFillColor(NSColor(red: 0.024, green: 0.067, blue: 0.094, alpha: 1).cgColor)
             context?.fill(bounds)
+        }
+
+        if frame.alternate_screen {
+            drawApplicationScreen(frame: frame, cells: cells)
+            return
         }
 
         let ranges = blockRanges(frame: frame, cells: cells)
@@ -556,7 +786,9 @@ final class TerminalNSView: NSView,
                 width: max(0, bounds.width - Self.blockOuterMargin * 2),
                 height: verticalFrame.height
             )
-            let isSelected = frame.scroll_offset + UInt64(range.lowerBound) == selectedBlockHistoryRow
+            let isSelected = selectedBlockHistoryRows.contains(
+                frame.scroll_offset + UInt64(range.lowerBound)
+            )
             let fillPath = NSBezierPath(
                 roundedRect: rect,
                 xRadius: Self.blockCornerRadius,
@@ -680,7 +912,102 @@ final class TerminalNSView: NSView,
             let status = gt_session_exit_status(handle)
             drawBadge("Process exited with status \(status)")
         }
-        drawScrollbar(frame)
+        if !frame.alternate_screen { drawScrollbar(frame) }
+    }
+
+    private func drawApplicationScreen(frame: GTFrame, cells: UnsafePointer<GTCell>) {
+        clearApplicationScreenHitTargets()
+        let leadingOffset = Self.terminalContentInset
+        let defaultBackground = (r: UInt8(6), g: UInt8(17), b: UInt8(24))
+
+        for y in 0..<Int(frame.rows) {
+            for x in 0..<Int(frame.cols) {
+                let cell = cells[y * Int(frame.cols) + x]
+                let rect = NSRect(
+                    x: CGFloat(x) * cellWidth + leadingOffset,
+                    y: CGFloat(y) * cellHeight,
+                    width: cellWidth + 0.5,
+                    height: cellHeight
+                )
+                if cell.bg_r != defaultBackground.r
+                    || cell.bg_g != defaultBackground.g
+                    || cell.bg_b != defaultBackground.b {
+                    color(cell.bg_r, cell.bg_g, cell.bg_b).setFill()
+                    rect.fill()
+                }
+                let historyRow = frame.scroll_offset + UInt64(y)
+                if textSelection?.contains(
+                    row: historyRow,
+                    column: x,
+                    totalColumns: Int(frame.cols)
+                ) == true {
+                    NSColor(srgbRed: 0.29, green: 0.82, blue: 0.80, alpha: 0.34).setFill()
+                    rect.fill()
+                }
+                guard cell.text_len > 0,
+                      cell.style & UInt16(GT_STYLE_INVISIBLE) == 0 else { continue }
+                let text = withUnsafeBytes(of: cell.text) { raw -> String in
+                    String(decoding: raw.prefix(Int(cell.text_len)), as: UTF8.self)
+                }
+                var foreground = color(cell.fg_r, cell.fg_g, cell.fg_b)
+                if cell.style & UInt16(GT_STYLE_FAINT) != 0 {
+                    foreground = foreground.withAlphaComponent(0.58)
+                }
+                let chosenFont: NSFont
+                if cell.style & UInt16(GT_STYLE_BOLD) != 0 {
+                    chosenFont = boldFont
+                } else if cell.style & UInt16(GT_STYLE_ITALIC) != 0 {
+                    chosenFont = italicFont
+                } else {
+                    chosenFont = font
+                }
+                (text as NSString).draw(
+                    at: NSPoint(x: rect.minX, y: rect.minY + 1),
+                    withAttributes: [.font: chosenFont, .foregroundColor: foreground]
+                )
+                if cell.style & UInt16(GT_STYLE_UNDERLINE_MASK) != 0 {
+                    foreground.setFill()
+                    NSRect(x: rect.minX, y: rect.maxY - 2, width: rect.width, height: 1).fill()
+                }
+                if cell.style & UInt16(GT_STYLE_STRIKETHROUGH) != 0 {
+                    foreground.setFill()
+                    NSRect(x: rect.minX, y: rect.midY, width: rect.width, height: 1).fill()
+                }
+            }
+        }
+
+        drawImages(
+            frame,
+            rowOffsets: Array(repeating: 0, count: Int(frame.rows)),
+            rowLeadingOffsets: Array(repeating: leadingOffset, count: Int(frame.rows)),
+            hiddenRows: []
+        )
+
+        if frame.cursor_visible {
+            let cursor = NSRect(
+                x: CGFloat(frame.cursor_x) * cellWidth + leadingOffset,
+                y: CGFloat(frame.cursor_y) * cellHeight,
+                width: cellWidth,
+                height: cellHeight
+            )
+            color(frame.cursor_r, frame.cursor_g, frame.cursor_b)
+                .withAlphaComponent(0.72)
+                .setFill()
+            cursor.fill(using: .screen)
+        }
+    }
+
+    private func clearApplicationScreenHitTargets() {
+        imageHitTargets.removeAll(keepingCapacity: true)
+        blockActionHitTargets.removeAll(keepingCapacity: true)
+        linkHitTargets.removeAll(keepingCapacity: true)
+        hoveredBlockAction = nil
+        hoveredLink = nil
+        linkActivationCandidate = nil
+        for tag in blockActionToolTipTags { removeToolTip(tag) }
+        for tag in linkToolTipTags { removeToolTip(tag) }
+        blockActionToolTipTags.removeAll(keepingCapacity: true)
+        linkToolTipTags.removeAll(keepingCapacity: true)
     }
 
     static func blockBackgroundRect(
@@ -825,7 +1152,9 @@ final class TerminalNSView: NSView,
                 height: buttonSize
             )
             let copyRect = attachRect.offsetBy(dx: -(buttonSize + buttonGap), dy: 0)
-            let foldRect = copyRect.offsetBy(dx: -(buttonSize + buttonGap), dy: 0)
+            let rerunRect = copyRect.offsetBy(dx: -(buttonSize + buttonGap), dy: 0)
+            let bookmarkRect = rerunRect.offsetBy(dx: -(buttonSize + buttonGap), dy: 0)
+            let foldRect = bookmarkRect.offsetBy(dx: -(buttonSize + buttonGap), dy: 0)
             if range.count > 1 {
                 targets.append(BlockActionHitTarget(
                     action: .toggleFold,
@@ -835,7 +1164,21 @@ final class TerminalNSView: NSView,
                     isEnabled: true
                 ))
             }
+            targets.append(BlockActionHitTarget(
+                action: .toggleBookmark,
+                blockID: blockID,
+                block: nil,
+                rect: bookmarkRect,
+                isEnabled: true
+            ))
             if let block = blockContents(for: range, frame: frame, cells: cells) {
+                targets.append(BlockActionHitTarget(
+                    action: .rerun,
+                    blockID: blockID,
+                    block: block,
+                    rect: rerunRect,
+                    isEnabled: session.canRunBlockCommand
+                ))
                 targets.append(BlockActionHitTarget(
                     action: .copy,
                     blockID: blockID,
@@ -869,6 +1212,8 @@ final class TerminalNSView: NSView,
             let isHovered = hoveredBlockAction?.action == target.action
                 && hoveredBlockAction?.blockID == target.blockID
             let isAttached = target.action == .attach && !target.isEnabled
+            let isBookmarked = target.action == .toggleBookmark
+                && session.isTerminalBlockBookmarked(target.blockID)
             let buttonRect = target.rect.insetBy(dx: 2, dy: 2)
             let background = NSBezierPath(
                 roundedRect: buttonRect,
@@ -877,7 +1222,7 @@ final class TerminalNSView: NSView,
             )
             if isHovered, target.isEnabled {
                 NSColor.white.withAlphaComponent(0.11).setFill()
-            } else if isAttached {
+            } else if isAttached || isBookmarked {
                 NSColor(srgbRed: 0.27, green: 0.83, blue: 0.81, alpha: 0.12).setFill()
             } else {
                 NSColor.white.withAlphaComponent(0.045).setFill()
@@ -893,6 +1238,10 @@ final class TerminalNSView: NSView,
                 symbolName = session.isTerminalBlockCollapsed(target.blockID)
                     ? "chevron.right"
                     : "chevron.down"
+            case .toggleBookmark:
+                symbolName = isBookmarked ? "bookmark.fill" : "bookmark"
+            case .rerun:
+                symbolName = "arrow.clockwise"
             case .copy:
                 symbolName = "doc.on.doc"
             case .attach:
@@ -904,7 +1253,7 @@ final class TerminalNSView: NSView,
             ) else {
                 continue
             }
-            let tint = isAttached
+            let tint = isAttached || isBookmarked
                 ? NSColor(srgbRed: 0.43, green: 0.95, blue: 0.91, alpha: 0.92)
                 : NSColor.white.withAlphaComponent(target.isEnabled ? 0.72 : 0.30)
             let configuration = NSImage.SymbolConfiguration(pointSize: 11, weight: .medium)
@@ -942,6 +1291,12 @@ final class TerminalNSView: NSView,
         switch target.action {
         case .toggleFold:
             session.isTerminalBlockCollapsed(target.blockID) ? "Expand block" : "Collapse block"
+        case .toggleBookmark:
+            session.isTerminalBlockBookmarked(target.blockID)
+                ? "Remove block bookmark"
+                : "Bookmark block"
+        case .rerun:
+            target.isEnabled ? "Run command again" : "Run again when the prompt is ready"
         case .copy:
             "Copy block output"
         case .attach:
@@ -950,10 +1305,15 @@ final class TerminalNSView: NSView,
     }
 
     private func performBlockAction(_ target: BlockActionHitTarget) {
-        selectedBlockHistoryRow = target.blockID.historyRow
+        selectedBlockHistoryRows = [target.blockID.historyRow]
         switch target.action {
         case .toggleFold:
             session.toggleTerminalBlockCollapsed(target.blockID)
+        case .toggleBookmark:
+            session.toggleTerminalBlockBookmarked(target.blockID)
+        case .rerun:
+            guard let block = target.block else { return }
+            session.rerunBlockCommand(block.command)
         case .copy:
             guard let block = target.block else { return }
             copyToPasteboard(block.output.isEmpty ? block.command : block.output)
@@ -978,6 +1338,14 @@ final class TerminalNSView: NSView,
         hiddenRows: Set<Int>
     ) {
         let previousTargets = linkHitTargets
+        if frame.alternate_screen {
+            linkHitTargets = []
+            hoveredLink = nil
+            linkActivationCandidate = nil
+            if previousTargets != linkHitTargets { refreshLinkToolTips() }
+            invalidateCursorRectsIfChanged(from: previousTargets)
+            return
+        }
         let columnCount = Int(frame.cols)
         var targets: [LinkHitTarget] = []
         for row in 0..<Int(frame.rows) where !hiddenRows.contains(row) {
@@ -1032,7 +1400,8 @@ final class TerminalNSView: NSView,
         hiddenRows: Set<Int>
     ) {
         let previousTargets = imageHitTargets
-        guard session.graphicalMode, let images = frame.images, frame.image_count > 0 else {
+        guard session.graphicalMode, !frame.alternate_screen,
+              let images = frame.images, frame.image_count > 0 else {
             imageHitTargets = []
             selectedGraphicalPlacementID = nil
             hoveredGraphicalPlacementID = nil
@@ -1495,24 +1864,118 @@ final class TerminalNSView: NSView,
         return (name as NSString).deletingPathExtension
     }
 
-    private func selectBlock(atVisualY visualY: CGFloat) {
+    private func selectBlock(atVisualY visualY: CGFloat, modifiers: NSEvent.ModifierFlags) {
         guard let handle = session.handle, let framePointer = gt_session_frame(handle),
               let cells = framePointer.pointee.cells else {
-            selectedBlockHistoryRow = nil
+            selectedBlockHistoryRows.removeAll()
             needsDisplay = true
             return
         }
         let frame = framePointer.pointee
         let ranges = blockRanges(frame: frame, cells: cells)
-        selectedBlockHistoryRow = blockVisualLayout(frame: frame, cells: cells, ranges: ranges)
+        guard let clickedRow = blockVisualLayout(frame: frame, cells: cells, ranges: ranges)
             .blockRange(at: visualY)
-            .map { frame.scroll_offset + UInt64($0.lowerBound) }
+            .map({ frame.scroll_offset + UInt64($0.lowerBound) }) else {
+            selectedBlockHistoryRows.removeAll()
+            needsDisplay = true
+            return
+        }
+        let visibleRows = ranges.map { frame.scroll_offset + UInt64($0.lowerBound) }
+        if modifiers.contains(.command) {
+            if !selectedBlockHistoryRows.insert(clickedRow).inserted {
+                selectedBlockHistoryRows.remove(clickedRow)
+            }
+        } else if modifiers.contains(.shift),
+                  let anchor = selectedBlockHistoryRows.sorted().last,
+                  let anchorIndex = visibleRows.firstIndex(of: anchor),
+                  let clickedIndex = visibleRows.firstIndex(of: clickedRow) {
+            let lower = min(anchorIndex, clickedIndex)
+            let upper = max(anchorIndex, clickedIndex)
+            selectedBlockHistoryRows.formUnion(visibleRows[lower...upper])
+        } else {
+            selectedBlockHistoryRows = [clickedRow]
+        }
         needsDisplay = true
     }
 
-    @objc private func copyOutput() { copyToPasteboard(contextBlock?.output) }
+    private func selectedBlockContents() -> [BlockContents] {
+        guard let handle = session.handle,
+              let framePointer = gt_session_frame(handle),
+              let cells = framePointer.pointee.cells else { return [] }
+        let frame = framePointer.pointee
+        return blockRanges(frame: frame, cells: cells).compactMap { range in
+            let historyRow = frame.scroll_offset + UInt64(range.lowerBound)
+            guard selectedBlockHistoryRows.contains(historyRow) else { return nil }
+            return blockContents(for: range, frame: frame, cells: cells)
+        }
+    }
+
+    private func selectAllVisibleBlocks() {
+        guard let handle = session.handle,
+              let framePointer = gt_session_frame(handle),
+              let cells = framePointer.pointee.cells else { return }
+        let frame = framePointer.pointee
+        selectedBlockHistoryRows = Set(blockRanges(frame: frame, cells: cells).map {
+            frame.scroll_offset + UInt64($0.lowerBound)
+        })
+        needsDisplay = true
+    }
+
+    private func selectRelativeBlock(_ delta: Int, extending: Bool) {
+        guard let handle = session.handle,
+              let framePointer = gt_session_frame(handle),
+              let cells = framePointer.pointee.cells else { return }
+        let frame = framePointer.pointee
+        let rows = blockRanges(frame: frame, cells: cells).map {
+            frame.scroll_offset + UInt64($0.lowerBound)
+        }
+        guard !rows.isEmpty else { return }
+        let current = delta < 0 ? selectedBlockHistoryRows.min() : selectedBlockHistoryRows.max()
+        let currentIndex = current.flatMap { rows.firstIndex(of: $0) }
+            ?? (delta < 0 ? rows.count : -1)
+        let targetIndex = min(rows.count - 1, max(0, currentIndex + delta))
+        if extending {
+            selectedBlockHistoryRows.insert(rows[targetIndex])
+        } else {
+            selectedBlockHistoryRows = [rows[targetIndex]]
+        }
+        needsDisplay = true
+    }
+
+    private func copySelectedBlocks(commandOnly: Bool, outputOnly: Bool) {
+        let values = selectedBlockContents().map { block -> String in
+            let output = session.fullOutput(for: block.command) ?? block.output
+            if commandOnly { return block.command }
+            if outputOnly { return output }
+            return [block.command, output].filter { !$0.isEmpty }.joined(separator: "\n")
+        }.filter { !$0.isEmpty }
+        copyToPasteboard(values.joined(separator: "\n\n"))
+    }
+
+    @objc private func copyOutput() {
+        guard let contextBlock else { return }
+        copyToPasteboard(session.fullOutput(for: contextBlock.command) ?? contextBlock.output)
+    }
     @objc private func copyCommand() { copyToPasteboard(contextBlock?.command) }
+    @objc private func copyCommandAndOutput() {
+        guard let contextBlock else { return }
+        let output = session.fullOutput(for: contextBlock.command) ?? contextBlock.output
+        copyToPasteboard([contextBlock.command, output].filter { !$0.isEmpty }.joined(separator: "\n"))
+    }
     @objc private func copyWorkingDirectory() { copyToPasteboard(contextBlock?.workingDirectory) }
+    @objc private func rerunCommand() {
+        guard let contextBlock else { return }
+        session.rerunBlockCommand(contextBlock.command)
+    }
+    @objc private func reinputCommand() {
+        guard let contextBlock else { return }
+        session.reinputBlockCommand(contextBlock.command)
+    }
+    @objc private func toggleContextBlockBookmark() {
+        guard let contextBlock else { return }
+        session.toggleTerminalBlockBookmarked(contextBlock.id)
+        needsDisplay = true
+    }
     @objc private func toggleContextBlockFold() {
         guard let contextBlock else { return }
         session.toggleTerminalBlockCollapsed(contextBlock.id)
@@ -1710,7 +2173,17 @@ final class TerminalNSView: NSView,
     }
 
     @objc private func attachOutputToAI() {
-        if let block = contextBlock {
+        let selectedBlocks = selectedBlockContents()
+        if !selectedBlocks.isEmpty {
+            for block in selectedBlocks {
+                session.attachToAI(
+                    command: block.command,
+                    output: session.fullOutput(for: block.command) ?? block.output,
+                    workingDirectory: block.workingDirectory,
+                    sourceBlockID: block.id
+                )
+            }
+        } else if let block = contextBlock {
             session.attachToAI(
                 command: block.command,
                 output: session.fullOutput(for: block.command) ?? block.output,
@@ -1724,7 +2197,7 @@ final class TerminalNSView: NSView,
 
     @objc private func pasteIntoTerminal() {
         guard let value = NSPasteboard.general.string(forType: .string) else { return }
-        session.sendUserInput(Data(value.utf8))
+        session.paste(value)
     }
 
     private func copyToPasteboard(_ value: String?) {
@@ -1746,6 +2219,7 @@ final class TerminalNSView: NSView,
     }
 
     private func blockRanges(frame: GTFrame, cells: UnsafePointer<GTCell>) -> [Range<Int>] {
+        guard !frame.alternate_screen else { return [] }
         let rowCount = Int(frame.rows)
         let inputRows = (0..<rowCount).map { row in
             (0..<Int(frame.cols)).contains { column in

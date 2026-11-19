@@ -13,6 +13,7 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 #include <util.h>
 
@@ -23,6 +24,8 @@ typedef void *GhosttyRenderStateRowCells;
 typedef void *GhosttyRenderStateImageIterator;
 typedef void *GhosttyKittyGraphics;
 typedef void *GhosttyKittyGraphicsImage;
+typedef void *GhosttyMouseEncoder;
+typedef void *GhosttyMouseEvent;
 typedef int GhosttyResult;
 typedef uint64_t GhosttyCellRaw;
 typedef uint64_t GhosttyRowRaw;
@@ -39,6 +42,17 @@ typedef struct {
 typedef struct { uint8_t *ptr; size_t cap, len; } GhosttyBuffer;
 typedef struct { const uint8_t *ptr; size_t len; } GhosttyString;
 typedef struct { uint64_t total, offset, len; } GhosttyTerminalScrollbar;
+typedef struct { float x, y; } GhosttyMousePosition;
+typedef struct {
+    size_t size;
+    uint32_t screen_width, screen_height;
+    uint32_t cell_width, cell_height;
+    uint32_t padding_top, padding_bottom, padding_right, padding_left;
+} GhosttyMouseEncoderSize;
+typedef struct {
+    uint16_t mode;
+    bool value;
+} GhosttyTerminalModeConfig;
 typedef union {
     intptr_t delta;
     size_t row;
@@ -80,7 +94,11 @@ enum {
     GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR = 6,
     GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8 = 9,
     GHOSTTY_TERMINAL_DATA_TITLE = 12,
+    GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN = 6,
+    GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING = 11,
     GHOSTTY_TERMINAL_DATA_SCROLLBAR = 9,
+    GHOSTTY_TERMINAL_DATA_MODE = 37,
+    GHOSTTY_TERMINAL_DATA_CURSOR_AT_PROMPT = 39,
     GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS = 30,
     GHOSTTY_ROW_DATA_SEMANTIC_PROMPT = 6,
     GHOSTTY_TERMINAL_SCROLL_VIEWPORT_BOTTOM = 1,
@@ -105,6 +123,12 @@ enum {
     GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_HEIGHT = 4,
     GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_FORMAT = 5,
     GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_PIXELS = 7,
+    GHOSTTY_TERMINAL_SCREEN_ALTERNATE = 1,
+    GHOSTTY_MOUSE_ENCODER_OPT_SIZE = 3,
+    GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED = 4,
+    GHOSTTY_MOUSE_ENCODER_OPT_TRACK_LAST_CELL = 5,
+    GHOSTTY_MODE_FOCUS_EVENT = 1004,
+    GHOSTTY_MODE_BRACKETED_PASTE = 2004,
 };
 
 typedef struct {
@@ -137,6 +161,19 @@ typedef struct {
     GhosttyKittyGraphicsImage (*kitty_image)(GhosttyKittyGraphics, uint32_t);
     GhosttyResult (*kitty_image_get_multi)(GhosttyKittyGraphicsImage, size_t,
                                            const int *, void **, size_t *);
+    GhosttyResult (*mouse_encoder_new)(const void *, GhosttyMouseEncoder *);
+    void (*mouse_encoder_free)(GhosttyMouseEncoder);
+    GhosttyResult (*mouse_encoder_set)(GhosttyMouseEncoder, int, const void *);
+    GhosttyResult (*mouse_encoder_set_from_terminal)(GhosttyMouseEncoder, GhosttyTerminal);
+    GhosttyResult (*mouse_encoder_encode)(GhosttyMouseEncoder, GhosttyMouseEvent,
+                                          uint8_t *, size_t, size_t *);
+    GhosttyResult (*mouse_event_new)(const void *, GhosttyMouseEvent *);
+    void (*mouse_event_free)(GhosttyMouseEvent);
+    GhosttyResult (*mouse_event_set_action)(GhosttyMouseEvent, int);
+    GhosttyResult (*mouse_event_set_button)(GhosttyMouseEvent, int);
+    GhosttyResult (*mouse_event_clear_button)(GhosttyMouseEvent);
+    GhosttyResult (*mouse_event_set_mods)(GhosttyMouseEvent, uint16_t);
+    GhosttyResult (*mouse_event_set_position)(GhosttyMouseEvent, GhosttyMousePosition);
 } GhosttyAPI;
 
 static GhosttyAPI api;
@@ -197,6 +234,18 @@ static void load_runtime(void) {
     LOAD(image_get_multi, "ghostty_render_state_image_get_multi");
     LOAD(kitty_image, "ghostty_kitty_graphics_image");
     LOAD(kitty_image_get_multi, "ghostty_kitty_graphics_image_get_multi");
+    LOAD(mouse_encoder_new, "ghostty_mouse_encoder_new");
+    LOAD(mouse_encoder_free, "ghostty_mouse_encoder_free");
+    LOAD(mouse_encoder_set, "ghostty_mouse_encoder_set");
+    LOAD(mouse_encoder_set_from_terminal, "ghostty_mouse_encoder_set_from_terminal");
+    LOAD(mouse_encoder_encode, "ghostty_mouse_encoder_encode");
+    LOAD(mouse_event_new, "ghostty_mouse_event_new");
+    LOAD(mouse_event_free, "ghostty_mouse_event_free");
+    LOAD(mouse_event_set_action, "ghostty_mouse_event_set_action");
+    LOAD(mouse_event_set_button, "ghostty_mouse_event_set_button");
+    LOAD(mouse_event_clear_button, "ghostty_mouse_event_clear_button");
+    LOAD(mouse_event_set_mods, "ghostty_mouse_event_set_mods");
+    LOAD(mouse_event_set_position, "ghostty_mouse_event_set_position");
 }
 
 const char *gt_runtime_error(void) {
@@ -215,6 +264,8 @@ struct GTSession {
     GhosttyRenderStateRowIterator rows;
     GhosttyRenderStateRowCells cells;
     GhosttyRenderStateImageIterator images;
+    GhosttyMouseEncoder mouse_encoder;
+    GhosttyMouseEvent mouse_event;
     GTCell *cell_buffer;
     size_t cell_capacity;
     uint8_t *row_semantics;
@@ -240,6 +291,24 @@ static void write_pty_reply(GhosttyTerminal terminal, void *userdata,
         ssize_t count = write(s->master_fd, data + sent, len - sent);
         if (count > 0) sent += (size_t)count;
         else if (errno != EINTR) break;
+    }
+}
+
+static void capture_command_output(GTSession *s, const uint8_t *buffer, size_t count) {
+    if (!s || !s->capturing_command_output || !buffer || !count) return;
+    size_t needed = s->command_output_len + count;
+    if (needed > s->command_output_capacity) {
+        size_t capacity = s->command_output_capacity ? s->command_output_capacity : 32768;
+        while (capacity < needed) capacity *= 2;
+        uint8_t *next = realloc(s->command_output, capacity);
+        if (next) {
+            s->command_output = next;
+            s->command_output_capacity = capacity;
+        }
+    }
+    if (needed <= s->command_output_capacity) {
+        memcpy(s->command_output + s->command_output_len, buffer, count);
+        s->command_output_len = needed;
     }
 }
 
@@ -270,7 +339,9 @@ GTSession *gt_session_create_configured(uint16_t cols, uint16_t rows,
         api.render_new(NULL, &s->render) != GHOSTTY_SUCCESS ||
         api.row_new(NULL, &s->rows) != GHOSTTY_SUCCESS ||
         api.cells_new(NULL, &s->cells) != GHOSTTY_SUCCESS ||
-        api.image_iter_new(NULL, &s->images) != GHOSTTY_SUCCESS) {
+        api.image_iter_new(NULL, &s->images) != GHOSTTY_SUCCESS ||
+        api.mouse_encoder_new(NULL, &s->mouse_encoder) != GHOSTTY_SUCCESS ||
+        api.mouse_event_new(NULL, &s->mouse_event) != GHOSTTY_SUCCESS) {
         set_error(error, "Could not initialize libghostty-vt.");
         gt_session_destroy(s);
         return NULL;
@@ -332,6 +403,8 @@ void gt_session_destroy(GTSession *s) {
     if (s->master_fd >= 0) close(s->master_fd);
     if (s->running && s->child > 0) kill(s->child, SIGHUP);
     if (s->cells) api.cells_free(s->cells);
+    if (s->mouse_event) api.mouse_event_free(s->mouse_event);
+    if (s->mouse_encoder) api.mouse_encoder_free(s->mouse_encoder);
     if (s->images) api.image_iter_free(s->images);
     if (s->rows) api.row_free(s->rows);
     if (s->render) api.render_free(s->render);
@@ -350,23 +423,13 @@ bool gt_session_poll(GTSession *s) {
     for (;;) {
         ssize_t count = read(s->master_fd, buffer, sizeof(buffer));
         if (count > 0) {
-            if (s->capturing_command_output) {
-                size_t needed = s->command_output_len + (size_t)count;
-                if (needed > s->command_output_capacity) {
-                    size_t capacity = s->command_output_capacity ? s->command_output_capacity : 32768;
-                    while (capacity < needed) capacity *= 2;
-                    uint8_t *next = realloc(s->command_output, capacity);
-                    if (next) {
-                        s->command_output = next;
-                        s->command_output_capacity = capacity;
-                    }
-                }
-                if (needed <= s->command_output_capacity) {
-                    memcpy(s->command_output + s->command_output_len, buffer, (size_t)count);
-                    s->command_output_len = needed;
-                }
-            }
             api.terminal_write(s->terminal, buffer, (size_t)count);
+            int active_screen = 0;
+            if (api.terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN,
+                                 &active_screen) == GHOSTTY_SUCCESS &&
+                active_screen != GHOSTTY_TERMINAL_SCREEN_ALTERNATE) {
+                capture_command_output(s, buffer, (size_t)count);
+            }
             changed = true;
             continue;
         }
@@ -559,6 +622,30 @@ const GTFrame *gt_session_frame(GTSession *s) {
     GhosttyColorRgb cursor_color = colors.cursor_has_value ? colors.cursor : colors.foreground;
     GhosttyTerminalScrollbar scrollbar = {0};
     api.terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &scrollbar);
+    int active_screen = 0;
+    bool mouse_reporting = false;
+    bool cursor_at_prompt = false;
+    GhosttyTerminalModeConfig focus_mode = {
+        .mode = GHOSTTY_MODE_FOCUS_EVENT,
+        .value = false,
+    };
+    GhosttyTerminalModeConfig paste_mode = {
+        .mode = GHOSTTY_MODE_BRACKETED_PASTE,
+        .value = false,
+    };
+    api.terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &active_screen);
+    api.terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &mouse_reporting);
+    api.terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_CURSOR_AT_PROMPT, &cursor_at_prompt);
+    bool focus_reporting = api.terminal_get(
+        s->terminal,
+        GHOSTTY_TERMINAL_DATA_MODE,
+        &focus_mode
+    ) == GHOSTTY_SUCCESS && focus_mode.value;
+    bool bracketed_paste = api.terminal_get(
+        s->terminal,
+        GHOSTTY_TERMINAL_DATA_MODE,
+        &paste_mode
+    ) == GHOSTTY_SUCCESS && paste_mode.value;
     size_t image_count = collect_images(s);
     s->frame = (GTFrame){
         .cols = cols, .rows = rows,
@@ -572,6 +659,11 @@ const GTFrame *gt_session_frame(GTSession *s) {
         .scroll_total = scrollbar.total,
         .scroll_offset = scrollbar.offset,
         .scroll_length = scrollbar.len,
+        .alternate_screen = active_screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE,
+        .mouse_reporting = mouse_reporting,
+        .focus_reporting = focus_reporting,
+        .cursor_at_prompt = cursor_at_prompt,
+        .bracketed_paste = bracketed_paste,
     };
     s->dirty = false;
     return &s->frame;
@@ -586,6 +678,81 @@ bool gt_session_write(GTSession *s, const uint8_t *bytes, size_t len) {
         else if (errno != EINTR) return false;
     }
     return true;
+}
+
+bool gt_session_set_echo(GTSession *s, bool enabled) {
+    if (!s || s->master_fd < 0) return false;
+    struct termios attributes;
+    if (tcgetattr(s->master_fd, &attributes) != 0) return false;
+    if (enabled) attributes.c_lflag |= ECHO;
+    else attributes.c_lflag &= (tcflag_t)~ECHO;
+    return tcsetattr(s->master_fd, TCSANOW, &attributes) == 0;
+}
+
+bool gt_session_send_mouse(GTSession *s, int action, int button,
+                           uint16_t modifiers, float x, float y,
+                           uint32_t screen_width, uint32_t screen_height,
+                           uint32_t cell_width, uint32_t cell_height,
+                           uint32_t padding_left, uint32_t padding_top,
+                           bool any_button_pressed) {
+    if (!s || !s->terminal || !s->mouse_encoder || !s->mouse_event ||
+        !cell_width || !cell_height) return false;
+
+    bool mouse_reporting = false;
+    if (api.terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING,
+                         &mouse_reporting) != GHOSTTY_SUCCESS || !mouse_reporting) return false;
+    if (api.mouse_encoder_set_from_terminal(s->mouse_encoder, s->terminal) != GHOSTTY_SUCCESS) {
+        return false;
+    }
+    GhosttyMouseEncoderSize size = {
+        .size = sizeof(size),
+        .screen_width = screen_width,
+        .screen_height = screen_height,
+        .cell_width = cell_width,
+        .cell_height = cell_height,
+        .padding_top = padding_top,
+        .padding_bottom = 0,
+        .padding_right = 0,
+        .padding_left = padding_left,
+    };
+    bool track_last_cell = true;
+    if (api.mouse_encoder_set(s->mouse_encoder, GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &size) !=
+            GHOSTTY_SUCCESS ||
+        api.mouse_encoder_set(s->mouse_encoder,
+                              GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED,
+                              &any_button_pressed) != GHOSTTY_SUCCESS ||
+        api.mouse_encoder_set(s->mouse_encoder,
+                              GHOSTTY_MOUSE_ENCODER_OPT_TRACK_LAST_CELL,
+                              &track_last_cell) != GHOSTTY_SUCCESS ||
+        api.mouse_event_set_action(s->mouse_event, action) != GHOSTTY_SUCCESS ||
+        api.mouse_event_set_mods(s->mouse_event, modifiers) != GHOSTTY_SUCCESS ||
+        api.mouse_event_set_position(s->mouse_event, (GhosttyMousePosition){x, y}) !=
+            GHOSTTY_SUCCESS) return false;
+    GhosttyResult button_result = button == GT_MOUSE_BUTTON_NONE
+        ? api.mouse_event_clear_button(s->mouse_event)
+        : api.mouse_event_set_button(s->mouse_event, button);
+    if (button_result != GHOSTTY_SUCCESS) return false;
+
+    uint8_t buffer[128];
+    size_t written = 0;
+    if (api.mouse_encoder_encode(s->mouse_encoder, s->mouse_event, buffer,
+                                 sizeof(buffer), &written) != GHOSTTY_SUCCESS) return false;
+    return written == 0 || gt_session_write(s, buffer, written);
+}
+
+bool gt_session_send_focus(GTSession *s, bool focused) {
+    if (!s || !s->terminal) return false;
+    GhosttyTerminalModeConfig mode = {
+        .mode = GHOSTTY_MODE_FOCUS_EVENT,
+        .value = false,
+    };
+    if (api.terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_MODE, &mode) !=
+            GHOSTTY_SUCCESS || !mode.value) return false;
+    const uint8_t focus_in[] = "\033[I";
+    const uint8_t focus_out[] = "\033[O";
+    return focused
+        ? gt_session_write(s, focus_in, sizeof(focus_in) - 1)
+        : gt_session_write(s, focus_out, sizeof(focus_out) - 1);
 }
 
 bool gt_session_feed_output(GTSession *s, const uint8_t *bytes, size_t len) {

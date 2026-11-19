@@ -74,7 +74,36 @@ typedef struct {
     uint64_t scroll_total;
     uint64_t scroll_offset;
     uint64_t scroll_length;
+    bool alternate_screen;
+    bool mouse_reporting;
+    bool focus_reporting;
+    bool cursor_at_prompt;
+    bool bracketed_paste;
 } GTFrame;
+
+enum {
+    GT_MOUSE_ACTION_PRESS = 0,
+    GT_MOUSE_ACTION_RELEASE = 1,
+    GT_MOUSE_ACTION_MOTION = 2,
+};
+
+enum {
+    GT_MOUSE_BUTTON_NONE = 0,
+    GT_MOUSE_BUTTON_LEFT = 1,
+    GT_MOUSE_BUTTON_RIGHT = 2,
+    GT_MOUSE_BUTTON_MIDDLE = 3,
+    GT_MOUSE_BUTTON_SCROLL_UP = 4,
+    GT_MOUSE_BUTTON_SCROLL_DOWN = 5,
+    GT_MOUSE_BUTTON_SCROLL_LEFT = 6,
+    GT_MOUSE_BUTTON_SCROLL_RIGHT = 7,
+};
+
+enum {
+    GT_MOD_SHIFT = 1 << 0,
+    GT_MOD_CONTROL = 1 << 1,
+    GT_MOD_ALT = 1 << 2,
+    GT_MOD_SUPER = 1 << 3,
+};
 
 /** Load libghostty-vt. Returns NULL when available, otherwise an error string. */
 const char *gt_runtime_error(void);
@@ -96,6 +125,15 @@ bool gt_session_poll(GTSession *session);
 const GTFrame *gt_session_frame(GTSession *session);
 
 bool gt_session_write(GTSession *session, const uint8_t *bytes, size_t len);
+bool gt_session_set_echo(GTSession *session, bool enabled);
+/** Encode and write application mouse/focus input using Ghostty's VT state. */
+bool gt_session_send_mouse(GTSession *session, int action, int button,
+                           uint16_t modifiers, float x, float y,
+                           uint32_t screen_width, uint32_t screen_height,
+                           uint32_t cell_width, uint32_t cell_height,
+                           uint32_t padding_left, uint32_t padding_top,
+                           bool any_button_pressed);
+bool gt_session_send_focus(GTSession *session, bool focused);
 /** Feed synthetic terminal output directly into libghostty-vt. */
 bool gt_session_feed_output(GTSession *session, const uint8_t *bytes, size_t len);
 /** Mark frontend-observed shell input/output boundaries using OSC 133. */

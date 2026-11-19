@@ -3,6 +3,111 @@ import GhosttyBridge
 @testable import Air
 
 final class AirTests: XCTestCase {
+    @MainActor
+    func testAlternateScreenExposesFullScreenApplicationInputModes() throws {
+        let session = TerminalSession(cols: 40, rows: 10)
+        let handle = try XCTUnwrap(session.handle)
+        let enterApplicationMode = Data(
+            "\u{1B}[?1049h\u{1B}[?1002h\u{1B}[?1006h\u{1B}[?1004h\u{1B}[?2004h".utf8
+        )
+        enterApplicationMode.withUnsafeBytes { bytes in
+            _ = gt_session_feed_output(
+                handle,
+                bytes.bindMemory(to: UInt8.self).baseAddress,
+                bytes.count
+            )
+        }
+
+        session.refreshFrame()
+
+        XCTAssertTrue(session.isAlternateScreen)
+        XCTAssertTrue(session.isMouseReporting)
+        XCTAssertTrue(session.isBracketedPasteEnabled)
+        XCTAssertTrue(gt_session_frame(handle)?.pointee.focus_reporting == true)
+
+        let recordedBlockCount = session.commandBlocks.count
+        session.sendUserInput(Data("x".utf8))
+        XCTAssertEqual(session.commandBlocks.count, recordedBlockCount)
+
+        let leaveApplicationMode = Data(
+            "\u{1B}[?2004l\u{1B}[?1004l\u{1B}[?1002l\u{1B}[?1049l".utf8
+        )
+        leaveApplicationMode.withUnsafeBytes { bytes in
+            _ = gt_session_feed_output(
+                handle,
+                bytes.bindMemory(to: UInt8.self).baseAddress,
+                bytes.count
+            )
+        }
+        session.refreshFrame()
+
+        XCTAssertFalse(session.isAlternateScreen)
+        XCTAssertFalse(session.isMouseReporting)
+        XCTAssertFalse(session.isBracketedPasteEnabled)
+    }
+
+    @MainActor
+    func testMicroRunsAsInteractiveFullScreenBlock() async throws {
+        let microPath = "/opt/homebrew/bin/micro"
+        guard FileManager.default.isExecutableFile(atPath: microPath) else {
+            throw XCTSkip("micro is not installed")
+        }
+        let file = FileManager.default.temporaryDirectory
+            .appending(path: "air-micro-test-\(UUID().uuidString).txt")
+        try Data("editable\n".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        let session = TerminalSession(cols: 80, rows: 24)
+        let handle = try XCTUnwrap(session.handle)
+        for _ in 0..<50 {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+        }
+
+        session.sendUserInput(Data("\(microPath) \(TerminalSession.shellQuoted(file.path))".utf8))
+        session.sendUserInput(Data([0x0D]))
+        for _ in 0..<150 where !session.isAlternateScreen {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+        }
+
+        XCTAssertTrue(session.isAlternateScreen)
+        XCTAssertTrue(session.isMouseReporting)
+        XCTAssertTrue(session.isBracketedPasteEnabled)
+        XCTAssertEqual(session.commandBlocks.last?.command.hasPrefix(microPath), true)
+
+        let capturedBeforeRepaints = gt_session_command_output(handle, nil, 0)
+        for _ in 0..<20 {
+            session.sendUserInput(Data("\u{1B}[B".utf8))
+            try await Task.sleep(for: .milliseconds(10))
+            session.poll()
+        }
+        let capturedAfterRepaints = gt_session_command_output(handle, nil, 0)
+        XCTAssertLessThanOrEqual(capturedAfterRepaints, capturedBeforeRepaints + 1_024)
+
+        session.sendUserInput(Data([0x11])) // micro: Ctrl-Q
+        for _ in 0..<150 where session.isAlternateScreen {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+        }
+
+        XCTAssertFalse(session.isAlternateScreen)
+    }
+
+    @MainActor
+    func testTerminalBlockBookmarksToggleIndependently() {
+        let session = TerminalSession(cols: 40, rows: 10)
+        let first = TerminalBlockID(sessionID: session.id, historyRow: 2)
+        let second = TerminalBlockID(sessionID: session.id, historyRow: 8)
+
+        session.toggleTerminalBlockBookmarked(first)
+        XCTAssertTrue(session.isTerminalBlockBookmarked(first))
+        XCTAssertFalse(session.isTerminalBlockBookmarked(second))
+
+        session.toggleTerminalBlockBookmarked(first)
+        XCTAssertFalse(session.isTerminalBlockBookmarked(first))
+    }
+
     func testAIBlockAttachmentIncludesTerminalContext() {
         let attachment = TerminalBlockAttachment(
             command: "swift test",
