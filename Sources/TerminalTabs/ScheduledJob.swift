@@ -4,6 +4,7 @@ struct ScheduledJob: Codable, Identifiable, Equatable, Sendable {
     let id: UUID
     var timing: ScheduledJobTiming
     var scheduledAt: Date?
+    var cronExpression: String?
     var script: ScheduledJobScript
     var runLocation: ScheduledJobRunLocation
     var workingDirectory: String
@@ -16,6 +17,7 @@ struct ScheduledJob: Codable, Identifiable, Equatable, Sendable {
         id: UUID = UUID(),
         timing: ScheduledJobTiming = .scheduled,
         scheduledAt: Date?,
+        cronExpression: String? = nil,
         script: ScheduledJobScript,
         runLocation: ScheduledJobRunLocation = .selectedFolder,
         workingDirectory: String,
@@ -26,7 +28,8 @@ struct ScheduledJob: Codable, Identifiable, Equatable, Sendable {
     ) {
         self.id = id
         self.timing = timing
-        self.scheduledAt = timing == .scheduled ? scheduledAt : nil
+        self.scheduledAt = timing == .manual ? nil : scheduledAt
+        self.cronExpression = timing == .cron ? cronExpression : nil
         self.script = script
         self.runLocation = runLocation
         self.workingDirectory = workingDirectory
@@ -44,6 +47,7 @@ struct ScheduledJob: Codable, Identifiable, Equatable, Sendable {
         case id
         case timing
         case scheduledAt
+        case cronExpression
         case script
         case scriptConfiguration
         case runLocation
@@ -60,6 +64,7 @@ struct ScheduledJob: Codable, Identifiable, Equatable, Sendable {
         timing = try container.decodeIfPresent(ScheduledJobTiming.self, forKey: .timing)
             ?? .scheduled
         scheduledAt = try container.decodeIfPresent(Date.self, forKey: .scheduledAt)
+        cronExpression = try container.decodeIfPresent(String.self, forKey: .cronExpression)
         if let configuration = try container.decodeIfPresent(
             ScheduledJobScript.self,
             forKey: .scriptConfiguration
@@ -85,6 +90,7 @@ struct ScheduledJob: Codable, Identifiable, Equatable, Sendable {
         try container.encode(id, forKey: .id)
         try container.encode(timing, forKey: .timing)
         try container.encodeIfPresent(scheduledAt, forKey: .scheduledAt)
+        try container.encodeIfPresent(cronExpression, forKey: .cronExpression)
         try container.encode(script, forKey: .scriptConfiguration)
         try container.encode(runLocation, forKey: .runLocation)
         try container.encode(workingDirectory, forKey: .workingDirectory)

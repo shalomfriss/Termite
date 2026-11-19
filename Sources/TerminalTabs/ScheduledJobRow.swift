@@ -43,11 +43,14 @@ struct ScheduledJobRow: View {
                     systemImage: "play.fill",
                     action: runNow
                 )
+                .buttonStyle(.airSecondary)
                 .help("Run this job in a new shell")
                 Button("Edit", systemImage: "pencil", action: edit)
+                    .buttonStyle(.airSecondary)
                     .help("Edit this job or workflow")
                 Spacer()
                 Button("Delete", systemImage: "trash", role: .destructive, action: delete)
+                    .buttonStyle(.airDestructive)
                     .help("Delete this job or workflow")
             }
             .controlSize(.small)
@@ -58,7 +61,8 @@ struct ScheduledJobRow: View {
     }
 
     private var statusTitle: String {
-        switch job.status {
+        if job.timing == .cron, job.status == .scheduled { return "Cron Job" }
+        return switch job.status {
         case .scheduled: "Scheduled"
         case .saved: "Saved Workflow"
         case .launching: "Launching"
@@ -76,6 +80,16 @@ struct ScheduledJobRow: View {
             } else {
                 Text("Saved workflow · Runs manually")
                     .foregroundStyle(.secondary)
+            }
+        } else if job.timing == .cron {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Cron job · \(job.cronExpression ?? "")")
+                    .font(.callout.monospaced())
+                    .foregroundStyle(TerminalTheme.cyanMuted)
+                if let scheduledAt = job.scheduledAt {
+                    Text("Next run \(scheduledAt, format: .dateTime.weekday().month().day().hour().minute())")
+                        .foregroundStyle(.secondary)
+                }
             }
         } else if let scheduledAt = job.scheduledAt {
             Text(scheduledAt, format: .dateTime.weekday().month().day().hour().minute())

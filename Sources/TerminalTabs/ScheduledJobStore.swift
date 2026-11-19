@@ -21,8 +21,14 @@ final class ScheduledJobStore: ObservableObject {
 
         var recoveredInterruptedJob = false
         for index in jobs.indices where jobs[index].status == .launching {
-            jobs[index].status = .failed
-            jobs[index].failureMessage = "The app closed before the shell accepted this script."
+            if jobs[index].timing == .cron {
+                jobs[index].status = .scheduled
+                jobs[index].scheduledAt = nextCronDate(for: jobs[index], after: .now)
+                jobs[index].failureMessage = "The previous run was interrupted when Air closed."
+            } else {
+                jobs[index].status = .failed
+                jobs[index].failureMessage = "The app closed before the shell accepted this script."
+            }
             recoveredInterruptedJob = true
         }
         sortJobs()
@@ -30,7 +36,7 @@ final class ScheduledJobStore: ObservableObject {
     }
 
     var scheduledCount: Int {
-        jobs.count { $0.timing == .scheduled && $0.status == .scheduled }
+        jobs.count { $0.timing != .manual && $0.status == .scheduled }
     }
 
     func setExecutor(_ executor: @escaping Executor) {
@@ -41,6 +47,7 @@ final class ScheduledJobStore: ObservableObject {
     func schedule(
         timing: ScheduledJobTiming = .scheduled,
         at scheduledAt: Date?,
+        cronExpression: String? = nil,
         script: ScheduledJobScript,
         runLocation: ScheduledJobRunLocation = .selectedFolder,
         workingDirectory: String
@@ -49,16 +56,21 @@ final class ScheduledJobStore: ObservableObject {
         if timing == .scheduled, scheduledAt == nil {
             throw ScheduledJobError.missingScheduleDate
         }
+        let cron = try validatedCronExpression(cronExpression, for: timing)
+        let nextRun = timing == .cron
+            ? try CronSchedule(cron ?? "").nextDate(after: .now)
+            : scheduledAt
         let cleanedDirectory = workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
         let job = ScheduledJob(
             timing: timing,
-            scheduledAt: scheduledAt,
+            scheduledAt: nextRun,
+            cronExpression: cron,
             script: script,
             runLocation: runLocation,
             workingDirectory: cleanedDirectory.isEmpty
                 ? FileManager.default.currentDirectoryPath
                 : cleanedDirectory,
-            status: timing == .scheduled ? .scheduled : .saved
+            status: timing == .manual ? .saved : .scheduled
         )
         jobs.append(job)
         sortAndPersist()
@@ -82,6 +94,7 @@ final class ScheduledJobStore: ObservableObject {
         _ id: UUID,
         timing: ScheduledJobTiming = .scheduled,
         scheduledAt: Date?,
+        cronExpression: String? = nil,
         script: ScheduledJobScript,
         runLocation: ScheduledJobRunLocation = .selectedFolder,
         workingDirectory: String
@@ -91,15 +104,19 @@ final class ScheduledJobStore: ObservableObject {
         if timing == .scheduled, scheduledAt == nil {
             throw ScheduledJobError.missingScheduleDate
         }
+        let cron = try validatedCronExpression(cronExpression, for: timing)
         let cleanedDirectory = workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
         jobs[index].timing = timing
-        jobs[index].scheduledAt = timing == .scheduled ? scheduledAt : nil
+        jobs[index].scheduledAt = timing == .cron
+            ? try CronSchedule(cron ?? "").nextDate(after: .now)
+            : (timing == .scheduled ? scheduledAt : nil)
+        jobs[index].cronExpression = cron
         jobs[index].script = script
         jobs[index].runLocation = runLocation
         jobs[index].workingDirectory = cleanedDirectory.isEmpty
             ? FileManager.default.currentDirectoryPath
             : cleanedDirectory
-        jobs[index].status = timing == .scheduled ? .scheduled : .saved
+        jobs[index].status = timing == .manual ? .saved : .scheduled
         jobs[index].launchedAt = nil
         jobs[index].failureMessage = nil
         sortAndPersist()
@@ -131,7 +148,7 @@ final class ScheduledJobStore: ObservableObject {
     func launchDueJobs(at date: Date = .now) {
         guard let executor else { return }
         let dueIDs = jobs.filter {
-            $0.timing == .scheduled
+            $0.timing != .manual
                 && $0.status == .scheduled
                 && ($0.scheduledAt.map { $0 <= date } ?? false)
         }.map(\.id)
@@ -149,7 +166,12 @@ final class ScheduledJobStore: ObservableObject {
 
     func markLaunched(_ id: UUID, at date: Date = .now) {
         guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
-        jobs[index].status = jobs[index].timing == .manual ? .saved : .launched
+        if jobs[index].timing == .cron {
+            jobs[index].status = .scheduled
+            jobs[index].scheduledAt = nextCronDate(for: jobs[index], after: date)
+        } else {
+            jobs[index].status = jobs[index].timing == .manual ? .saved : .launched
+        }
         jobs[index].launchedAt = date
         jobs[index].failureMessage = nil
         persist()
@@ -157,7 +179,12 @@ final class ScheduledJobStore: ObservableObject {
 
     func markFailed(_ id: UUID, message: String) {
         guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
-        jobs[index].status = .failed
+        if jobs[index].timing == .cron {
+            jobs[index].status = .scheduled
+            jobs[index].scheduledAt = nextCronDate(for: jobs[index], after: .now)
+        } else {
+            jobs[index].status = .failed
+        }
         jobs[index].failureMessage = message
         persist()
     }
@@ -181,9 +208,30 @@ final class ScheduledJobStore: ObservableObject {
 
     nonisolated private static func sortRank(for job: ScheduledJob) -> Int {
         if job.timing == .scheduled, job.status == .scheduled { return 0 }
-        if job.timing == .manual { return 1 }
-        if job.status == .launching { return 2 }
-        return 3
+        if job.timing == .cron, job.status == .scheduled { return 1 }
+        if job.timing == .manual { return 2 }
+        if job.status == .launching { return 3 }
+        return 4
+    }
+
+    private func validatedCronExpression(
+        _ expression: String?,
+        for timing: ScheduledJobTiming
+    ) throws -> String? {
+        guard timing == .cron else { return nil }
+        let schedule = try CronSchedule(expression ?? "")
+        guard schedule.nextDate(after: .now) != nil else {
+            throw CronSchedule.ValidationError.invalidExpression(
+                "no matching date was found in the next five years."
+            )
+        }
+        return schedule.expression
+    }
+
+    private func nextCronDate(for job: ScheduledJob, after date: Date) -> Date? {
+        guard let expression = job.cronExpression,
+              let schedule = try? CronSchedule(expression) else { return nil }
+        return schedule.nextDate(after: date)
     }
 
     private func persist() {

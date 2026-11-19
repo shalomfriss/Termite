@@ -4,6 +4,7 @@ struct ScheduledJobEditor: View {
     @Environment(\.dismiss) private var dismiss
     @State private var timing: ScheduledJobTiming
     @State private var scheduledAt: Date
+    @State private var cronExpression: String
     @State private var scriptSource: ScheduledJobScriptSource
     @State private var scriptLanguage: ScheduledScriptLanguage
     @State private var pastedScript: String
@@ -16,6 +17,7 @@ struct ScheduledJobEditor: View {
     let save: (
         ScheduledJobTiming,
         Date?,
+        String?,
         ScheduledJobScript,
         ScheduledJobRunLocation,
         String
@@ -24,9 +26,11 @@ struct ScheduledJobEditor: View {
     init(
         job: ScheduledJob?,
         defaultWorkingDirectory: String,
+        initialTiming: ScheduledJobTiming = .scheduled,
         save: @escaping (
             ScheduledJobTiming,
             Date?,
+            String?,
             ScheduledJobScript,
             ScheduledJobRunLocation,
             String
@@ -35,8 +39,9 @@ struct ScheduledJobEditor: View {
         let script = job?.script ?? .pasted("", language: .bash)
         isEditing = job != nil
         self.save = save
-        _timing = State(initialValue: job?.timing ?? .scheduled)
+        _timing = State(initialValue: job?.timing ?? initialTiming)
         _scheduledAt = State(initialValue: job?.scheduledAt ?? .now.addingTimeInterval(300))
+        _cronExpression = State(initialValue: job?.cronExpression ?? "0 9 * * 1-5")
         _scriptSource = State(initialValue: script.source)
         _scriptLanguage = State(initialValue: script.language)
         _pastedScript = State(initialValue: script.pastedText)
@@ -71,6 +76,20 @@ struct ScheduledJobEditor: View {
                         selection: $scheduledAt,
                         displayedComponents: [.date, .hourAndMinute]
                     )
+                } else if timing == .cron {
+                    LabeledContent("Cron schedule") {
+                        TextField("0 9 * * 1-5", text: $cronExpression)
+                            .font(.body.monospaced())
+                            .textFieldStyle(.roundedBorder)
+                            .frame(minWidth: 230)
+                            .help("Five fields: minute, hour, day of month, month, day of week")
+                    }
+                    Label(
+                        "Five fields: minute, hour, day of month, month, day of week. Example: */15 * * * *",
+                        systemImage: "repeat"
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
                 } else {
                     Label(
                         "This workflow is saved without a time and runs only when you choose Run Now.",
@@ -109,9 +128,10 @@ struct ScheduledJobEditor: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Cancel", role: .cancel, action: dismiss.callAsFunction)
+                    .buttonStyle(.airSecondary)
                     .help("Discard changes and close")
                 Button(isEditing ? "Save" : primaryActionTitle, action: saveJob)
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.airPrimary)
                     .disabled(!canSave)
                     .help(isEditing ? "Save changes" : primaryActionHelp)
             }
@@ -135,7 +155,9 @@ struct ScheduledJobEditor: View {
     }
 
     private var canSave: Bool {
-        switch scriptSource {
+        if timing == .cron,
+           (try? CronSchedule(cronExpression)) == nil { return false }
+        return switch scriptSource {
         case .pasted:
             !pastedScript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         case .file:
@@ -144,17 +166,27 @@ struct ScheduledJobEditor: View {
     }
 
     private var primaryActionTitle: String {
-        timing == .scheduled ? "Schedule" : "Save Workflow"
+        switch timing {
+        case .scheduled: "Schedule"
+        case .cron: "Create Cron Job"
+        case .manual: "Save Workflow"
+        }
     }
 
     private var primaryActionHelp: String {
-        timing == .scheduled ? "Schedule this job" : "Save this workflow without a time"
+        switch timing {
+        case .scheduled: "Schedule this job"
+        case .cron: "Create this recurring cron job"
+        case .manual: "Save this workflow without a time"
+        }
     }
 
     private var footerMessage: String {
-        timing == .scheduled
-            ? "Pending jobs launch when the app is next open."
-            : "Saved workflows run only when you start them."
+        switch timing {
+        case .scheduled: "Pending jobs launch when the app is next open."
+        case .cron: "Cron jobs run while Air is open and catch up when Air is reopened."
+        case .manual: "Saved workflows run only when you start them."
+        }
     }
 
     private func saveJob() {
@@ -173,6 +205,7 @@ struct ScheduledJobEditor: View {
             try save(
                 timing,
                 timing == .scheduled ? scheduledAt : nil,
+                timing == .cron ? cronExpression : nil,
                 script,
                 runLocation,
                 workingDirectory

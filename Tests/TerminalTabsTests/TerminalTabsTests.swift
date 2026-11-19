@@ -1424,6 +1424,66 @@ final class AirTests: XCTestCase {
         XCTAssertEqual(restored.jobs.first?.launchedAt, runDate)
     }
 
+    func testCronScheduleParsesRangesStepsAndWeekdays() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let schedule = try CronSchedule("*/15 9-17 * * 1-5")
+        let monday = try XCTUnwrap(calendar.date(from: DateComponents(
+            year: 2026,
+            month: 11,
+            day: 16,
+            hour: 9,
+            minute: 30
+        )))
+        let saturday = try XCTUnwrap(calendar.date(from: DateComponents(
+            year: 2026,
+            month: 11,
+            day: 21,
+            hour: 9,
+            minute: 30
+        )))
+
+        XCTAssertTrue(schedule.matches(monday, calendar: calendar))
+        XCTAssertFalse(schedule.matches(saturday, calendar: calendar))
+        XCTAssertThrowsError(try CronSchedule("61 * * * *"))
+        XCTAssertThrowsError(try CronSchedule("* * *"))
+    }
+
+    @MainActor
+    func testCronJobRepeatsAndIsPersistedWithCronLabel() throws {
+        let suiteName = "AirTests.CronJobs.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = ScheduledJobStore(userDefaults: defaults, storageKey: "jobs")
+        var launchedJobs: [ScheduledJob] = []
+        store.setExecutor { launchedJobs.append($0) }
+        let job = try store.schedule(
+            timing: .cron,
+            at: nil,
+            cronExpression: "*/5 * * * *",
+            script: .pasted("printf cron", language: .bash),
+            workingDirectory: FileManager.default.currentDirectoryPath
+        )
+        let firstRun = try XCTUnwrap(job.scheduledAt)
+
+        store.launchDueJobs(at: firstRun)
+        store.launchDueJobs(at: firstRun.addingTimeInterval(30))
+        XCTAssertEqual(launchedJobs.map(\.id), [job.id])
+
+        store.markLaunched(job.id, at: firstRun)
+        let secondRun = try XCTUnwrap(store.jobs.first?.scheduledAt)
+        XCTAssertGreaterThan(secondRun, firstRun)
+        XCTAssertEqual(store.jobs.first?.status, .scheduled)
+        XCTAssertEqual(store.jobs.first?.timing.title, "Cron Job")
+
+        store.launchDueJobs(at: secondRun)
+        XCTAssertEqual(launchedJobs.map(\.id), [job.id, job.id])
+
+        let restored = ScheduledJobStore(userDefaults: defaults, storageKey: "jobs")
+        XCTAssertEqual(restored.jobs.first?.cronExpression, "*/5 * * * *")
+        XCTAssertEqual(restored.jobs.first?.timing, .cron)
+    }
+
     @MainActor
     func testSavedWorkflowHasNoTimeAndRunsOnlyOnDemand() throws {
         let suiteName = "AirTests.SavedWorkflow.\(UUID().uuidString)"
