@@ -7,11 +7,23 @@ struct TerminalSurface: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            TerminalCanvas(
-                session: session,
-                openDirectoryInNewTab: openDirectoryInNewTab
-            )
-            .id(session.id)
+            HStack(spacing: 0) {
+                TerminalCanvas(
+                    session: session,
+                    openDirectoryInNewTab: openDirectoryInNewTab
+                )
+                .id(session.id)
+
+                if store.graphicalMode, let item = session.graphicalPreviewItem {
+                    Divider()
+
+                    GraphicalFilePreviewPane(
+                        item: item,
+                        close: { session.setGraphicalPreviewItem(nil) }
+                    )
+                    .frame(minWidth: 260, idealWidth: 340, maxWidth: 420)
+                }
+            }
 
             statusBar
         }

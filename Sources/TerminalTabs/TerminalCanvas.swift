@@ -32,7 +32,7 @@ final class TerminalNSView: NSView,
     NSDraggingSource {
     static let blockContentPadding: CGFloat = 20
     static let blockSpacing: CGFloat = 10
-    static let blockTopInset: CGFloat = 20
+    static let blockTopInset: CGFloat = 10
     static let blockCornerRadius: CGFloat = 4
     private static let blockOuterMargin: CGFloat = 8
     private static let terminalContentInset: CGFloat = 10
@@ -222,6 +222,7 @@ final class TerminalNSView: NSView,
             textSelectionAnchor = nil
             textSelection = nil
             selectedGraphicalPlacementID = nil
+            session.setGraphicalPreviewItem(nil)
             if target.isEnabled { performBlockAction(target) }
             return
         }
@@ -232,6 +233,7 @@ final class TerminalNSView: NSView,
             textSelection = nil
             selectedBlockHistoryRows.removeAll()
             selectedGraphicalPlacementID = target.placementID
+            session.setGraphicalPreviewItem(item)
             graphicalDragCandidate = (target.placementID, point)
             needsDisplay = true
             if event.clickCount >= 2 {
@@ -245,6 +247,7 @@ final class TerminalNSView: NSView,
             textSelection = nil
             textSelectionAnchor = terminalPosition(at: point)
             selectedGraphicalPlacementID = nil
+            session.setGraphicalPreviewItem(nil)
             return
         }
         textSelection = nil
@@ -252,6 +255,7 @@ final class TerminalNSView: NSView,
         linkActivationCandidate = nil
         textSelectionAnchor = terminalPosition(at: point)
         selectedGraphicalPlacementID = nil
+        session.setGraphicalPreviewItem(nil)
         selectBlock(atVisualY: point.y, modifiers: event.modifierFlags)
     }
 
@@ -293,6 +297,7 @@ final class TerminalNSView: NSView,
         textSelection = TerminalTextSelection(anchor: anchor, extent: extent)
         selectedBlockHistoryRows.removeAll()
         selectedGraphicalPlacementID = nil
+        session.setGraphicalPreviewItem(nil)
         needsDisplay = true
     }
 
@@ -551,6 +556,7 @@ final class TerminalNSView: NSView,
            let item = session.graphicalItem(for: target.placementID) {
             selectedBlockHistoryRows.removeAll()
             selectedGraphicalPlacementID = target.placementID
+            session.setGraphicalPreviewItem(item)
             needsDisplay = true
             contextBlock = nil
             return graphicalItemMenu(for: item)

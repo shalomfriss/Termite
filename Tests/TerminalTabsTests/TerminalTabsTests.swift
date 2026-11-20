@@ -549,6 +549,22 @@ final class AirTests: XCTestCase {
                 Int($0.pointee.image_count)
             } ?? 0
         }
+        let staleViewMarker = "stale-graphical-folder-view"
+        let staleViewOutput = Data(
+            "\u{1B}[H\(staleViewMarker)\u{1B}[5;1H".utf8
+        )
+        let handle = try XCTUnwrap(session.handle)
+        staleViewOutput.withUnsafeBytes { bytes in
+            _ = gt_session_feed_output(
+                handle,
+                bytes.bindMemory(to: UInt8.self).baseAddress,
+                bytes.count
+            )
+        }
+        XCTAssertTrue(
+            visibleFrameText(try XCTUnwrap(gt_session_frame(handle)).pointee)
+                .contains(staleViewMarker)
+        )
         let target = FileManager.default.currentDirectoryPath + "/Scripts"
         session.activateGraphicalItem(
             GraphicalFileItem(path: target, name: "Scripts", kind: .directory)
@@ -584,6 +600,10 @@ final class AirTests: XCTestCase {
             session.poll()
         }
         let frame = try XCTUnwrap(gt_session_frame(try XCTUnwrap(session.handle))).pointee
+        XCTAssertFalse(
+            visibleFrameText(frame).contains(staleViewMarker),
+            "Opening a folder should clear the previous graphical view"
+        )
         let visibleRows = (0..<Int(frame.rows)).map {
             rowText(frame: frame, row: $0).trimmingCharacters(in: .whitespacesAndNewlines)
         }.filter {
@@ -1090,11 +1110,11 @@ final class AirTests: XCTestCase {
             topInset: TerminalNSView.blockTopInset
         )
 
-        XCTAssertEqual(layout.blockFrames[0].minY, 20)
+        XCTAssertEqual(layout.blockFrames[0].minY, 10)
         XCTAssertEqual(layout.blockFrames[0].height, 100)
         XCTAssertEqual(layout.blockFrames[1].minY - layout.blockFrames[0].maxY, 10)
-        XCTAssertEqual(layout.rowOffsets[0], 40)
-        XCTAssertEqual(layout.rowOffsets[3], 90)
+        XCTAssertEqual(layout.rowOffsets[0], 30)
+        XCTAssertEqual(layout.rowOffsets[3], 80)
         XCTAssertEqual(TerminalNSView.blockCornerRadius, 4)
         XCTAssertEqual(first.minX, 8)
         XCTAssertEqual(first.maxX, 392)
@@ -1102,6 +1122,38 @@ final class AirTests: XCTestCase {
             TerminalNSView.blockContentLeadingOffset - first.minX,
             TerminalNSView.blockContentPadding
         )
+    }
+
+    @MainActor
+    func testGraphicalFileSelectionControlsPreview() throws {
+        let root = FileManager.default.temporaryDirectory.appending(
+            path: "air-graphical-preview-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        let file = root.appending(path: "preview.txt")
+        let folder = root.appending(path: "Folder", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("Preview contents".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let session = TerminalSession(cols: 40, rows: 10, workingDirectory: root.path)
+        session.graphicalMode = true
+        let fileItem = GraphicalFileItem(path: file.path, name: file.lastPathComponent, kind: .file)
+        let folderItem = GraphicalFileItem(
+            path: folder.path,
+            name: folder.lastPathComponent,
+            kind: .directory
+        )
+
+        session.setGraphicalPreviewItem(fileItem)
+        XCTAssertEqual(session.graphicalPreviewItem, fileItem)
+
+        session.setGraphicalPreviewItem(folderItem)
+        XCTAssertNil(session.graphicalPreviewItem)
+
+        session.setGraphicalPreviewItem(fileItem)
+        session.setGraphicalMode(false)
+        XCTAssertNil(session.graphicalPreviewItem)
     }
 
     func testBlankTerminalRowsDoNotIncreaseBlockSpacing() {

@@ -114,6 +114,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var isFocusReporting = false
     @Published private(set) var isCursorAtPrompt = false
     @Published private(set) var isBracketedPasteEnabled = false
+    @Published private(set) var graphicalPreviewItem: GraphicalFileItem?
     @Published var graphicalOperationIssue: GraphicalOperationIssue?
     @Published var tabAccentColor: NSColor?
     @Published private(set) var gitBranch: String? = nil
@@ -516,6 +517,19 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
     }
 
+    func setGraphicalPreviewItem(_ item: GraphicalFileItem?) {
+        let previewItem: GraphicalFileItem?
+        if graphicalMode,
+           let item,
+           !graphicalItemIsDirectory(item) {
+            previewItem = item
+        } else {
+            previewItem = nil
+        }
+        guard graphicalPreviewItem != previewItem else { return }
+        graphicalPreviewItem = previewItem
+    }
+
     func listGraphicalDirectory(_ item: GraphicalFileItem) {
         guard graphicalMode, graphicalItemIsDirectory(item) else { return }
         sendUserInput(Data("ls -- \(Self.shellQuoted(item.path))".utf8))
@@ -797,6 +811,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             graphicalNavigationTask = nil
             isGraphicalNavigationInProgress = false
             currentGraphicalListing = nil
+            graphicalPreviewItem = nil
             return
         }
         graphicalStartupTask?.cancel()
@@ -883,6 +898,7 @@ final class TerminalSession: ObservableObject, Identifiable {
               !isGraphicalNavigationInProgress,
               let handle,
               let prompt = capturedPrompt ?? visiblePromptText(handle: handle) else { return false }
+        setGraphicalPreviewItem(nil)
         // Preserve the shell's existing idle prompt instead of submitting a
         // blank command, which would make the shell emit a second prompt.
         write(Data([0x15]))
@@ -912,6 +928,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func requestGraphicalNavigation(to rawTarget: String) {
         guard graphicalMode else { return }
         let targetURL = URL(fileURLWithPath: rawTarget, isDirectory: true).standardizedFileURL
+        graphicalPreviewItem = nil
         graphicalStartupTask?.cancel()
         graphicalStartupTask = nil
         graphicalNavigationGeneration &+= 1
@@ -970,6 +987,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         try await Task.sleep(for: .milliseconds(10))
         try Task.checkCancellation()
         if gt_session_poll(handle) { refreshFrame() }
+        // Replace the current folder view before asking the shell to enter the
+        // next directory. The command and its prompt remain concealed below.
+        feedTerminalOutput("\r\u{1B}[2J\u{1B}[H", handle: handle)
+        feedTerminalOutput(Self.graphicalNavigationConcealSequence, handle: handle)
         write(Data(("cd -- \(Self.shellQuoted(target))\r").utf8))
         var reachedTarget = false
         for _ in 0..<200 {
