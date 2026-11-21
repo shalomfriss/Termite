@@ -521,7 +521,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         let previewItem: GraphicalFileItem?
         if graphicalMode,
            let item,
-           !graphicalItemIsDirectory(item) {
+           graphicalItemCanDisplayAsText(item) {
             previewItem = item
         } else {
             previewItem = nil
@@ -558,12 +558,12 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard FileManager.default.fileExists(atPath: url.path) else { return false }
 
         if let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType {
-            if contentType.conforms(to: .text) { return true }
             if contentType.conforms(to: .image)
                 || contentType.conforms(to: .audio)
                 || contentType.conforms(to: .movie)
                 || contentType.conforms(to: .archive)
-                || contentType.conforms(to: .executable) {
+                || contentType.conforms(to: .executable)
+                || contentType.conforms(to: .pdf) {
                 return false
             }
         }
@@ -572,6 +572,12 @@ final class TerminalSession: ObservableObject, Identifiable {
         defer { try? handle.close() }
         guard let sample = try? handle.read(upToCount: 8_192) else { return false }
         guard !sample.isEmpty else { return true }
+        if sample.starts(with: [0xFF, 0xFE]) {
+            return String(data: sample, encoding: .utf16LittleEndian) != nil
+        }
+        if sample.starts(with: [0xFE, 0xFF]) {
+            return String(data: sample, encoding: .utf16BigEndian) != nil
+        }
         if sample.contains(0) { return false }
         return String(data: sample, encoding: .utf8) != nil
     }

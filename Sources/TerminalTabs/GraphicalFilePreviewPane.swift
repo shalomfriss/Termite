@@ -7,10 +7,22 @@ struct GraphicalFilePreviewPane: View {
     @State private var isAvailable = false
     @State private var errorMessage: String?
 
+    private var fileURL: URL {
+        URL(fileURLWithPath: item.path)
+    }
+
+    private var isCodeFile: Bool {
+        CodePreviewFileDetector.isCodeFile(fileURL)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Image(systemName: "doc.fill")
+                Image(
+                    systemName: isCodeFile
+                        ? "chevron.left.forwardslash.chevron.right"
+                        : "doc.text.fill"
+                )
                     .foregroundStyle(TerminalTheme.cyan)
                     .accessibilityHidden(true)
 
@@ -46,7 +58,7 @@ struct GraphicalFilePreviewPane: View {
                         description: Text(errorMessage)
                     )
                 } else if isAvailable {
-                    QuickLookPreview(url: URL(fileURLWithPath: item.path))
+                    TextFilePreview(url: fileURL, highlightsSyntax: isCodeFile)
                         .id(item.path)
                 } else {
                     ProgressView("Loading preview…")
@@ -65,7 +77,7 @@ struct GraphicalFilePreviewPane: View {
         errorMessage = nil
         do {
             try await TerminalSession.ensureUbiquitousItemIsAvailable(
-                at: URL(fileURLWithPath: item.path)
+                at: fileURL
             )
             try Task.checkCancellation()
             isAvailable = true

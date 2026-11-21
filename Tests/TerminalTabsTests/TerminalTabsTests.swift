@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 import GhosttyBridge
 @testable import Air
@@ -296,6 +297,63 @@ final class AirTests: XCTestCase {
             ),
             78
         )
+    }
+
+    func testGraphicalPreviewWidthStaysWithinUsableBounds() {
+        XCTAssertEqual(
+            GraphicalPreviewSizing.clampedWidth(100, containerWidth: 1_000),
+            240
+        )
+        XCTAssertEqual(
+            GraphicalPreviewSizing.clampedWidth(900, containerWidth: 1_000),
+            720
+        )
+        XCTAssertEqual(
+            GraphicalPreviewSizing.clampedWidth(360, containerWidth: 1_000),
+            360
+        )
+        XCTAssertEqual(
+            GraphicalPreviewSizing.clampedWidth(360, containerWidth: 300),
+            180
+        )
+    }
+
+    func testCodePreviewFileDetectionRecognizesSourceAndConfigFiles() {
+        XCTAssertTrue(CodePreviewFileDetector.isCodeFile(URL(fileURLWithPath: "/tmp/App.swift")))
+        XCTAssertTrue(CodePreviewFileDetector.isCodeFile(URL(fileURLWithPath: "/tmp/Dockerfile")))
+        XCTAssertTrue(CodePreviewFileDetector.isCodeFile(URL(fileURLWithPath: "/tmp/config.json")))
+        XCTAssertFalse(CodePreviewFileDetector.isCodeFile(URL(fileURLWithPath: "/tmp/notes.txt")))
+    }
+
+    @MainActor
+    func testCodeSyntaxHighlightingSeparatesKeywordsStringsAndComments() throws {
+        let source = "let value = \"let\" // let"
+        let highlighted = CodeSyntaxHighlighter.attributedString(
+            for: source,
+            highlightsSyntax: true
+        )
+        let string = source as NSString
+        let keywordIndex = string.range(of: "let").location
+        let identifierIndex = string.range(of: "value").location
+        let quotedKeywordIndex = string.range(of: "\"let\"").location + 1
+        let commentIndex = string.range(of: "//").location
+
+        let keywordColor = try XCTUnwrap(
+            highlighted.attribute(.foregroundColor, at: keywordIndex, effectiveRange: nil) as? NSColor
+        )
+        let baseColor = try XCTUnwrap(
+            highlighted.attribute(.foregroundColor, at: identifierIndex, effectiveRange: nil) as? NSColor
+        )
+        let stringColor = try XCTUnwrap(
+            highlighted.attribute(.foregroundColor, at: quotedKeywordIndex, effectiveRange: nil) as? NSColor
+        )
+        let commentColor = try XCTUnwrap(
+            highlighted.attribute(.foregroundColor, at: commentIndex, effectiveRange: nil) as? NSColor
+        )
+
+        XCTAssertNotEqual(keywordColor, baseColor)
+        XCTAssertNotEqual(stringColor, keywordColor)
+        XCTAssertNotEqual(commentColor, stringColor)
     }
 
     func testActivePromptReceivesBlockBeforeTypingBegins() {
@@ -1131,9 +1189,15 @@ final class AirTests: XCTestCase {
             directoryHint: .isDirectory
         )
         let file = root.appending(path: "preview.txt")
+        let unknownTextFile = root.appending(path: "preview.unknown-air-text")
+        let binaryFile = root.appending(path: "preview.bin")
+        let disguisedBinaryFile = root.appending(path: "binary.txt")
         let folder = root.appending(path: "Folder", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         try Data("Preview contents".utf8).write(to: file)
+        try Data("Unknown text contents".utf8).write(to: unknownTextFile)
+        try Data([0x00, 0x01, 0x02, 0xFF]).write(to: binaryFile)
+        try Data([0x41, 0x00, 0xFF, 0x00]).write(to: disguisedBinaryFile)
         defer { try? FileManager.default.removeItem(at: root) }
 
         let session = TerminalSession(cols: 40, rows: 10, workingDirectory: root.path)
@@ -1144,11 +1208,35 @@ final class AirTests: XCTestCase {
             name: folder.lastPathComponent,
             kind: .directory
         )
+        let unknownTextItem = GraphicalFileItem(
+            path: unknownTextFile.path,
+            name: unknownTextFile.lastPathComponent,
+            kind: .file
+        )
+        let binaryItem = GraphicalFileItem(
+            path: binaryFile.path,
+            name: binaryFile.lastPathComponent,
+            kind: .file
+        )
+        let disguisedBinaryItem = GraphicalFileItem(
+            path: disguisedBinaryFile.path,
+            name: disguisedBinaryFile.lastPathComponent,
+            kind: .file
+        )
 
         session.setGraphicalPreviewItem(fileItem)
         XCTAssertEqual(session.graphicalPreviewItem, fileItem)
 
         session.setGraphicalPreviewItem(folderItem)
+        XCTAssertNil(session.graphicalPreviewItem)
+
+        session.setGraphicalPreviewItem(unknownTextItem)
+        XCTAssertEqual(session.graphicalPreviewItem, unknownTextItem)
+
+        session.setGraphicalPreviewItem(binaryItem)
+        XCTAssertNil(session.graphicalPreviewItem)
+
+        session.setGraphicalPreviewItem(disguisedBinaryItem)
         XCTAssertNil(session.graphicalPreviewItem)
 
         session.setGraphicalPreviewItem(fileItem)

@@ -5,23 +5,38 @@ struct TerminalSurface: View {
     @ObservedObject var store: TerminalStore
     let openDirectoryInNewTab: (URL) -> Void
 
+    @State private var graphicalPreviewWidth = GraphicalPreviewSizing.defaultWidth
+
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 0) {
-                TerminalCanvas(
-                    session: session,
-                    openDirectoryInNewTab: openDirectoryInNewTab
-                )
-                .id(session.id)
-
-                if store.graphicalMode, let item = session.graphicalPreviewItem {
-                    Divider()
-
-                    GraphicalFilePreviewPane(
-                        item: item,
-                        close: { session.setGraphicalPreviewItem(nil) }
+            GeometryReader { geometry in
+                ZStack(alignment: .trailing) {
+                    TerminalCanvas(
+                        session: session,
+                        openDirectoryInNewTab: openDirectoryInNewTab
                     )
-                    .frame(minWidth: 260, idealWidth: 340, maxWidth: 420)
+                    .id(session.id)
+
+                    if store.graphicalMode, let item = session.graphicalPreviewItem {
+                        HStack(spacing: 0) {
+                            GraphicalPreviewResizeHandle(
+                                width: $graphicalPreviewWidth,
+                                containerWidth: geometry.size.width
+                            )
+
+                            GraphicalFilePreviewPane(
+                                item: item,
+                                close: { session.setGraphicalPreviewItem(nil) }
+                            )
+                            .frame(
+                                width: GraphicalPreviewSizing.clampedWidth(
+                                    graphicalPreviewWidth,
+                                    containerWidth: geometry.size.width
+                                )
+                            )
+                        }
+                        .shadow(color: .black.opacity(0.32), radius: 16, x: -6)
+                    }
                 }
             }
 
