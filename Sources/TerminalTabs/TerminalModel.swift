@@ -115,6 +115,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var isCursorAtPrompt = false
     @Published private(set) var isBracketedPasteEnabled = false
     @Published private(set) var graphicalPreviewItem: GraphicalFileItem?
+    @Published private(set) var terminalBlockBookmarks: [TerminalBlockBookmark] = []
     @Published var graphicalOperationIssue: GraphicalOperationIssue?
     @Published var tabAccentColor: NSColor?
     @Published private(set) var gitBranch: String? = nil
@@ -133,6 +134,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private(set) var commandBlocks: [TerminalCommandBlock] = []
     private var collapsedTerminalBlockIDs: Set<TerminalBlockID> = []
     private var bookmarkedTerminalBlockIDs: Set<TerminalBlockID> = []
+    private var pendingTerminalBlockNavigation: TerminalBlockID?
     private var commandLine = CommandLineTracker()
     private var isMarkingInput = false
     private var terminalColumns = 100
@@ -2131,11 +2133,58 @@ final class TerminalSession: ObservableObject, Identifiable {
         bookmarkedTerminalBlockIDs.contains(id)
     }
 
-    func toggleTerminalBlockBookmarked(_ id: TerminalBlockID) {
+    func toggleTerminalBlockBookmarked(
+        _ id: TerminalBlockID,
+        command: String = "",
+        output: String = "",
+        workingDirectory: String? = nil
+    ) {
         if !bookmarkedTerminalBlockIDs.insert(id).inserted {
             bookmarkedTerminalBlockIDs.remove(id)
+            terminalBlockBookmarks.removeAll { $0.id == id }
+        } else {
+            terminalBlockBookmarks.insert(
+                TerminalBlockBookmark(
+                    id: id,
+                    command: command,
+                    output: output,
+                    workingDirectory: workingDirectory ?? self.workingDirectory
+                ),
+                at: 0
+            )
         }
         revision &+= 1
+    }
+
+    func revealTerminalBlock(_ bookmark: TerminalBlockBookmark) {
+        guard bookmark.id.sessionID == id else { return }
+        pendingTerminalBlockNavigation = bookmark.id
+        guard let handle,
+              let frame = gt_session_frame(handle) else {
+            revision &+= 1
+            return
+        }
+        let rows = Self.terminalBlockScrollDelta(
+            from: frame.pointee.scroll_offset,
+            to: bookmark.id.historyRow
+        )
+        if rows != 0 {
+            _ = gt_session_scroll(handle, rows)
+        }
+        revision &+= 1
+        refreshFrame()
+    }
+
+    func takePendingTerminalBlockNavigation() -> TerminalBlockID? {
+        defer { pendingTerminalBlockNavigation = nil }
+        return pendingTerminalBlockNavigation
+    }
+
+    nonisolated static func terminalBlockScrollDelta(from current: UInt64, to target: UInt64) -> Int {
+        if target >= current {
+            return Int(clamping: target - current)
+        }
+        return -Int(clamping: current - target)
     }
 
     var canRunBlockCommand: Bool {

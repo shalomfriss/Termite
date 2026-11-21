@@ -76,6 +76,8 @@ struct TerminalSurface: View {
 
             Spacer(minLength: 12)
 
+            TerminalBookmarksMenu(session: session)
+
             if session.gitBranch != nil {
                 GitBranchMenu(session: session)
             }

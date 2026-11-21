@@ -101,12 +101,89 @@ final class AirTests: XCTestCase {
         let first = TerminalBlockID(sessionID: session.id, historyRow: 2)
         let second = TerminalBlockID(sessionID: session.id, historyRow: 8)
 
-        session.toggleTerminalBlockBookmarked(first)
+        session.toggleTerminalBlockBookmarked(
+            first,
+            command: "swift   test\n--parallel",
+            output: "85 tests passed",
+            workingDirectory: "/tmp/project"
+        )
         XCTAssertTrue(session.isTerminalBlockBookmarked(first))
         XCTAssertFalse(session.isTerminalBlockBookmarked(second))
+        XCTAssertEqual(session.terminalBlockBookmarks.count, 1)
+        XCTAssertEqual(session.terminalBlockBookmarks.first?.title, "swift test --parallel")
+        XCTAssertEqual(session.terminalBlockBookmarks.first?.workingDirectory, "/tmp/project")
+
+        let bookmark = session.terminalBlockBookmarks[0]
+        session.revealTerminalBlock(bookmark)
+        XCTAssertEqual(session.takePendingTerminalBlockNavigation(), first)
+        XCTAssertNil(session.takePendingTerminalBlockNavigation())
 
         session.toggleTerminalBlockBookmarked(first)
         XCTAssertFalse(session.isTerminalBlockBookmarked(first))
+        XCTAssertTrue(session.terminalBlockBookmarks.isEmpty)
+    }
+
+    func testTerminalBlockActionsCompactAgainstTrailingEdge() {
+        let singleAction = TerminalBlockActionLayout.rects(
+            actionCount: 1,
+            trailingEdge: 492,
+            top: 20
+        )
+        let allActions = TerminalBlockActionLayout.rects(
+            actionCount: 5,
+            trailingEdge: 492,
+            top: 20
+        )
+
+        XCTAssertEqual(singleAction.count, 1)
+        XCTAssertEqual(singleAction[0].maxX, 482)
+        XCTAssertEqual(allActions.last?.maxX, 482)
+        XCTAssertEqual(allActions[1].minX - allActions[0].maxX, 4)
+    }
+
+    func testTerminalBlockBookmarkScrollDeltaMovesInEitherDirection() {
+        XCTAssertEqual(
+            TerminalSession.terminalBlockScrollDelta(from: 10, to: 25),
+            15
+        )
+        XCTAssertEqual(
+            TerminalSession.terminalBlockScrollDelta(from: 10, to: 3),
+            -7
+        )
+    }
+
+    @MainActor
+    func testRevealingTerminalBlockBookmarkScrollsTowardItsHistoryRow() throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let session = TerminalSession(cols: 40, rows: 6)
+        let handle = try XCTUnwrap(session.handle)
+        let output = Data(
+            (0..<40).map { "line \($0)\r\n" }.joined().utf8
+        )
+        output.withUnsafeBytes { bytes in
+            _ = gt_session_feed_output(
+                handle,
+                bytes.bindMemory(to: UInt8.self).baseAddress,
+                bytes.count
+            )
+        }
+        session.refreshFrame()
+
+        let initialOffset = try XCTUnwrap(gt_session_frame(handle)).pointee.scroll_offset
+        XCTAssertGreaterThan(initialOffset, 4)
+        let targetRow = initialOffset - 4
+        let bookmark = TerminalBlockBookmark(
+            id: TerminalBlockID(sessionID: session.id, historyRow: targetRow),
+            command: "line 30",
+            output: "",
+            workingDirectory: "/tmp"
+        )
+
+        session.revealTerminalBlock(bookmark)
+
+        let revealedOffset = try XCTUnwrap(gt_session_frame(handle)).pointee.scroll_offset
+        XCTAssertLessThan(revealedOffset, initialOffset)
+        XCTAssertEqual(session.takePendingTerminalBlockNavigation(), bookmark.id)
     }
 
     func testAIBlockAttachmentIncludesTerminalContext() {

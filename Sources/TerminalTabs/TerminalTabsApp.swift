@@ -211,8 +211,6 @@ struct VerticalPanelHeader: View {
                 .foregroundStyle(TerminalTheme.mutedText)
                 .lineLimit(1)
             Spacer()
-            ScheduledJobsButton(store: store)
-            TabSettingsMenu(store: store)
             Spacer().frame(width: 8)
         }
         .padding(.leading, 8)

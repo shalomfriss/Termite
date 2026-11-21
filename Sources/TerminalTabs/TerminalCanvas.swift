@@ -20,6 +20,7 @@ struct TerminalCanvas: NSViewRepresentable {
         view.session = session
         view.openDirectoryInNewTab = openDirectoryInNewTab
         view.syncApplicationFocusReporting()
+        view.revealPendingTerminalBlockNavigation()
         view.needsLayout = true
         view.needsDisplay = true
         view.window?.invalidateCursorRects(for: view)
@@ -192,6 +193,16 @@ final class TerminalNSView: NSView,
         defer { wasFocusReportingEnabled = session.isFocusReporting }
         guard session.isFocusReporting, !wasFocusReportingEnabled else { return }
         session.sendFocus(window.firstResponder === self)
+    }
+
+    func revealPendingTerminalBlockNavigation() {
+        guard let blockID = session.takePendingTerminalBlockNavigation() else { return }
+        selectedBlockHistoryRows = [blockID.historyRow]
+        selectedGraphicalPlacementID = nil
+        textSelection = nil
+        textSelectionAnchor = nil
+        focusTerminal()
+        needsDisplay = true
     }
 
     override func layout() {
@@ -657,7 +668,12 @@ final class TerminalNSView: NSView,
         }
         if characters == "b", !selectedBlockHistoryRows.isEmpty {
             for block in selectedBlockContents() {
-                session.toggleTerminalBlockBookmarked(block.id)
+                session.toggleTerminalBlockBookmarked(
+                    block.id,
+                    command: block.command,
+                    output: block.output,
+                    workingDirectory: block.workingDirectory
+                )
             }
             needsDisplay = true
             return true
@@ -1139,9 +1155,6 @@ final class TerminalNSView: NSView,
         visualLayout: TerminalBlockVisualLayout
     ) {
         let previousTargets = blockActionHitTargets
-        let buttonSize: CGFloat = 22
-        let buttonGap: CGFloat = 4
-        let trailingInset: CGFloat = 10
         var targets: [BlockActionHitTarget] = []
 
         for (index, range) in ranges.enumerated() {
@@ -1151,53 +1164,53 @@ final class TerminalNSView: NSView,
                 sessionID: session.id,
                 historyRow: frame.scroll_offset + UInt64(range.lowerBound)
             )
-            let attachRect = NSRect(
-                x: bounds.maxX - Self.blockOuterMargin - trailingInset - buttonSize,
-                y: blockFrame.minY + 5,
-                width: buttonSize,
-                height: buttonSize
-            )
-            let copyRect = attachRect.offsetBy(dx: -(buttonSize + buttonGap), dy: 0)
-            let rerunRect = copyRect.offsetBy(dx: -(buttonSize + buttonGap), dy: 0)
-            let bookmarkRect = rerunRect.offsetBy(dx: -(buttonSize + buttonGap), dy: 0)
-            let foldRect = bookmarkRect.offsetBy(dx: -(buttonSize + buttonGap), dy: 0)
+            let block = blockContents(for: range, frame: frame, cells: cells)
+            var descriptors: [(
+                action: BlockAction,
+                block: BlockContents?,
+                isEnabled: Bool
+            )] = []
             if range.count > 1 {
-                targets.append(BlockActionHitTarget(
+                descriptors.append((
                     action: .toggleFold,
-                    blockID: blockID,
                     block: nil,
-                    rect: foldRect,
                     isEnabled: true
                 ))
             }
-            targets.append(BlockActionHitTarget(
+            descriptors.append((
                 action: .toggleBookmark,
-                blockID: blockID,
-                block: nil,
-                rect: bookmarkRect,
+                block: block,
                 isEnabled: true
             ))
-            if let block = blockContents(for: range, frame: frame, cells: cells) {
-                targets.append(BlockActionHitTarget(
+            if let block {
+                descriptors.append((
                     action: .rerun,
-                    blockID: blockID,
                     block: block,
-                    rect: rerunRect,
                     isEnabled: session.canRunBlockCommand
                 ))
-                targets.append(BlockActionHitTarget(
+                descriptors.append((
                     action: .copy,
-                    blockID: blockID,
                     block: block,
-                    rect: copyRect,
                     isEnabled: true
                 ))
-                targets.append(BlockActionHitTarget(
+                descriptors.append((
                     action: .attach,
-                    blockID: blockID,
                     block: block,
-                    rect: attachRect,
                     isEnabled: !session.hasPendingAIAttachment(for: block.id)
+                ))
+            }
+            let rects = TerminalBlockActionLayout.rects(
+                actionCount: descriptors.count,
+                trailingEdge: bounds.maxX - Self.blockOuterMargin,
+                top: blockFrame.minY + 5
+            )
+            for (descriptor, rect) in zip(descriptors, rects) {
+                targets.append(BlockActionHitTarget(
+                    action: descriptor.action,
+                    blockID: blockID,
+                    block: descriptor.block,
+                    rect: rect,
+                    isEnabled: descriptor.isEnabled
                 ))
             }
         }
@@ -1316,7 +1329,12 @@ final class TerminalNSView: NSView,
         case .toggleFold:
             session.toggleTerminalBlockCollapsed(target.blockID)
         case .toggleBookmark:
-            session.toggleTerminalBlockBookmarked(target.blockID)
+            session.toggleTerminalBlockBookmarked(
+                target.blockID,
+                command: target.block?.command ?? "",
+                output: target.block?.output ?? "",
+                workingDirectory: target.block?.workingDirectory
+            )
         case .rerun:
             guard let block = target.block else { return }
             session.rerunBlockCommand(block.command)
@@ -1979,7 +1997,12 @@ final class TerminalNSView: NSView,
     }
     @objc private func toggleContextBlockBookmark() {
         guard let contextBlock else { return }
-        session.toggleTerminalBlockBookmarked(contextBlock.id)
+        session.toggleTerminalBlockBookmarked(
+            contextBlock.id,
+            command: contextBlock.command,
+            output: contextBlock.output,
+            workingDirectory: contextBlock.workingDirectory
+        )
         needsDisplay = true
     }
     @objc private func toggleContextBlockFold() {
