@@ -453,6 +453,26 @@ final class AirTests: XCTestCase {
         XCTAssertEqual(ranges, [0..<2, 2..<3])
     }
 
+    func testGraphicalOutputMergesWithItsActivePrompt() {
+        let ranges = TerminalBlockRangeResolver.mergingGraphicalOutputWithActivePrompt(
+            ranges: [0..<3, 3..<4],
+            graphicalRows: [0, 1, 2],
+            cursorRow: 3
+        )
+
+        XCTAssertEqual(ranges, [0..<4])
+    }
+
+    func testGraphicalOutputDoesNotMergeWithSubmittedCommandBlock() {
+        let ranges = TerminalBlockRangeResolver.mergingGraphicalOutputWithActivePrompt(
+            ranges: [0..<3, 3..<6, 6..<7],
+            graphicalRows: [0, 1, 2],
+            cursorRow: 6
+        )
+
+        XCTAssertEqual(ranges, [0..<3, 3..<6, 6..<7])
+    }
+
     func testGraphicalRowCoverageContainsImageAndLabelRows() {
         let range = TerminalGraphicalRowCoverage.range(
             placementRow: 0,
@@ -494,6 +514,30 @@ final class AirTests: XCTestCase {
         XCTAssertEqual(layout.blockFrames[1].minY - layout.blockFrames[0].maxY, 10)
         XCTAssertEqual(layout.rowOffsets[3], 30)
         XCTAssertEqual(layout.row(at: 40, cellHeight: 20, nearest: false), 0)
+    }
+
+    func testCollapsedGraphicalBlockPreservesPromptAfterIcons() {
+        let collapsedVisibleRows = TerminalBlockRangeResolver.collapsedVisibleRows(
+            ranges: [0..<5, 5..<6],
+            collapsedRangeStarts: [0],
+            graphicalRows: [0, 1, 2, 3],
+            textRows: [2, 3, 4, 5]
+        )
+        let layout = TerminalBlockVisualLayout.make(
+            ranges: [0..<5, 5..<6],
+            rowCount: 8,
+            cellHeight: 20,
+            viewportHeight: 500,
+            lastContentRow: 5,
+            collapsedRangeStarts: [0],
+            collapsedVisibleRows: collapsedVisibleRows
+        )
+
+        XCTAssertEqual(collapsedVisibleRows, [0: 4])
+        XCTAssertEqual(layout.hiddenRows, [0, 1, 2, 3])
+        XCTAssertEqual(layout.blockFrames[0].height, 60)
+        XCTAssertEqual(layout.blockFrames[1].minY - layout.blockFrames[0].maxY, 10)
+        XCTAssertEqual(layout.row(at: 40, cellHeight: 20, nearest: false), 4)
     }
 
     func testFinderStyleArrangementSortsAndGroupsItems() {
@@ -948,6 +992,90 @@ final class AirTests: XCTestCase {
                 "A newly opened graphical terminal should show only one prompt"
             )
         }
+    }
+
+    @MainActor
+    func testCollapsedGraphicalFrameChoosesPreservedPromptRow() async throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let root = FileManager.default.temporaryDirectory.appending(
+            path: "air-collapsed-graphical-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("preview".utf8).write(to: root.appending(path: "note.txt"))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let session = TerminalSession(cols: 60, rows: 24, workingDirectory: root.path)
+        session.setGraphicalMode(true)
+        var frame: GTFrame?
+        for _ in 0..<250 {
+            try await Task.sleep(for: .milliseconds(20))
+            session.poll()
+            guard let candidate = gt_session_frame(try XCTUnwrap(session.handle))?.pointee,
+                  candidate.image_count > 0 else { continue }
+            frame = candidate
+            break
+        }
+
+        let settledFrame = try XCTUnwrap(frame)
+        let cells = try XCTUnwrap(settledFrame.cells)
+        let rowCount = Int(settledFrame.rows)
+        let columnCount = Int(settledFrame.cols)
+        let textRows = Set((0..<rowCount).filter { row in
+            (0..<columnCount).contains { column in
+                let cell = cells[row * columnCount + column]
+                return cell.text_len > 0 && cell.style & UInt16(GT_STYLE_INVISIBLE) == 0
+            }
+        })
+        var graphicalRows: Set<Int> = []
+        if let images = settledFrame.images {
+            for index in 0..<Int(settledFrame.image_count) {
+                let placement = images[index]
+                guard session.graphicalItem(for: placement.placement_id) != nil,
+                      let range = TerminalGraphicalRowCoverage.range(
+                          placementRow: Int(placement.viewport_row),
+                          cellOffsetY: CGFloat(placement.cell_offset_y),
+                          pixelHeight: CGFloat(placement.pixel_height),
+                          layoutRowHeight: session.graphicalItemHitLayout(
+                              for: placement.placement_id
+                          ).2,
+                          rowCount: rowCount,
+                          cellHeight: 20
+                      ) else { continue }
+                graphicalRows.formUnion(range)
+            }
+        }
+        let visibleRows = (0..<rowCount).map {
+            textRows.contains($0) || graphicalRows.contains($0)
+        }
+        let unresolvedRanges = TerminalBlockRangeResolver.ranges(
+            rowSemantics: TerminalBlockRangeResolver.normalizedSemantics(
+                rowSemantics: (0..<rowCount).map {
+                    settledFrame.row_semantics?[$0] ?? 0
+                },
+                inputRows: semanticInputRows(in: settledFrame)
+            ),
+            visibleRows: visibleRows,
+            cursorRow: settledFrame.cursor_visible ? Int(settledFrame.cursor_y) : nil
+        )
+        let ranges = TerminalBlockRangeResolver.mergingGraphicalOutputWithActivePrompt(
+            ranges: unresolvedRanges,
+            graphicalRows: graphicalRows,
+            cursorRow: settledFrame.cursor_visible ? Int(settledFrame.cursor_y) : nil
+        )
+        let graphicalBlock = try XCTUnwrap(ranges.first { range in
+            range.contains { graphicalRows.contains($0) }
+        })
+        let visibleRowsByBlockStart = TerminalBlockRangeResolver.collapsedVisibleRows(
+            ranges: ranges,
+            collapsedRangeStarts: [graphicalBlock.lowerBound],
+            graphicalRows: graphicalRows,
+            textRows: textRows
+        )
+        let promptRow = try XCTUnwrap(visibleRowsByBlockStart[graphicalBlock.lowerBound])
+
+        XCTAssertGreaterThan(promptRow, graphicalRows.filter(graphicalBlock.contains).max() ?? -1)
+        XCTAssertTrue(TerminalSession.looksLikeShellPrompt(rowText(frame: settledFrame, row: promptRow)))
     }
 
     func testShellPromptReadinessRecognizesCommonPromptStyles() {

@@ -1,6 +1,47 @@
 import Foundation
 
 struct TerminalBlockRangeResolver {
+    static func mergingGraphicalOutputWithActivePrompt(
+        ranges: [Range<Int>],
+        graphicalRows: Set<Int>,
+        cursorRow: Int?
+    ) -> [Range<Int>] {
+        guard let cursorRow, ranges.count > 1 else { return ranges }
+        var result = ranges
+        for index in 0..<(result.count - 1) {
+            let graphicalRange = result[index]
+            let promptRange = result[index + 1]
+            guard graphicalRange.upperBound == cursorRow,
+                  promptRange == cursorRow..<(cursorRow + 1),
+                  graphicalRange.contains(where: graphicalRows.contains) else { continue }
+            result.replaceSubrange(
+                index...(index + 1),
+                with: [graphicalRange.lowerBound..<promptRange.upperBound]
+            )
+            break
+        }
+        return result
+    }
+
+    static func collapsedVisibleRows(
+        ranges: [Range<Int>],
+        collapsedRangeStarts: Set<Int>,
+        graphicalRows: Set<Int>,
+        textRows: Set<Int>
+    ) -> [Int: Int] {
+        var result: [Int: Int] = [:]
+        for range in ranges where collapsedRangeStarts.contains(range.lowerBound) && range.count > 1 {
+            guard let lastGraphicalRow = range.reversed().first(where: graphicalRows.contains),
+                  let promptRow = range.reversed().first(where: {
+                      $0 > lastGraphicalRow
+                          && textRows.contains($0)
+                          && !graphicalRows.contains($0)
+                  }) else { continue }
+            result[range.lowerBound] = promptRow
+        }
+        return result
+    }
+
     static func normalizedSemantics(
         rowSemantics: [UInt8],
         inputRows: [Bool]

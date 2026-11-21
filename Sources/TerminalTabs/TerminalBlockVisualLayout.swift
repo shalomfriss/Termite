@@ -5,7 +5,7 @@ struct TerminalBlockVisualLayout {
     let rowOffsets: [CGFloat]
     let blockFrames: [CGRect]
     let hiddenRows: Set<Int>
-    let collapsedRangeStarts: Set<Int>
+    let collapsedVisibleRows: [Int: Int]
 
     static func make(
         ranges: [Range<Int>],
@@ -14,6 +14,7 @@ struct TerminalBlockVisualLayout {
         viewportHeight: CGFloat,
         lastContentRow: Int,
         collapsedRangeStarts: Set<Int> = [],
+        collapsedVisibleRows: [Int: Int] = [:],
         contentPadding: CGFloat = 20,
         blockSpacing: CGFloat = 10,
         topInset: CGFloat = 0
@@ -24,9 +25,20 @@ struct TerminalBlockVisualLayout {
                 rowOffsets: [],
                 blockFrames: [],
                 hiddenRows: [],
-                collapsedRangeStarts: []
+                collapsedVisibleRows: [:]
             )
         }
+
+        let resolvedCollapsedVisibleRows = Dictionary(uniqueKeysWithValues: ranges.compactMap {
+            range -> (Int, Int)? in
+            guard collapsedRangeStarts.contains(range.lowerBound), range.count > 1 else {
+                return nil
+            }
+            let preferredRow = collapsedVisibleRows[range.lowerBound]
+                .flatMap { range.contains($0) ? $0 : nil }
+                ?? range.lowerBound
+            return (range.lowerBound, preferredRow)
+        })
 
         var rowOffsets = Array(repeating: CGFloat.zero, count: rowCount)
         var hiddenRows: Set<Int> = []
@@ -45,12 +57,13 @@ struct TerminalBlockVisualLayout {
                 accumulatedOffset += contentPadding
             }
             let range = rangeIndex < ranges.count ? ranges[rangeIndex] : nil
-            let isCollapsed = range.map {
-                collapsedRangeStarts.contains($0.lowerBound) && $0.count > 1
-            } ?? false
-            if let range, isCollapsed, row > range.lowerBound, range.contains(row) {
-                hiddenRows.insert(row)
-                rowOffsets[row] = rowOffsets[range.lowerBound]
+            let collapsedVisibleRow = range.flatMap {
+                resolvedCollapsedVisibleRows[$0.lowerBound]
+            }
+            let isCollapsed = collapsedVisibleRow != nil
+            if let range, let collapsedVisibleRow, range.contains(row) {
+                if row != collapsedVisibleRow { hiddenRows.insert(row) }
+                rowOffsets[row] = accumulatedOffset
                     - CGFloat(row - range.lowerBound) * cellHeight
             } else {
                 rowOffsets[row] = accumulatedOffset
@@ -65,15 +78,16 @@ struct TerminalBlockVisualLayout {
         }
 
         var blockFrames = ranges.map { range in
-            let firstOffset = rowOffsets.indices.contains(range.lowerBound)
-                ? rowOffsets[range.lowerBound]
+            let visibleRow = resolvedCollapsedVisibleRows[range.lowerBound] ?? range.lowerBound
+            let firstOffset = rowOffsets.indices.contains(visibleRow)
+                ? rowOffsets[visibleRow]
                 : 0
-            let visibleRowCount = collapsedRangeStarts.contains(range.lowerBound) && range.count > 1
+            let visibleRowCount = resolvedCollapsedVisibleRows[range.lowerBound] != nil
                 ? 1
                 : range.count
             return CGRect(
                 x: 0,
-                y: CGFloat(range.lowerBound) * cellHeight + firstOffset - contentPadding,
+                y: CGFloat(visibleRow) * cellHeight + firstOffset - contentPadding,
                 width: 0,
                 height: CGFloat(visibleRowCount) * cellHeight + contentPadding * 2
             )
@@ -95,7 +109,7 @@ struct TerminalBlockVisualLayout {
             rowOffsets: rowOffsets,
             blockFrames: blockFrames,
             hiddenRows: hiddenRows,
-            collapsedRangeStarts: collapsedRangeStarts
+            collapsedVisibleRows: resolvedCollapsedVisibleRows
         )
     }
 
@@ -113,7 +127,7 @@ struct TerminalBlockVisualLayout {
             if minY <= visualY, visualY < minY + cellHeight { return row }
         }
         if let range = blockRange(at: visualY) {
-            if collapsedRangeStarts.contains(range.lowerBound) { return range.lowerBound }
+            if let visibleRow = collapsedVisibleRows[range.lowerBound] { return visibleRow }
             let contentTop = CGFloat(range.lowerBound) * cellHeight + rowOffsets[range.lowerBound]
             return visualY < contentTop ? range.lowerBound : range.upperBound - 1
         }

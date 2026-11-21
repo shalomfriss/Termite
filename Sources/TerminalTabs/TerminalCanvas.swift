@@ -1085,19 +1085,30 @@ final class TerminalNSView: NSView,
         if let finalRange = ranges.last {
             lastContentRow = max(lastContentRow, finalRange.upperBound - 1)
         }
+        let collapsedRangeStarts = Set(ranges.compactMap { range in
+            let blockID = TerminalBlockID(
+                sessionID: session.id,
+                historyRow: frame.scroll_offset + UInt64(range.lowerBound)
+            )
+            return session.isTerminalBlockCollapsed(blockID) ? range.lowerBound : nil
+        })
+        let graphicalRows = graphicalListingRows(frame: frame)
+        let textRows = Set((0..<Int(frame.rows)).filter {
+            rowHasVisibleContent($0, frame: frame, cells: cells)
+        })
         return TerminalBlockVisualLayout.make(
             ranges: ranges,
             rowCount: Int(frame.rows),
             cellHeight: cellHeight,
             viewportHeight: bounds.height,
             lastContentRow: lastContentRow,
-            collapsedRangeStarts: Set(ranges.compactMap { range in
-                let blockID = TerminalBlockID(
-                    sessionID: session.id,
-                    historyRow: frame.scroll_offset + UInt64(range.lowerBound)
-                )
-                return session.isTerminalBlockCollapsed(blockID) ? range.lowerBound : nil
-            }),
+            collapsedRangeStarts: collapsedRangeStarts,
+            collapsedVisibleRows: TerminalBlockRangeResolver.collapsedVisibleRows(
+                ranges: ranges,
+                collapsedRangeStarts: collapsedRangeStarts,
+                graphicalRows: graphicalRows,
+                textRows: textRows
+            ),
             contentPadding: Self.blockContentPadding,
             blockSpacing: Self.blockSpacing,
             topInset: Self.blockTopInset
@@ -2263,35 +2274,61 @@ final class TerminalNSView: NSView,
         var visibleRows = (0..<rowCount).map {
             rowHasVisibleContent($0, frame: frame, cells: cells)
         }
-        if let images = frame.images {
-            for index in 0..<Int(frame.image_count) {
-                let placement = images[index]
-                let layoutRowHeight: Int
-                if session.graphicalItem(for: placement.placement_id) != nil {
-                    layoutRowHeight = session.graphicalItemHitLayout(
-                        for: placement.placement_id
-                    ).2
-                } else {
-                    layoutRowHeight = 1
-                }
-                guard let range = TerminalGraphicalRowCoverage.range(
-                    placementRow: Int(placement.viewport_row),
-                    cellOffsetY: CGFloat(placement.cell_offset_y),
-                    pixelHeight: CGFloat(placement.pixel_height),
-                    layoutRowHeight: layoutRowHeight,
-                    rowCount: rowCount,
-                    cellHeight: cellHeight
-                ) else { continue }
-                for row in range {
-                    visibleRows[row] = true
-                }
-            }
+        for row in graphicalImageRows(frame: frame) {
+            visibleRows[row] = true
         }
-        return TerminalBlockRangeResolver.ranges(
+        let ranges = TerminalBlockRangeResolver.ranges(
             rowSemantics: semantics,
             visibleRows: visibleRows,
             cursorRow: frame.cursor_visible ? Int(frame.cursor_y) : nil
         )
+        return TerminalBlockRangeResolver.mergingGraphicalOutputWithActivePrompt(
+            ranges: ranges,
+            graphicalRows: graphicalListingRows(frame: frame),
+            cursorRow: frame.cursor_visible ? Int(frame.cursor_y) : nil
+        )
+    }
+
+    private func graphicalImageRows(frame: GTFrame) -> Set<Int> {
+        guard let images = frame.images else { return [] }
+        var rows: Set<Int> = []
+        for index in 0..<Int(frame.image_count) {
+            let placement = images[index]
+            let layoutRowHeight = session.graphicalItem(for: placement.placement_id) == nil
+                ? 1
+                : session.graphicalItemHitLayout(for: placement.placement_id).2
+            guard let range = TerminalGraphicalRowCoverage.range(
+                placementRow: Int(placement.viewport_row),
+                cellOffsetY: CGFloat(placement.cell_offset_y),
+                pixelHeight: CGFloat(placement.pixel_height),
+                layoutRowHeight: layoutRowHeight,
+                rowCount: Int(frame.rows),
+                cellHeight: cellHeight
+            ) else { continue }
+            rows.formUnion(range)
+        }
+        return rows
+    }
+
+    private func graphicalListingRows(frame: GTFrame) -> Set<Int> {
+        guard let images = frame.images else { return [] }
+        var rows: Set<Int> = []
+        for index in 0..<Int(frame.image_count) {
+            let placement = images[index]
+            guard session.graphicalItem(for: placement.placement_id) != nil,
+                  let range = TerminalGraphicalRowCoverage.range(
+                      placementRow: Int(placement.viewport_row),
+                      cellOffsetY: CGFloat(placement.cell_offset_y),
+                      pixelHeight: CGFloat(placement.pixel_height),
+                      layoutRowHeight: session.graphicalItemHitLayout(
+                          for: placement.placement_id
+                      ).2,
+                      rowCount: Int(frame.rows),
+                      cellHeight: cellHeight
+                  ) else { continue }
+            rows.formUnion(range)
+        }
+        return rows
     }
 
     private func rowHasVisibleContent(_ row: Int, frame: GTFrame, cells: UnsafePointer<GTCell>) -> Bool {
