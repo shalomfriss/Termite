@@ -383,7 +383,7 @@ final class AirTests: XCTestCase {
         )
         XCTAssertEqual(
             GraphicalPreviewSizing.clampedWidth(900, containerWidth: 1_000),
-            720
+            662
         )
         XCTAssertEqual(
             GraphicalPreviewSizing.clampedWidth(360, containerWidth: 1_000),
@@ -391,8 +391,22 @@ final class AirTests: XCTestCase {
         )
         XCTAssertEqual(
             GraphicalPreviewSizing.clampedWidth(360, containerWidth: 300),
-            180
+            240
         )
+    }
+
+    func testTextFileDocumentLoadsAndSavesUsingOriginalEncoding() throws {
+        let url = FileManager.default.temporaryDirectory.appending(
+            path: "air-text-preview-\(UUID().uuidString).txt"
+        )
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try "hello".write(to: url, atomically: true, encoding: .utf16)
+        let document = try TextFileDocument.load(from: url)
+        XCTAssertEqual(document.text, "hello")
+
+        try document.write("updated", to: url)
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf16), "updated")
     }
 
     func testCodePreviewFileDetectionRecognizesSourceAndConfigFiles() {
@@ -2086,6 +2100,19 @@ final class AirTests: XCTestCase {
         store.graphicalViewMode = .icons
         XCTAssertEqual(store.tabPanelVisibilityActionTitle, "Hide Top Panel")
         XCTAssertEqual(store.tabOrientation.panelSystemImage, "rectangle.topthird.inset.filled")
+    }
+
+    @MainActor
+    func testGraphicalPreviewLayoutModePersists() {
+        let store = TerminalStore()
+        let originalMode = store.graphicalPreviewLayoutMode
+        defer { store.graphicalPreviewLayoutMode = originalMode }
+
+        store.graphicalPreviewLayoutMode = .overlay
+        XCTAssertEqual(TerminalStore().graphicalPreviewLayoutMode, .overlay)
+
+        store.graphicalPreviewLayoutMode = .resizeContent
+        XCTAssertEqual(TerminalStore().graphicalPreviewLayoutMode, .resizeContent)
     }
 
     @MainActor

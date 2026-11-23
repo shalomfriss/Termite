@@ -6,38 +6,59 @@ struct TerminalSurface: View {
     let openDirectoryInNewTab: (URL) -> Void
 
     @State private var graphicalPreviewWidth = GraphicalPreviewSizing.defaultWidth
+    @State private var isGraphicalPreviewPresented = false
 
     var body: some View {
         VStack(spacing: 0) {
             GeometryReader { geometry in
                 ZStack(alignment: .trailing) {
-                    TerminalCanvas(
-                        session: session,
-                        openDirectoryInNewTab: openDirectoryInNewTab
-                    )
-                    .id(session.id)
+                    HStack(spacing: 0) {
+                        TerminalCanvas(
+                            session: session,
+                            openDirectoryInNewTab: openDirectoryInNewTab
+                        )
+                        .id(session.id)
 
-                    if store.graphicalMode, let item = session.graphicalPreviewItem {
-                        HStack(spacing: 0) {
-                            GraphicalPreviewResizeHandle(
+                        if store.graphicalMode,
+                           store.graphicalPreviewLayoutMode == .resizeContent,
+                           isGraphicalPreviewPresented,
+                           let item = session.graphicalPreviewItem {
+                            GraphicalPreviewContainer(
                                 width: $graphicalPreviewWidth,
-                                containerWidth: geometry.size.width
-                            )
-
-                            GraphicalFilePreviewPane(
+                                containerWidth: geometry.size.width,
                                 item: item,
-                                close: { session.setGraphicalPreviewItem(nil) }
-                            )
-                            .frame(
-                                width: GraphicalPreviewSizing.clampedWidth(
-                                    graphicalPreviewWidth,
-                                    containerWidth: geometry.size.width
-                                )
+                                collapse: collapseGraphicalPreview
                             )
                         }
+                    }
+
+                    if store.graphicalMode,
+                       store.graphicalPreviewLayoutMode == .overlay,
+                       isGraphicalPreviewPresented,
+                       let item = session.graphicalPreviewItem {
+                        GraphicalPreviewContainer(
+                            width: $graphicalPreviewWidth,
+                            containerWidth: geometry.size.width,
+                            item: item,
+                            collapse: collapseGraphicalPreview
+                        )
                         .shadow(color: .black.opacity(0.32), radius: 16, x: -6)
                     }
+
+                    if store.graphicalMode,
+                       !isGraphicalPreviewPresented,
+                       let item = session.graphicalPreviewItem {
+                        GraphicalPreviewDisclosureButton(item: item) {
+                            withAnimation(.smooth(duration: 0.2)) {
+                                isGraphicalPreviewPresented = true
+                            }
+                        }
+                    }
                 }
+                .animation(
+                    .smooth(duration: 0.2),
+                    value: isGraphicalPreviewPresented
+                )
             }
 
             statusBar
@@ -59,6 +80,15 @@ struct TerminalSurface: View {
             radius: 18,
             y: 8
         )
+        .onChange(of: store.graphicalMode) { _, isEnabled in
+            if !isEnabled { isGraphicalPreviewPresented = false }
+        }
+    }
+
+    private func collapseGraphicalPreview() {
+        withAnimation(.smooth(duration: 0.2)) {
+            isGraphicalPreviewPresented = false
+        }
     }
 
     private var statusBar: some View {

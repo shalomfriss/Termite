@@ -39,12 +39,12 @@ struct GraphicalFilePreviewPane: View {
 
                 Spacer(minLength: 8)
 
-                Button("Close Preview", systemImage: "xmark", action: close)
+                Button("Collapse Preview", systemImage: "chevron.right", action: close)
                     .labelStyle(.iconOnly)
                     .buttonStyle(.plain)
                     .frame(width: 28, height: 28)
                     .contentShape(.rect)
-                    .help("Close preview")
+                    .help("Collapse preview")
             }
             .padding(10)
 

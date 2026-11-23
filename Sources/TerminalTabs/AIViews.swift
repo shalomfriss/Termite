@@ -215,6 +215,24 @@ struct AppSettingsView: View {
                         .padding(8)
                     }
 
+                    GroupBox("File preview") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            LabeledContent("Panel behavior") {
+                                AirMenuPicker(
+                                    "File preview panel behavior",
+                                    selection: $store.graphicalPreviewLayoutMode,
+                                    options: GraphicalPreviewLayoutMode.allCases,
+                                    minimumWidth: 170,
+                                    optionTitle: { $0.title }
+                                )
+                            }
+                            Text(store.graphicalPreviewLayoutMode.detail)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(8)
+                    }
+
                     GroupBox("AI connections") {
                         VStack(spacing: 14) {
                             credentialRow(

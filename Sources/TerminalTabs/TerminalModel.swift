@@ -2465,6 +2465,7 @@ final class TerminalStore: ObservableObject {
     private static let graphicalGroupOptionKey = "graphicalGroupOption"
     private static let graphicalSortDirectionKey = "graphicalSortDirection"
     private static let graphicalFoldersFirstKey = "graphicalFoldersFirst"
+    private static let graphicalPreviewLayoutModeKey = "graphicalPreviewLayoutMode"
     private static let listingBackendKey = "listingBackend"
     private static let autocolorTabsKey = "autocolorTabs"
     private static let automaticTabColors = [
@@ -2557,6 +2558,14 @@ final class TerminalStore: ObservableObject {
             }
         }
     }
+    @Published var graphicalPreviewLayoutMode: GraphicalPreviewLayoutMode {
+        didSet {
+            UserDefaults.standard.set(
+                graphicalPreviewLayoutMode.rawValue,
+                forKey: Self.graphicalPreviewLayoutModeKey
+            )
+        }
+    }
     @Published var listingBackend: ListingBackend {
         didSet {
             UserDefaults.standard.set(listingBackend.rawValue, forKey: Self.listingBackendKey)
@@ -2604,6 +2613,11 @@ final class TerminalStore: ObservableObject {
         } else {
             graphicalFoldersFirst = UserDefaults.standard.bool(forKey: Self.graphicalFoldersFirstKey)
         }
+        graphicalPreviewLayoutMode = GraphicalPreviewLayoutMode(
+            rawValue: UserDefaults.standard.string(
+                forKey: Self.graphicalPreviewLayoutModeKey
+            ) ?? ""
+        ) ?? .resizeContent
         listingBackend = ListingBackend(
             rawValue: UserDefaults.standard.string(forKey: Self.listingBackendKey) ?? ""
         ) ?? .eza

@@ -7,19 +7,20 @@ struct GraphicalPreviewResizeHandle: View {
 
     @State private var dragStartWidth: CGFloat?
     @State private var isHovering = false
+    @State private var isDragging = false
 
     var body: some View {
         Rectangle()
-            .fill(isHovering ? TerminalTheme.cyan.opacity(0.12) : .clear)
-            .frame(width: 10)
+            .fill(isActive ? TerminalTheme.cyan.opacity(0.14) : .clear)
+            .frame(width: GraphicalPreviewSizing.resizeHandleWidth)
             .overlay(alignment: .trailing) {
                 Rectangle()
                     .fill(
-                        isHovering
+                        isActive
                             ? TerminalTheme.cyan.opacity(0.9)
                             : Color.white.opacity(0.16)
                     )
-                    .frame(width: isHovering ? 2 : 1)
+                    .frame(width: isActive ? 2 : 1)
             }
             .contentShape(.rect)
             .onContinuousHover { phase in
@@ -29,27 +30,37 @@ struct GraphicalPreviewResizeHandle: View {
                     NSCursor.resizeLeftRight.set()
                 case .ended:
                     isHovering = false
-                    NSCursor.arrow.set()
+                    if !isDragging { NSCursor.arrow.set() }
                 }
             }
             .onDisappear {
                 NSCursor.arrow.set()
             }
             .gesture(
-                DragGesture(minimumDistance: 1)
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
                     .onChanged { value in
+                        isDragging = true
+                        NSCursor.resizeLeftRight.set()
                         let startWidth = dragStartWidth
                             ?? GraphicalPreviewSizing.clampedWidth(
                                 width,
                                 containerWidth: containerWidth
                             )
                         dragStartWidth = startWidth
-                        width = GraphicalPreviewSizing.clampedWidth(
-                            startWidth - value.translation.width,
-                            containerWidth: containerWidth
-                        )
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            width = GraphicalPreviewSizing.clampedWidth(
+                                startWidth - value.translation.width,
+                                containerWidth: containerWidth
+                            )
+                        }
                     }
-                    .onEnded { _ in dragStartWidth = nil }
+                    .onEnded { _ in
+                        dragStartWidth = nil
+                        isDragging = false
+                        if !isHovering { NSCursor.arrow.set() }
+                    }
             )
             .accessibilityElement()
             .accessibilityLabel("File preview width")
@@ -75,5 +86,9 @@ struct GraphicalPreviewResizeHandle: View {
 
     private var effectiveWidth: CGFloat {
         GraphicalPreviewSizing.clampedWidth(width, containerWidth: containerWidth)
+    }
+
+    private var isActive: Bool {
+        isHovering || isDragging
     }
 }
