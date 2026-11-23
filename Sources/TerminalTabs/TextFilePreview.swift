@@ -1,18 +1,49 @@
 import SwiftUI
 
 struct TextFilePreview: View {
-    static let maximumByteCount = 4 * 1_024 * 1_024
-
     let url: URL
     let highlightsSyntax: Bool
 
-    @State private var source: String?
+    @State private var document: TextFileDocument?
+    @State private var source = ""
+    @State private var savedSource = ""
+    @State private var isWritable = false
+    @State private var isSaving = false
+    @State private var isPreviewingMarkdown = false
     @State private var errorMessage: String?
+    @State private var saveErrorMessage: String?
 
     var body: some View {
         Group {
-            if let source {
-                HighlightedTextView(source: source, highlightsSyntax: highlightsSyntax)
+            if document != nil {
+                VStack(spacing: 0) {
+                    TextFileEditorToolbar(
+                        isEditable: isWritable,
+                        isDirty: isDirty,
+                        isSaving: isSaving,
+                        errorMessage: saveErrorMessage,
+                        canPreviewMarkdown: isMarkdownFile,
+                        isPreviewingMarkdown: isPreviewingMarkdown,
+                        toggleMarkdownPreview: toggleMarkdownPreview,
+                        revert: revert,
+                        save: save
+                    )
+
+                    Divider()
+
+                    if isPreviewingMarkdown {
+                        RenderedMarkdownView(
+                            source: source,
+                            baseURL: url.deletingLastPathComponent()
+                        )
+                    } else {
+                        HighlightedTextView(
+                            source: $source,
+                            highlightsSyntax: highlightsSyntax,
+                            isEditable: isWritable && !isSaving
+                        )
+                    }
+                }
             } else if let errorMessage {
                 ContentUnavailableView(
                     "Text Preview Unavailable",
@@ -30,30 +61,25 @@ struct TextFilePreview: View {
     }
 
     private func loadSource() async {
-        source = nil
+        document = nil
+        source = ""
+        savedSource = ""
+        isWritable = false
+        isSaving = false
+        isPreviewingMarkdown = false
         errorMessage = nil
+        saveErrorMessage = nil
 
         do {
-            let values = try url.resourceValues(forKeys: [.fileSizeKey])
-            if let fileSize = values.fileSize, fileSize > Self.maximumByteCount {
-                errorMessage = "Text files larger than 4 MB are not previewed."
-                return
-            }
-
             let url = url
-            let maximumByteCount = Self.maximumByteCount
-            let loadedSource = try await Task.detached(priority: .userInitiated) {
-                let data = try Data(contentsOf: url, options: .mappedIfSafe)
-                guard data.count <= maximumByteCount else {
-                    throw CocoaError(.fileReadTooLarge)
-                }
-                guard let decoded = Self.decode(data) else {
-                    throw CocoaError(.fileReadInapplicableStringEncoding)
-                }
-                return decoded
+            let loadedDocument = try await Task.detached(priority: .userInitiated) {
+                try TextFileDocument.load(from: url)
             }.value
             try Task.checkCancellation()
-            source = loadedSource
+            document = loadedDocument
+            source = loadedDocument.text
+            savedSource = loadedDocument.text
+            isWritable = FileManager.default.isWritableFile(atPath: url.path)
         } catch is CancellationError {
             return
         } catch CocoaError.fileReadTooLarge {
@@ -63,18 +89,44 @@ struct TextFilePreview: View {
         }
     }
 
-    nonisolated private static func decode(_ data: Data) -> String? {
-        for encoding in [
-            String.Encoding.utf8,
-            .utf16,
-            .utf16LittleEndian,
-            .utf16BigEndian,
-            .isoLatin1,
-        ] {
-            if let decoded = String(data: data, encoding: encoding) {
-                return decoded
+    private var isDirty: Bool {
+        source != savedSource
+    }
+
+    private var isMarkdownFile: Bool {
+        MarkdownPreviewFileDetector.isMarkdownFile(url)
+    }
+
+    private func toggleMarkdownPreview() {
+        isPreviewingMarkdown.toggle()
+    }
+
+    private func revert() {
+        source = savedSource
+        saveErrorMessage = nil
+    }
+
+    private func save() {
+        guard let document, isWritable, isDirty, !isSaving else { return }
+        let sourceToSave = source
+        let url = url
+        isSaving = true
+        saveErrorMessage = nil
+
+        Task {
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try document.write(sourceToSave, to: url)
+                }.value
+                try Task.checkCancellation()
+                savedSource = sourceToSave
+                isSaving = false
+            } catch is CancellationError {
+                isSaving = false
+            } catch {
+                saveErrorMessage = error.localizedDescription
+                isSaving = false
             }
         }
-        return nil
     }
 }

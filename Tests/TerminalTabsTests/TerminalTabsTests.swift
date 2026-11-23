@@ -416,6 +416,43 @@ final class AirTests: XCTestCase {
         XCTAssertFalse(CodePreviewFileDetector.isCodeFile(URL(fileURLWithPath: "/tmp/notes.txt")))
     }
 
+    func testMarkdownPreviewFileDetectionRecognizesMarkdownExtensions() {
+        XCTAssertTrue(
+            MarkdownPreviewFileDetector.isMarkdownFile(
+                URL(fileURLWithPath: "/tmp/README.md")
+            )
+        )
+        XCTAssertTrue(
+            MarkdownPreviewFileDetector.isMarkdownFile(
+                URL(fileURLWithPath: "/tmp/Guide.MARKDOWN")
+            )
+        )
+        XCTAssertFalse(
+            MarkdownPreviewFileDetector.isMarkdownFile(
+                URL(fileURLWithPath: "/tmp/notes.txt")
+            )
+        )
+    }
+
+    @MainActor
+    func testMarkdownRendererCreatesStyledBlocksAndLinks() throws {
+        let rendered = try MarkdownRenderer.attributedString(
+            for: "# Title\n\n- One\n- Two\n\n[OpenAI](https://openai.com)",
+            baseURL: URL(fileURLWithPath: "/tmp", isDirectory: true)
+        )
+
+        XCTAssertEqual(rendered.string, "Title\n• One\n• Two\nOpenAI")
+        let titleFont = try XCTUnwrap(
+            rendered.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        )
+        XCTAssertGreaterThan(titleFont.pointSize, 13)
+        let linkRange = (rendered.string as NSString).range(of: "OpenAI")
+        XCTAssertEqual(
+            rendered.attribute(.link, at: linkRange.location, effectiveRange: nil) as? URL,
+            URL(string: "https://openai.com")
+        )
+    }
+
     @MainActor
     func testCodeSyntaxHighlightingSeparatesKeywordsStringsAndComments() throws {
         let source = "let value = \"let\" // let"
