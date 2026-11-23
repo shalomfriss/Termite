@@ -197,6 +197,8 @@ struct AppSettingsView: View {
                         .padding(8)
                     }
 
+                    PredictiveTypingSettingsSection(store: store)
+
                     GroupBox("Directory listings") {
                         VStack(alignment: .leading, spacing: 8) {
                             LabeledContent("Backend") {

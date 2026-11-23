@@ -1780,6 +1780,85 @@ final class AirTests: XCTestCase {
         XCTAssertEqual(tracker.text, "")
     }
 
+    func testCommandLineTrackerSuppressesPredictionAfterEscapeSequence() {
+        var tracker = CommandLineTracker()
+        tracker.append(Data("git st".utf8))
+        tracker.append(Data([0x1B, 0x5B, 0x41]))
+
+        XCTAssertFalse(tracker.isReliable)
+        XCTAssertEqual(tracker.submit(), "")
+        XCTAssertTrue(tracker.isReliable)
+        XCTAssertEqual(tracker.text, "")
+    }
+
+    func testCommandLineTrackerHandlesUnicodeAndSuppressesEditingControls() {
+        var tracker = CommandLineTracker()
+        tracker.append(Data("echo café".utf8))
+        XCTAssertEqual(tracker.submit(), "echo café")
+
+        tracker.append(Data("git status".utf8))
+        tracker.append(Data([0x01]))
+        XCTAssertFalse(tracker.isReliable)
+        XCTAssertEqual(tracker.submit(), "")
+    }
+
+    func testCommandHistoryPrefersRecentMatchesAndEnforcesLimit() {
+        var history = CommandHistory(limit: 3)
+        history.record("git status")
+        history.record("git stash")
+        history.record("swift test")
+        history.record("git status")
+
+        XCTAssertEqual(history.commands, ["git stash", "swift test", "git status"])
+        XCTAssertEqual(history.prediction(for: "git s"), "git status")
+
+        history.record("git switch main")
+        XCTAssertEqual(history.commands, ["swift test", "git status", "git switch main"])
+        XCTAssertEqual(history.prediction(for: "git s"), "git switch main")
+
+        history.setLimit(2)
+        XCTAssertEqual(history.commands, ["git status", "git switch main"])
+    }
+
+    @MainActor
+    func testCommandHistoryStorePersistsSettingsAndCommands() throws {
+        let suiteName = "AirTests.CommandHistory.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = CommandHistoryStore(
+            defaults: defaults,
+            predictionEnabled: false,
+            limit: 25
+        )
+        store.setPredictionEnabled(true)
+        store.setLimit(25)
+        store.record("git status")
+        store.record("swift test")
+        store.record("git switch main")
+
+        let reloaded = CommandHistoryStore(defaults: defaults)
+        XCTAssertTrue(reloaded.isPredictionEnabled)
+        XCTAssertEqual(reloaded.limit, 25)
+        XCTAssertEqual(reloaded.history.commands, ["git status", "swift test", "git switch main"])
+        XCTAssertEqual(reloaded.prediction(for: "git s"), "git switch main")
+
+        reloaded.clear()
+        XCTAssertTrue(reloaded.history.commands.isEmpty)
+    }
+
+    @MainActor
+    func testDisabledCommandHistoryDoesNotRecordOrPredict() {
+        let store = CommandHistoryStore(predictionEnabled: false, limit: 25)
+        store.record("git status")
+        XCTAssertTrue(store.history.commands.isEmpty)
+        XCTAssertNil(store.prediction(for: "git"))
+
+        store.setPredictionEnabled(true)
+        store.record("git status")
+        XCTAssertEqual(store.prediction(for: "git"), "git status")
+    }
+
     @MainActor
     func testStoreAlwaysKeepsOneTab() {
         let store = TerminalStore()

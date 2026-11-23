@@ -720,6 +720,19 @@ final class TerminalNSView: NSView,
     }
 
     override func keyDown(with event: NSEvent) {
+        let predictionModifiers = event.modifierFlags.intersection([
+            .command,
+            .control,
+            .option,
+            .shift,
+        ])
+        if event.keyCode == 124,
+           predictionModifiers.isEmpty,
+           session.acceptCommandPrediction() {
+            clearTextSelection()
+            needsDisplay = true
+            return
+        }
         if event.modifierFlags.contains(.shift), event.keyCode == 116 || event.keyCode == 121 {
             let page = max(1, Int(lastGrid.rows) - 2)
             session.scroll(rows: event.keyCode == 116 ? -page : page)
@@ -916,6 +929,12 @@ final class TerminalNSView: NSView,
             hiddenRows: visualLayout.hiddenRows
         )
         drawBlockActions()
+        drawCommandPrediction(
+            frame: frame,
+            rowOffsets: rowOffsets,
+            rowLeadingOffsets: rowLeadingOffsets,
+            hiddenRows: visualLayout.hiddenRows
+        )
 
         if frame.cursor_visible, !visualLayout.hiddenRows.contains(Int(frame.cursor_y)) {
             let cursorRow = Int(frame.cursor_y)
@@ -935,6 +954,63 @@ final class TerminalNSView: NSView,
             drawBadge("Process exited with status \(status)")
         }
         if !frame.alternate_screen { drawScrollbar(frame) }
+    }
+
+    private func drawCommandPrediction(
+        frame: GTFrame,
+        rowOffsets: [CGFloat],
+        rowLeadingOffsets: [CGFloat],
+        hiddenRows: Set<Int>
+    ) {
+        guard frame.cursor_visible,
+              let suffix = session.commandPredictionSuffix,
+              !suffix.isEmpty else { return }
+
+        let columnCount = Int(frame.cols)
+        let rowCount = Int(frame.rows)
+        guard columnCount > 0, rowCount > 0 else { return }
+
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor(
+                srgbRed: 0.50,
+                green: 0.65,
+                blue: 0.71,
+                alpha: 0.48
+            ),
+        ]
+        var column = Int(frame.cursor_x)
+        var row = Int(frame.cursor_y)
+
+        for character in suffix {
+            guard character != "\n", character != "\r" else { break }
+            if character == "\t" {
+                column += 4 - column % 4
+                continue
+            }
+            if column >= columnCount {
+                column = 0
+                row += 1
+            }
+            guard row < rowCount else { break }
+            guard !hiddenRows.contains(row) else {
+                column += 1
+                continue
+            }
+
+            let rowOffset = rowOffsets.indices.contains(row) ? rowOffsets[row] : 0
+            let leadingOffset = rowLeadingOffsets.indices.contains(row)
+                ? rowLeadingOffsets[row]
+                : Self.terminalContentInset
+            (String(character) as NSString).draw(
+                at: NSPoint(
+                    x: CGFloat(column) * cellWidth + leadingOffset,
+                    y: CGFloat(row) * cellHeight + rowOffset + 1
+                ),
+                withAttributes: attributes
+            )
+            column += 1
+        }
     }
 
     private func drawApplicationScreen(frame: GTFrame, cells: UnsafePointer<GTCell>) {

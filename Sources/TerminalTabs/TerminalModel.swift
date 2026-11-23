@@ -62,22 +62,45 @@ private struct LstrJSONNode: Decodable {
 
 struct CommandLineTracker {
     private(set) var text = ""
+    private(set) var isReliable = true
 
     mutating func append(_ data: Data) {
+        if data.first == 0x1B {
+            isReliable = false
+            return
+        }
+        if data.allSatisfy({ $0 >= 0x20 && $0 != 0x7F }) {
+            guard isReliable, let typedText = String(data: data, encoding: .utf8) else {
+                isReliable = false
+                return
+            }
+            text.append(contentsOf: typedText)
+            return
+        }
         for byte in data {
             switch byte {
             case 0x7F, 0x08:
-                if !text.isEmpty { text.removeLast() }
+                if isReliable, !text.isEmpty { text.removeLast() }
+            case 0x15:
+                text = ""
+                isReliable = true
+            case 0x03:
+                text = ""
+                isReliable = true
             case 0x20...0x7E:
-                text.append(Character(UnicodeScalar(byte)))
+                if isReliable { text.append(Character(UnicodeScalar(byte))) }
             default:
-                break
+                isReliable = false
             }
         }
     }
 
     mutating func submit() -> String {
-        defer { text = "" }
+        defer {
+            text = ""
+            isReliable = true
+        }
+        guard isReliable else { return "" }
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
@@ -114,6 +137,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var isFocusReporting = false
     @Published private(set) var isCursorAtPrompt = false
     @Published private(set) var isBracketedPasteEnabled = false
+    @Published private(set) var commandPrediction: String?
     @Published private(set) var graphicalPreviewItem: GraphicalFileItem?
     @Published private(set) var terminalBlockBookmarks: [TerminalBlockBookmark] = []
     @Published var graphicalOperationIssue: GraphicalOperationIssue?
@@ -136,6 +160,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var bookmarkedTerminalBlockIDs: Set<TerminalBlockID> = []
     private var pendingTerminalBlockNavigation: TerminalBlockID?
     private var commandLine = CommandLineTracker()
+    private let commandHistoryStore: CommandHistoryStore
     private var isMarkingInput = false
     private var terminalColumns = 100
     private var nextGraphicalImageID: UInt32 = 10_000
@@ -151,8 +176,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     init(
         cols: UInt16 = 100,
         rows: UInt16 = 32,
-        workingDirectory initialWorkingDirectory: String? = nil
+        workingDirectory initialWorkingDirectory: String? = nil,
+        commandHistoryStore: CommandHistoryStore? = nil
     ) {
+        self.commandHistoryStore = commandHistoryStore ?? CommandHistoryStore()
         tabAccentColor = nil
         let initialDirectory = initialWorkingDirectory.map {
             URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL.path
@@ -214,6 +241,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard let handle, let frame = gt_session_frame(handle) else { return }
         terminalColumns = Int(frame.pointee.cols)
         isAlternateScreen = frame.pointee.alternate_screen
+        if isAlternateScreen, commandPrediction != nil { commandPrediction = nil }
         isMouseReporting = frame.pointee.mouse_reporting
         isFocusReporting = frame.pointee.focus_reporting
         isCursorAtPrompt = frame.pointee.cursor_at_prompt
@@ -451,6 +479,34 @@ final class TerminalSession: ObservableObject, Identifiable {
         sendPendingInput(pending, handle: handle)
     }
 
+    var commandPredictionSuffix: String? {
+        guard commandLine.isReliable,
+              let commandPrediction,
+              commandPrediction.hasPrefix(commandLine.text) else { return nil }
+        let suffix = commandPrediction.dropFirst(commandLine.text.count)
+        return suffix.isEmpty ? nil : String(suffix)
+    }
+
+    @discardableResult
+    func acceptCommandPrediction() -> Bool {
+        guard let suffix = commandPredictionSuffix, !isAlternateScreen else { return false }
+        sendUserInput(Data(suffix.utf8))
+        return true
+    }
+
+    func refreshCommandPrediction() {
+        let nextPrediction: String? = if isAlternateScreen {
+            nil
+        } else if !commandLine.isReliable {
+            nil
+        } else {
+            commandHistoryStore.prediction(for: commandLine.text)
+        }
+        if commandPrediction != nextPrediction {
+            commandPrediction = nextPrediction
+        }
+    }
+
     private func sendPendingInput(_ data: Data, handle: OpaquePointer) {
         guard !data.isEmpty else { return }
         if !isMarkingInput {
@@ -459,6 +515,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             revision &+= 1
         }
         commandLine.append(data)
+        refreshCommandPrediction()
         write(data)
     }
 
@@ -469,6 +526,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             if gt_session_poll(handle) { refreshFrame() }
             let command = commandLine.submit()
             if !command.isEmpty {
+                commandHistoryStore.record(command)
                 commandBlocks.append(.init(command: command, workingDirectory: workingDirectory))
                 if let target = Self.directoryChangePath(
                     for: command,
@@ -478,6 +536,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                     directoryChangeTarget = target
                 }
             }
+            refreshCommandPrediction()
             gt_session_mark_output(handle)
             revision &+= 1
             if let request = Self.fileListingRequest(
@@ -2480,6 +2539,7 @@ final class TerminalStore: ObservableObject {
     @Published var groups: [TerminalTabGroup] = []
     let aiSettings = AISettings()
     let scheduledJobs: ScheduledJobStore
+    private let commandHistoryStore: CommandHistoryStore
     @Published var isSettingsVisible = false
     @Published var isScheduledJobsVisible = false
     @Published var selectedGroupID: UUID?
@@ -2492,6 +2552,18 @@ final class TerminalStore: ObservableObject {
     }
     @Published var autocolorTabs: Bool {
         didSet { UserDefaults.standard.set(autocolorTabs, forKey: Self.autocolorTabsKey) }
+    }
+    @Published var predictiveTypingEnabled: Bool {
+        didSet {
+            commandHistoryStore.setPredictionEnabled(predictiveTypingEnabled)
+            refreshCommandPredictions()
+        }
+    }
+    @Published var commandHistoryLimit: Int {
+        didSet {
+            commandHistoryStore.setLimit(commandHistoryLimit)
+            refreshCommandPredictions()
+        }
     }
     @Published var graphicalMode: Bool {
         didSet {
@@ -2578,7 +2650,14 @@ final class TerminalStore: ObservableObject {
     private var lastAutomaticTabColorIndex: Int?
 
     init(scheduledJobs: ScheduledJobStore? = nil) {
+        let commandHistoryStore = CommandHistoryStore(
+            defaults: .standard,
+            predictionEnabled: true
+        )
+        self.commandHistoryStore = commandHistoryStore
         self.scheduledJobs = scheduledJobs ?? ScheduledJobStore()
+        predictiveTypingEnabled = commandHistoryStore.isPredictionEnabled
+        commandHistoryLimit = commandHistoryStore.limit
         tabOrientation = TabOrientation(
             rawValue: UserDefaults.standard.string(forKey: Self.orientationKey) ?? ""
         ) ?? .horizontal
@@ -2648,6 +2727,11 @@ final class TerminalStore: ObservableObject {
 
     func setGraphicalMode(_ enabled: Bool) {
         graphicalMode = enabled
+    }
+
+    func clearCommandHistory() {
+        commandHistoryStore.clear()
+        refreshCommandPredictions()
     }
 
     @discardableResult
@@ -2750,7 +2834,10 @@ final class TerminalStore: ObservableObject {
     }
 
     private func makeTab(startingIn directory: String? = nil) -> TerminalSession {
-        let tab = TerminalSession(workingDirectory: directory)
+        let tab = TerminalSession(
+            workingDirectory: directory,
+            commandHistoryStore: commandHistoryStore
+        )
         tab.setGraphicalViewMode(graphicalViewMode, refresh: false)
         tab.setGraphicalShowsHiddenFiles(graphicalShowsHiddenFiles, refresh: false)
         tab.setGraphicalSortOption(graphicalSortOption, refresh: false)
@@ -2769,6 +2856,12 @@ final class TerminalStore: ObservableObject {
         lastAutomaticTabColorIndex = colorIndex
         tab.tabAccentColor = Self.automaticTabColors[colorIndex]
         return tab
+    }
+
+    private func refreshCommandPredictions() {
+        for tab in groups.lazy.flatMap(\.tabs) {
+            tab.refreshCommandPrediction()
+        }
     }
 
     func selectNext(delta: Int) {
