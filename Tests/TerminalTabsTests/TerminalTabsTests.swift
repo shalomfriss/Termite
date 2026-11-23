@@ -77,6 +77,13 @@ final class AirTests: XCTestCase {
         XCTAssertTrue(session.isBracketedPasteEnabled)
         XCTAssertEqual(session.commandBlocks.last?.command.hasPrefix(microPath), true)
 
+        let canvas = TerminalNSView(session: session)
+        canvas.frame = NSRect(x: 0, y: 0, width: 740, height: 480)
+        canvas.layoutSubtreeIfNeeded()
+        let bitmap = try XCTUnwrap(canvas.bitmapImageRepForCachingDisplay(in: canvas.bounds))
+        canvas.cacheDisplay(in: canvas.bounds, to: bitmap)
+        XCTAssertNotNil(bitmap.cgImage)
+
         let capturedBeforeRepaints = gt_session_command_output(handle, nil, 0)
         for _ in 0..<20 {
             session.sendUserInput(Data("\u{1B}[B".utf8))
@@ -492,6 +499,37 @@ final class AirTests: XCTestCase {
         )
 
         XCTAssertEqual(ranges, [1..<4, 4..<5])
+    }
+
+    func testWrappedInputAndOutputRemainInOneBlock() {
+        let semantics = TerminalBlockRangeResolver.normalizedSemantics(
+            rowSemantics: [1, 1, 1, 0, 0],
+            inputRows: [true, true, true, false, false]
+        )
+        let ranges = TerminalBlockRangeResolver.ranges(
+            rowSemantics: semantics,
+            visibleRows: [true, true, true, true, true],
+            cursorRow: 4
+        )
+
+        XCTAssertEqual(semantics, [1, 0, 0, 0, 0])
+        XCTAssertEqual(ranges, [0..<4, 4..<5])
+    }
+
+    func testActiveWrappedTypingRemainsInOneBlock() {
+        let inputRows = [true, true, true, false]
+        let semantics = TerminalBlockRangeResolver.normalizedSemantics(
+            rowSemantics: [1, 1, 1, 0],
+            inputRows: inputRows
+        )
+        let ranges = TerminalBlockRangeResolver.ranges(
+            rowSemantics: semantics,
+            visibleRows: [true, true, true, false],
+            cursorRow: 2,
+            inputRows: inputRows
+        )
+
+        XCTAssertEqual(ranges, [0..<3])
     }
 
     func testLeadingGraphicalOutputReceivesBlockBeforeFirstPrompt() {
@@ -942,6 +980,44 @@ final class AirTests: XCTestCase {
 
     func testGraphicalViewModesExcludeColumns() {
         XCTAssertEqual(GraphicalViewMode.allCases, [.icons, .list])
+    }
+
+    func testGraphicalKeyboardNavigationMatchesFinderStyleLayout() {
+        XCTAssertEqual(GraphicalKeyboardNavigation.destinationIndex(
+            from: nil,
+            itemCount: 7,
+            columnCount: 3,
+            viewMode: .icons,
+            direction: .right
+        ), 0)
+        XCTAssertEqual(GraphicalKeyboardNavigation.destinationIndex(
+            from: 1,
+            itemCount: 7,
+            columnCount: 3,
+            viewMode: .icons,
+            direction: .down
+        ), 4)
+        XCTAssertEqual(GraphicalKeyboardNavigation.destinationIndex(
+            from: 4,
+            itemCount: 7,
+            columnCount: 3,
+            viewMode: .icons,
+            direction: .up
+        ), 1)
+        XCTAssertEqual(GraphicalKeyboardNavigation.destinationIndex(
+            from: 1,
+            itemCount: 7,
+            columnCount: 1,
+            viewMode: .list,
+            direction: .down
+        ), 2)
+        XCTAssertNil(GraphicalKeyboardNavigation.destinationIndex(
+            from: 1,
+            itemCount: 7,
+            columnCount: 1,
+            viewMode: .list,
+            direction: .right
+        ))
     }
 
     @MainActor
@@ -1780,6 +1856,15 @@ final class AirTests: XCTestCase {
         XCTAssertEqual(tracker.text, "")
     }
 
+    func testCommandLineTrackerIncludesPastedTextInCurrentCommand() {
+        var tracker = CommandLineTracker()
+        tracker.append(Data("printf ".utf8))
+        tracker.appendPastedText("'first\nsecond'")
+        tracker.append(Data(" | cat".utf8))
+
+        XCTAssertEqual(tracker.submit(), "printf 'first\nsecond' | cat")
+    }
+
     func testCommandLineTrackerSuppressesPredictionAfterEscapeSequence() {
         var tracker = CommandLineTracker()
         tracker.append(Data("git st".utf8))
@@ -2201,6 +2286,23 @@ final class AirTests: XCTestCase {
     }
 
     @MainActor
+    func testTabsCanBeReorderedWithinTheirGroup() throws {
+        let store = TerminalStore()
+        let first = try XCTUnwrap(store.tabs.first)
+        let second = store.newTab()
+        let third = store.newTab()
+        let groupID = try XCTUnwrap(store.selectedGroupID)
+
+        XCTAssertTrue(store.moveTab(first.id, to: third.id, in: groupID))
+        XCTAssertEqual(store.tabs.map(\.id), [second.id, third.id, first.id])
+        XCTAssertEqual(store.selectedID, third.id)
+
+        XCTAssertTrue(store.moveTab(first.id, to: second.id, in: groupID))
+        XCTAssertEqual(store.tabs.map(\.id), [first.id, second.id, third.id])
+        XCTAssertEqual(store.selectedGroupID, groupID)
+    }
+
+    @MainActor
     func testTabLayoutCanChangeAndHide() {
         let store = TerminalStore()
         store.tabOrientation = .vertical
@@ -2331,6 +2433,30 @@ final class AirTests: XCTestCase {
         }
         let after = try XCTUnwrap(gt_session_frame(handle)).pointee.cursor_y
         XCTAssertEqual(after, before)
+    }
+
+    @MainActor
+    func testBracketedPasteStartsCurrentCommandBlock() throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let session = TerminalSession(cols: 24, rows: 16)
+        let handle = try XCTUnwrap(session.handle)
+        for _ in 0..<100 {
+            usleep(10_000)
+            session.poll()
+            if session.isCursorAtPrompt { break }
+        }
+        if !session.isBracketedPasteEnabled {
+            let enableBracketedPaste = Data("\u{1B}[?2004h".utf8)
+            enableBracketedPaste.withUnsafeBytes { bytes in
+                guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return }
+                _ = gt_session_feed_output(handle, base, enableBracketedPaste.count)
+            }
+            session.refreshFrame()
+        }
+        XCTAssertTrue(session.isBracketedPasteEnabled)
+
+        session.paste("printf 'paste_block_probe\\n'")
+        XCTAssertEqual(session.pendingCommandInput, "printf 'paste_block_probe\\n'")
     }
 
     private func rowText(frame: GTFrame, row: Int) -> String {

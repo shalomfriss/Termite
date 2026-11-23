@@ -17,13 +17,50 @@ struct TerminalCanvas: NSViewRepresentable {
     }
 
     func updateNSView(_ view: TerminalNSView, context: Context) {
-        view.session = session
-        view.openDirectoryInNewTab = openDirectoryInNewTab
-        view.syncApplicationFocusReporting()
-        view.revealPendingTerminalBlockNavigation()
-        view.needsLayout = true
-        view.needsDisplay = true
-        view.window?.invalidateCursorRects(for: view)
+        view.update(
+            session: session,
+            openDirectoryInNewTab: openDirectoryInNewTab
+        )
+    }
+}
+
+enum GraphicalKeyboardDirection {
+    case left
+    case right
+    case up
+    case down
+}
+
+struct GraphicalKeyboardNavigation {
+    static func destinationIndex(
+        from currentIndex: Int?,
+        itemCount: Int,
+        columnCount: Int,
+        viewMode: GraphicalViewMode,
+        direction: GraphicalKeyboardDirection
+    ) -> Int? {
+        guard itemCount > 0 else { return nil }
+        guard let currentIndex, (0..<itemCount).contains(currentIndex) else { return 0 }
+
+        let destination: Int
+        switch (viewMode, direction) {
+        case (.list, .up):
+            destination = currentIndex - 1
+        case (.list, .down):
+            destination = currentIndex + 1
+        case (.list, .left), (.list, .right):
+            return nil
+        case (.icons, .left):
+            destination = currentIndex - 1
+        case (.icons, .right):
+            destination = currentIndex + 1
+        case (.icons, .up):
+            destination = currentIndex - max(1, columnCount)
+        case (.icons, .down):
+            destination = min(itemCount - 1, currentIndex + max(1, columnCount))
+        }
+        guard (0..<itemCount).contains(destination), destination != currentIndex else { return nil }
+        return destination
     }
 }
 
@@ -73,6 +110,43 @@ final class TerminalNSView: NSView,
         let rect: NSRect
     }
 
+    private struct RenderState: Equatable {
+        let revision: UInt
+        let graphicalMode: Bool
+        let isAlternateScreen: Bool
+        let isRunning: Bool
+        let commandPrediction: String?
+
+        @MainActor
+        init(session: TerminalSession) {
+            revision = session.revision
+            graphicalMode = session.graphicalMode
+            isAlternateScreen = session.isAlternateScreen
+            isRunning = session.isRunning
+            commandPrediction = session.commandPrediction
+        }
+    }
+
+    private struct ApplicationTextStyle: Equatable {
+        let foregroundRed: UInt8
+        let foregroundGreen: UInt8
+        let foregroundBlue: UInt8
+        let flags: UInt16
+
+        init(cell: GTCell) {
+            foregroundRed = cell.fg_r
+            foregroundGreen = cell.fg_g
+            foregroundBlue = cell.fg_b
+            flags = cell.style & UInt16(GT_STYLE_BOLD | GT_STYLE_ITALIC | GT_STYLE_FAINT)
+        }
+    }
+
+    private struct ApplicationBackground: Equatable {
+        let red: UInt8
+        let green: UInt8
+        let blue: UInt8
+    }
+
     var session: TerminalSession
     var openDirectoryInNewTab: (URL) -> Void
     var openURL: (URL) -> Void
@@ -81,6 +155,12 @@ final class TerminalNSView: NSView,
     private let italicFont: NSFont
     private let cellWidth: CGFloat
     private let cellHeight: CGFloat = 20
+    private lazy var regularCellKern = cellWidth
+        - ("M" as NSString).size(withAttributes: [.font: font]).width
+    private lazy var boldCellKern = cellWidth
+        - ("M" as NSString).size(withAttributes: [.font: boldFont]).width
+    private lazy var italicCellKern = cellWidth
+        - ("M" as NSString).size(withAttributes: [.font: italicFont]).width
     private var lastGrid = (cols: UInt16(0), rows: UInt16(0))
     private var wasFocusReportingEnabled = false
     private var windowKeyObserver: NSObjectProtocol?
@@ -88,6 +168,7 @@ final class TerminalNSView: NSView,
     private var contextGraphicalItem: GraphicalFileItem?
     private var selectedBlockHistoryRows: Set<UInt64> = []
     private var selectedGraphicalPlacementID: UInt32?
+    private(set) var hasGraphicalKeyboardFocus = false
     private var hoveredGraphicalPlacementID: UInt32?
     private var dropTargetGraphicalPlacementID: UInt32?
     private var graphicalDragCandidate: (placementID: UInt32, origin: NSPoint)?
@@ -107,6 +188,7 @@ final class TerminalNSView: NSView,
     private var selectionGlowCache: [String: CGImage] = [:]
     private var quickLookURL: URL?
     private var sharingPicker: NSSharingServicePicker?
+    private var renderState: RenderState
     private let ciContext = CIContext(options: [.cacheIntermediates: true])
     private lazy var graphicalBackdropGradient: CGGradient? = {
         let colors = [
@@ -130,6 +212,7 @@ final class TerminalNSView: NSView,
         self.session = session
         self.openDirectoryInNewTab = openDirectoryInNewTab
         self.openURL = openURL
+        renderState = RenderState(session: session)
         let descriptor = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular).fontDescriptor
             .withSymbolicTraits(.italic)
         italicFont = NSFont(descriptor: descriptor, size: 14) ?? font
@@ -188,6 +271,30 @@ final class TerminalNSView: NSView,
         window.makeFirstResponder(self)
     }
 
+    func update(
+        session: TerminalSession,
+        openDirectoryInNewTab: @escaping (URL) -> Void
+    ) {
+        let nextRenderState = RenderState(session: session)
+        let needsTerminalLayout = renderState.isAlternateScreen != nextRenderState.isAlternateScreen
+        let needsTerminalDisplay = renderState != nextRenderState
+
+        self.session = session
+        self.openDirectoryInNewTab = openDirectoryInNewTab
+        renderState = nextRenderState
+        if !session.graphicalMode || session.isAlternateScreen {
+            hasGraphicalKeyboardFocus = false
+        }
+
+        if needsTerminalLayout { needsLayout = true }
+        if needsTerminalDisplay {
+            needsDisplay = true
+            window?.invalidateCursorRects(for: self)
+        }
+        syncApplicationFocusReporting()
+        revealPendingTerminalBlockNavigation()
+    }
+
     func syncApplicationFocusReporting() {
         guard let window else { return }
         defer { wasFocusReportingEnabled = session.isFocusReporting }
@@ -228,6 +335,7 @@ final class TerminalNSView: NSView,
         }
         let point = convert(event.locationInWindow, from: nil)
         if let target = blockActionHitTargets.last(where: { $0.rect.contains(point) }) {
+            hasGraphicalKeyboardFocus = false
             graphicalDragCandidate = nil
             linkActivationCandidate = nil
             textSelectionAnchor = nil
@@ -239,6 +347,7 @@ final class TerminalNSView: NSView,
         }
         if let target = imageHitTargets.last(where: { $0.rect.contains(point) }),
            let item = session.graphicalItem(for: target.placementID) {
+            hasGraphicalKeyboardFocus = true
             linkActivationCandidate = nil
             textSelectionAnchor = nil
             textSelection = nil
@@ -253,6 +362,7 @@ final class TerminalNSView: NSView,
             return
         }
         if let target = linkHitTargets.last(where: { $0.rect.contains(point) }) {
+            hasGraphicalKeyboardFocus = false
             graphicalDragCandidate = nil
             linkActivationCandidate = target
             textSelection = nil
@@ -261,6 +371,19 @@ final class TerminalNSView: NSView,
             session.setGraphicalPreviewItem(nil)
             return
         }
+        if isGraphicalFilePage(at: point) {
+            hasGraphicalKeyboardFocus = true
+            textSelection = nil
+            textSelectionAnchor = nil
+            graphicalDragCandidate = nil
+            linkActivationCandidate = nil
+            selectedBlockHistoryRows.removeAll()
+            selectedGraphicalPlacementID = nil
+            session.setGraphicalPreviewItem(nil)
+            needsDisplay = true
+            return
+        }
+        hasGraphicalKeyboardFocus = false
         textSelection = nil
         graphicalDragCandidate = nil
         linkActivationCandidate = nil
@@ -720,6 +843,7 @@ final class TerminalNSView: NSView,
     }
 
     override func keyDown(with event: NSEvent) {
+        if handleGraphicalKeyDown(event) { return }
         let predictionModifiers = event.modifierFlags.intersection([
             .command,
             .control,
@@ -747,6 +871,76 @@ final class TerminalNSView: NSView,
             clearTextSelection()
             session.sendUserInput(data)
         }
+    }
+
+    private func handleGraphicalKeyDown(_ event: NSEvent) -> Bool {
+        guard session.graphicalMode,
+              hasGraphicalKeyboardFocus,
+              !session.isAlternateScreen,
+              event.modifierFlags.intersection([.command, .control, .option]).isEmpty
+        else { return false }
+
+        let direction: GraphicalKeyboardDirection?
+        switch event.keyCode {
+        case 123: direction = .left
+        case 124: direction = .right
+        case 125: direction = .down
+        case 126: direction = .up
+        default: direction = nil
+        }
+        if let direction {
+            moveGraphicalSelection(direction)
+            return true
+        }
+        if event.keyCode == 36 || event.keyCode == 76 {
+            guard let selectedGraphicalPlacementID,
+                  let item = session.graphicalItem(for: selectedGraphicalPlacementID)
+            else { return true }
+            session.activateGraphicalItem(item)
+            return true
+        }
+        return false
+    }
+
+    private func moveGraphicalSelection(_ direction: GraphicalKeyboardDirection) {
+        let navigation = session.graphicalKeyboardNavigation
+        let currentIndex = selectedGraphicalPlacementID.flatMap {
+            navigation.placementIDs.firstIndex(of: $0)
+        }
+        guard let destinationIndex = GraphicalKeyboardNavigation.destinationIndex(
+            from: currentIndex,
+            itemCount: navigation.placementIDs.count,
+            columnCount: navigation.columnCount,
+            viewMode: session.graphicalViewMode,
+            direction: direction
+        ) else { return }
+
+        let previousIndex = currentIndex
+        let placementID = navigation.placementIDs[destinationIndex]
+        selectedGraphicalPlacementID = placementID
+        selectedBlockHistoryRows.removeAll()
+        textSelection = nil
+        textSelectionAnchor = nil
+        session.setGraphicalPreviewItem(session.graphicalItem(for: placementID))
+        if !imageHitTargets.contains(where: { $0.placementID == placementID }) {
+            let rowCount = session.graphicalItemHitLayout(for: placementID).2
+            session.scroll(rows: destinationIndex < (previousIndex ?? 0) ? -rowCount : rowCount)
+        }
+        needsDisplay = true
+    }
+
+    private func isGraphicalFilePage(at point: NSPoint) -> Bool {
+        guard session.graphicalMode,
+              let handle = session.handle,
+              let framePointer = gt_session_frame(handle),
+              let cells = framePointer.pointee.cells else { return false }
+        let frame = framePointer.pointee
+        let ranges = blockRanges(frame: frame, cells: cells)
+        let layout = blockVisualLayout(frame: frame, cells: cells, ranges: ranges)
+        guard let row = layout.row(at: point.y, cellHeight: cellHeight, nearest: false) else {
+            return false
+        }
+        return graphicalListingRows(frame: frame).contains(row)
     }
 
     nonisolated override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
@@ -1019,59 +1213,19 @@ final class TerminalNSView: NSView,
         let defaultBackground = (r: UInt8(6), g: UInt8(17), b: UInt8(24))
 
         for y in 0..<Int(frame.rows) {
-            for x in 0..<Int(frame.cols) {
-                let cell = cells[y * Int(frame.cols) + x]
-                let rect = NSRect(
-                    x: CGFloat(x) * cellWidth + leadingOffset,
-                    y: CGFloat(y) * cellHeight,
-                    width: cellWidth + 0.5,
-                    height: cellHeight
-                )
-                if cell.bg_r != defaultBackground.r
-                    || cell.bg_g != defaultBackground.g
-                    || cell.bg_b != defaultBackground.b {
-                    color(cell.bg_r, cell.bg_g, cell.bg_b).setFill()
-                    rect.fill()
-                }
-                let historyRow = frame.scroll_offset + UInt64(y)
-                if textSelection?.contains(
-                    row: historyRow,
-                    column: x,
-                    totalColumns: Int(frame.cols)
-                ) == true {
-                    NSColor(srgbRed: 0.29, green: 0.82, blue: 0.80, alpha: 0.34).setFill()
-                    rect.fill()
-                }
-                guard cell.text_len > 0,
-                      cell.style & UInt16(GT_STYLE_INVISIBLE) == 0 else { continue }
-                let text = withUnsafeBytes(of: cell.text) { raw -> String in
-                    String(decoding: raw.prefix(Int(cell.text_len)), as: UTF8.self)
-                }
-                var foreground = color(cell.fg_r, cell.fg_g, cell.fg_b)
-                if cell.style & UInt16(GT_STYLE_FAINT) != 0 {
-                    foreground = foreground.withAlphaComponent(0.58)
-                }
-                let chosenFont: NSFont
-                if cell.style & UInt16(GT_STYLE_BOLD) != 0 {
-                    chosenFont = boldFont
-                } else if cell.style & UInt16(GT_STYLE_ITALIC) != 0 {
-                    chosenFont = italicFont
-                } else {
-                    chosenFont = font
-                }
-                (text as NSString).draw(
-                    at: NSPoint(x: rect.minX, y: rect.minY + 1),
-                    withAttributes: [.font: chosenFont, .foregroundColor: foreground]
-                )
-                if cell.style & UInt16(GT_STYLE_UNDERLINE_MASK) != 0 {
-                    foreground.setFill()
-                    NSRect(x: rect.minX, y: rect.maxY - 2, width: rect.width, height: 1).fill()
-                }
-                if cell.style & UInt16(GT_STYLE_STRIKETHROUGH) != 0 {
-                    foreground.setFill()
-                    NSRect(x: rect.minX, y: rect.midY, width: rect.width, height: 1).fill()
-                }
-            }
+            drawApplicationBackgroundRow(
+                frame: frame,
+                cells: cells,
+                row: y,
+                leadingOffset: leadingOffset,
+                defaultBackground: defaultBackground
+            )
+            drawApplicationTextRow(
+                frame: frame,
+                cells: cells,
+                row: y,
+                leadingOffset: leadingOffset
+            )
         }
 
         drawImages(
@@ -1093,6 +1247,204 @@ final class TerminalNSView: NSView,
                 .setFill()
             cursor.fill(using: .screen)
         }
+    }
+
+    private func drawApplicationBackgroundRow(
+        frame: GTFrame,
+        cells: UnsafePointer<GTCell>,
+        row: Int,
+        leadingOffset: CGFloat,
+        defaultBackground: (r: UInt8, g: UInt8, b: UInt8)
+    ) {
+        var runStartColumn = 0
+        var runColor: ApplicationBackground?
+
+        for column in 0...Int(frame.cols) {
+            let nextColor: ApplicationBackground?
+            if column < Int(frame.cols) {
+                let cell = cells[row * Int(frame.cols) + column]
+                if cell.bg_r == defaultBackground.r,
+                   cell.bg_g == defaultBackground.g,
+                   cell.bg_b == defaultBackground.b {
+                    nextColor = nil
+                } else {
+                    nextColor = ApplicationBackground(
+                        red: cell.bg_r,
+                        green: cell.bg_g,
+                        blue: cell.bg_b
+                    )
+                }
+            } else {
+                nextColor = nil
+            }
+            if nextColor == runColor { continue }
+            if let runColor {
+                color(runColor.red, runColor.green, runColor.blue).setFill()
+                NSRect(
+                    x: CGFloat(runStartColumn) * cellWidth + leadingOffset,
+                    y: CGFloat(row) * cellHeight,
+                    width: CGFloat(column - runStartColumn) * cellWidth + 0.5,
+                    height: cellHeight
+                ).fill()
+            }
+            runStartColumn = column
+            runColor = nextColor
+        }
+
+        guard textSelection != nil else { return }
+        let selectionColor = NSColor(
+            srgbRed: 0.29,
+            green: 0.82,
+            blue: 0.80,
+            alpha: 0.34
+        )
+        let historyRow = frame.scroll_offset + UInt64(row)
+        for column in 0..<Int(frame.cols) where textSelection?.contains(
+            row: historyRow,
+            column: column,
+            totalColumns: Int(frame.cols)
+        ) == true {
+            selectionColor.setFill()
+            NSRect(
+                x: CGFloat(column) * cellWidth + leadingOffset,
+                y: CGFloat(row) * cellHeight,
+                width: cellWidth + 0.5,
+                height: cellHeight
+            ).fill()
+        }
+    }
+
+    private func drawApplicationTextRow(
+        frame: GTFrame,
+        cells: UnsafePointer<GTCell>,
+        row: Int,
+        leadingOffset: CGFloat
+    ) {
+        var runBytes: [UInt8] = []
+        runBytes.reserveCapacity(Int(frame.cols))
+        var runStartColumn = 0
+        var runStyle: ApplicationTextStyle?
+
+        func flushRun() {
+            guard !runBytes.isEmpty, let style = runStyle else { return }
+            drawApplicationText(
+                String(decoding: runBytes, as: UTF8.self),
+                column: runStartColumn,
+                row: row,
+                leadingOffset: leadingOffset,
+                style: style,
+                appliesCellKern: true
+            )
+            runBytes.removeAll(keepingCapacity: true)
+            runStyle = nil
+        }
+
+        for column in 0..<Int(frame.cols) {
+            let cell = cells[row * Int(frame.cols) + column]
+            guard cell.text_len > 0,
+                  cell.style & UInt16(GT_STYLE_INVISIBLE) == 0 else {
+                flushRun()
+                continue
+            }
+
+            let firstByte = withUnsafeBytes(of: cell.text) { $0[0] }
+            let hasLineDecoration = cell.style
+                & UInt16(GT_STYLE_UNDERLINE_MASK | GT_STYLE_STRIKETHROUGH) != 0
+            let canJoinRun = cell.text_len == 1
+                && firstByte >= 0x20
+                && firstByte <= 0x7E
+                && !hasLineDecoration
+            let style = ApplicationTextStyle(cell: cell)
+
+            if canJoinRun {
+                if firstByte == 0x20, runBytes.isEmpty { continue }
+                if let runStyle, runStyle != style { flushRun() }
+                if runBytes.isEmpty {
+                    runStartColumn = column
+                    runStyle = style
+                }
+                runBytes.append(firstByte)
+                continue
+            }
+
+            flushRun()
+            let text = withUnsafeBytes(of: cell.text) { raw -> String in
+                String(decoding: raw.prefix(Int(cell.text_len)), as: UTF8.self)
+            }
+            drawApplicationText(
+                text,
+                column: column,
+                row: row,
+                leadingOffset: leadingOffset,
+                style: style,
+                appliesCellKern: false
+            )
+            let foreground = applicationForeground(for: style)
+            if cell.style & UInt16(GT_STYLE_UNDERLINE_MASK) != 0 {
+                foreground.setFill()
+                NSRect(
+                    x: CGFloat(column) * cellWidth + leadingOffset,
+                    y: CGFloat(row + 1) * cellHeight - 2,
+                    width: cellWidth + 0.5,
+                    height: 1
+                ).fill()
+            }
+            if cell.style & UInt16(GT_STYLE_STRIKETHROUGH) != 0 {
+                foreground.setFill()
+                NSRect(
+                    x: CGFloat(column) * cellWidth + leadingOffset,
+                    y: CGFloat(row) * cellHeight + cellHeight / 2,
+                    width: cellWidth + 0.5,
+                    height: 1
+                ).fill()
+            }
+        }
+        flushRun()
+    }
+
+    private func drawApplicationText(
+        _ text: String,
+        column: Int,
+        row: Int,
+        leadingOffset: CGFloat,
+        style: ApplicationTextStyle,
+        appliesCellKern: Bool
+    ) {
+        let chosenFont: NSFont
+        let cellKern: CGFloat
+        if style.flags & UInt16(GT_STYLE_BOLD) != 0 {
+            chosenFont = boldFont
+            cellKern = boldCellKern
+        } else if style.flags & UInt16(GT_STYLE_ITALIC) != 0 {
+            chosenFont = italicFont
+            cellKern = italicCellKern
+        } else {
+            chosenFont = font
+            cellKern = regularCellKern
+        }
+        var attributes: [NSAttributedString.Key: Any] = [
+            .font: chosenFont,
+            .foregroundColor: applicationForeground(for: style),
+        ]
+        if appliesCellKern { attributes[.kern] = cellKern }
+        (text as NSString).draw(
+            at: NSPoint(
+                x: CGFloat(column) * cellWidth + leadingOffset,
+                y: CGFloat(row) * cellHeight + 1
+            ),
+            withAttributes: attributes
+        )
+    }
+
+    private func applicationForeground(for style: ApplicationTextStyle) -> NSColor {
+        let foreground = color(
+            style.foregroundRed,
+            style.foregroundGreen,
+            style.foregroundBlue
+        )
+        return style.flags & UInt16(GT_STYLE_FAINT) != 0
+            ? foreground.withAlphaComponent(0.58)
+            : foreground
     }
 
     private func clearApplicationScreenHitTargets() {
@@ -1547,7 +1899,8 @@ final class TerminalNSView: NSView,
         }
 
         if let selectedGraphicalPlacementID,
-           !imageHitTargets.contains(where: { $0.placementID == selectedGraphicalPlacementID }) {
+           !imageHitTargets.contains(where: { $0.placementID == selectedGraphicalPlacementID }),
+           !session.isCurrentGraphicalPlacement(selectedGraphicalPlacementID) {
             self.selectedGraphicalPlacementID = nil
         }
         if let hoveredGraphicalPlacementID,
@@ -2356,7 +2709,8 @@ final class TerminalNSView: NSView,
         let ranges = TerminalBlockRangeResolver.ranges(
             rowSemantics: semantics,
             visibleRows: visibleRows,
-            cursorRow: frame.cursor_visible ? Int(frame.cursor_y) : nil
+            cursorRow: frame.cursor_visible ? Int(frame.cursor_y) : nil,
+            inputRows: inputRows
         )
         return TerminalBlockRangeResolver.mergingGraphicalOutputWithActivePrompt(
             ranges: ranges,

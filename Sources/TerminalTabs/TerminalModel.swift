@@ -103,6 +103,15 @@ struct CommandLineTracker {
         guard isReliable else { return "" }
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
+    mutating func appendPastedText(_ value: String) {
+        guard isReliable else { return }
+        if value.unicodeScalars.contains(where: { $0.value == 0x1B }) {
+            isReliable = false
+            return
+        }
+        text.append(contentsOf: value)
+    }
 }
 
 @MainActor
@@ -167,6 +176,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var nextGraphicalPlacementID: UInt32 = 1
     private var graphicalItemsByPlacementID: [UInt32: GraphicalFileItem] = [:]
     private var graphicalHitLayoutsByPlacementID: [UInt32: GraphicalHitLayout] = [:]
+    private var currentGraphicalPlacementIDs: [UInt32] = []
+    private var currentGraphicalNavigationColumnCount = 1
     private var currentGraphicalListing: GraphicalDirectoryListing?
     private var graphicalNavigationTask: Task<Void, Never>?
     private var graphicalStartupTask: Task<Void, Never>?
@@ -234,40 +245,55 @@ final class TerminalSession: ObservableObject, Identifiable {
             refreshFrame()
             if !isAlternateScreen { refreshCapturedCommandOutput() }
         }
-        isRunning = gt_session_is_running(handle)
+        let running = gt_session_is_running(handle)
+        if isRunning != running { isRunning = running }
     }
 
     func refreshFrame() {
         guard let handle, let frame = gt_session_frame(handle) else { return }
         terminalColumns = Int(frame.pointee.cols)
-        isAlternateScreen = frame.pointee.alternate_screen
+        let alternateScreen = frame.pointee.alternate_screen
+        if isAlternateScreen != alternateScreen { isAlternateScreen = alternateScreen }
         if isAlternateScreen, commandPrediction != nil { commandPrediction = nil }
-        isMouseReporting = frame.pointee.mouse_reporting
-        isFocusReporting = frame.pointee.focus_reporting
-        isCursorAtPrompt = frame.pointee.cursor_at_prompt
-        isBracketedPasteEnabled = frame.pointee.bracketed_paste
+        if isMouseReporting != frame.pointee.mouse_reporting {
+            isMouseReporting = frame.pointee.mouse_reporting
+        }
+        if isFocusReporting != frame.pointee.focus_reporting {
+            isFocusReporting = frame.pointee.focus_reporting
+        }
+        if isCursorAtPrompt != frame.pointee.cursor_at_prompt {
+            isCursorAtPrompt = frame.pointee.cursor_at_prompt
+        }
+        if isBracketedPasteEnabled != frame.pointee.bracketed_paste {
+            isBracketedPasteEnabled = frame.pointee.bracketed_paste
+        }
         if let pointer = frame.pointee.title {
             let value = String(cString: pointer).unicodeScalars.filter { scalar in
                 !CharacterSet.controlCharacters.contains(scalar)
                     && !(0x202A...0x202E).contains(scalar.value)
                     && !(0x2066...0x2069).contains(scalar.value)
             }.map(String.init).joined()
-            terminalTitle = value.isEmpty ? "Shell" : value
-            if customTitle == nil { title = terminalTitle }
+            let nextTitle = value.isEmpty ? "Shell" : value
+            terminalTitle = nextTitle
+            if customTitle == nil, title != nextTitle { title = nextTitle }
         }
         if let pointer = frame.pointee.working_directory {
             let value = String(cString: pointer)
             if !value.isEmpty {
                 let decoded = value.removingPercentEncoding ?? value
+                let nextDirectory: String
                 if let url = URL(string: decoded), url.isFileURL {
-                    shellWorkingDirectory = url.path
+                    nextDirectory = url.path
                 } else {
-                    shellWorkingDirectory = decoded
+                    nextDirectory = decoded
                 }
-                workingDirectory = shellWorkingDirectory
+                shellWorkingDirectory = nextDirectory
+                if workingDirectory != nextDirectory {
+                    workingDirectory = nextDirectory
+                }
             }
         }
-        refreshGitBranch()
+        if !isAlternateScreen { refreshGitBranch() }
     }
 
     private func refreshGitBranch(forceBranches: Bool = false) {
@@ -487,6 +513,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         return suffix.isEmpty ? nil : String(suffix)
     }
 
+    var pendingCommandInput: String? {
+        isMarkingInput ? commandLine.text : nil
+    }
+
     @discardableResult
     func acceptCommandPrediction() -> Bool {
         guard let suffix = commandPredictionSuffix, !isAlternateScreen else { return false }
@@ -509,14 +539,17 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func sendPendingInput(_ data: Data, handle: OpaquePointer) {
         guard !data.isEmpty else { return }
-        if !isMarkingInput {
-            gt_session_mark_input(handle)
-            isMarkingInput = true
-            revision &+= 1
-        }
+        beginCommandInputIfNeeded(handle: handle)
         commandLine.append(data)
         refreshCommandPrediction()
         write(data)
+    }
+
+    private func beginCommandInputIfNeeded(handle: OpaquePointer) {
+        guard !isMarkingInput else { return }
+        gt_session_mark_input(handle)
+        isMarkingInput = true
+        revision &+= 1
     }
 
     private func submitCommand(_ byte: UInt8, handle: OpaquePointer) {
@@ -1185,6 +1218,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         return (layout.leadingColumns, layout.widthColumns, layout.rowHeight)
     }
 
+    var graphicalKeyboardNavigation: (placementIDs: [UInt32], columnCount: Int) {
+        (currentGraphicalPlacementIDs, currentGraphicalNavigationColumnCount)
+    }
+
+    func isCurrentGraphicalPlacement(_ placementID: UInt32) -> Bool {
+        currentGraphicalPlacementIDs.contains(placementID)
+    }
+
     nonisolated static func shellQuoted(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
@@ -1394,6 +1435,13 @@ final class TerminalSession: ObservableObject, Identifiable {
             error: nil,
             isLoading: false
         )
+        currentGraphicalPlacementIDs.removeAll(keepingCapacity: true)
+        currentGraphicalNavigationColumnCount = if request.detailed
+            || graphicalViewMode == .list {
+            1
+        } else {
+            max(1, (terminalColumns - 2) / 10)
+        }
 
         // Clear the command buffered by the interactive shell. The app renders
         // the equivalent output into libghostty-vt, then submits a blank line so
@@ -1489,6 +1537,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 guard let imageID = imageIDs[item.kind] else { continue }
                 let placementID = nextGraphicalPlacementID
                 nextGraphicalPlacementID &+= 1
+                currentGraphicalPlacementIDs.append(placementID)
                 let tileStart = outerMarginColumns + index * tileWidth
                 let iconOffset = (tileWidth - iconWidth) / 2
                 let iconColumn = tileStart + iconOffset
@@ -1527,6 +1576,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             guard let imageID = imageIDs[item.kind] else { continue }
             let placementID = nextGraphicalPlacementID
             nextGraphicalPlacementID &+= 1
+            currentGraphicalPlacementIDs.append(placementID)
             append("\u{1B}[\(iconColumn + 1)G")
             append("\u{1B}_Ga=p,i=\(imageID),p=\(placementID),c=2,r=1,C=1,q=2\u{1B}\\")
             let name = Self.truncatedGraphicalName(item.name, maximumCharacters: nameWidth)
@@ -1561,6 +1611,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 guard let imageID = imageIDs[item.kind] else { continue }
                 let placementID = nextGraphicalPlacementID
                 nextGraphicalPlacementID &+= 1
+                currentGraphicalPlacementIDs.append(placementID)
                 graphicalItemsByPlacementID[placementID] = item
                 graphicalHitLayoutsByPlacementID[placementID] = GraphicalHitLayout(
                     leadingColumns: 0,
@@ -1593,6 +1644,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             guard let imageID = imageIDs[item.kind] else { continue }
             let placementID = nextGraphicalPlacementID
             nextGraphicalPlacementID &+= 1
+            currentGraphicalPlacementIDs.append(placementID)
             append("\u{1B}[\(iconColumn + 1)G")
             append("\u{1B}_Ga=p,i=\(imageID),p=\(placementID),c=2,r=1,C=1,q=2\u{1B}\\")
 
@@ -2269,6 +2321,12 @@ final class TerminalSession: ObservableObject, Identifiable {
     func paste(_ value: String) {
         guard !value.isEmpty else { return }
         if isBracketedPasteEnabled {
+            if !isAlternateScreen, let handle {
+                _ = gt_session_scroll_to_bottom(handle)
+                beginCommandInputIfNeeded(handle: handle)
+                commandLine.appendPastedText(value)
+                refreshCommandPrediction()
+            }
             write(Data("\u{1B}[200~\(value)\u{1B}[201~".utf8))
         } else {
             sendUserInput(Data(value.utf8))
@@ -2826,6 +2884,22 @@ final class TerminalStore: ObservableObject {
     func toggleGroupCollapsed(_ id: UUID) {
         guard let index = groupIndex(for: id) else { return }
         groups[index].isCollapsed.toggle()
+    }
+
+    @discardableResult
+    func moveTab(_ id: UUID, to targetID: UUID, in groupID: UUID) -> Bool {
+        guard id != targetID,
+              let groupIndex = groupIndex(for: groupID),
+              let sourceIndex = groups[groupIndex].tabs.firstIndex(where: { $0.id == id }),
+              let targetIndex = groups[groupIndex].tabs.firstIndex(where: { $0.id == targetID })
+        else { return false }
+
+        let tab = groups[groupIndex].tabs.remove(at: sourceIndex)
+        groups[groupIndex].tabs.insert(
+            tab,
+            at: min(targetIndex, groups[groupIndex].tabs.endIndex)
+        )
+        return true
     }
 
     func select(_ index: Int) {

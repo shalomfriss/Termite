@@ -50,9 +50,11 @@ struct TerminalBlockRangeResolver {
         let rowCount = min(result.count, inputRows.count)
         for row in 0..<rowCount where inputRows[row] {
             let continuesPreviousInput = row > 0 && inputRows[row - 1]
-            if !continuesPreviousInput {
-                result[row] = 1
-            }
+            // A command may wrap across several terminal rows, but it still has
+            // only one semantic beginning. Some shells copy the input semantic
+            // marker onto every wrapped row, so explicitly clear those duplicate
+            // starts instead of turning each visual line into its own block.
+            result[row] = continuesPreviousInput ? 0 : 1
         }
         return result
     }
@@ -60,7 +62,8 @@ struct TerminalBlockRangeResolver {
     static func ranges(
         rowSemantics: [UInt8],
         visibleRows: [Bool],
-        cursorRow: Int?
+        cursorRow: Int?,
+        inputRows: [Bool] = []
     ) -> [Range<Int>] {
         let rowCount = min(rowSemantics.count, visibleRows.count)
         guard rowCount > 0 else { return [] }
@@ -74,7 +77,8 @@ struct TerminalBlockRangeResolver {
             if index == starts.count - 1,
                let cursorRow,
                cursorRow > start,
-               cursorRow < rowCount {
+               cursorRow < rowCount,
+               !(inputRows.indices.contains(cursorRow) && inputRows[cursorRow]) {
                 limit = min(limit, cursorRow)
             }
 

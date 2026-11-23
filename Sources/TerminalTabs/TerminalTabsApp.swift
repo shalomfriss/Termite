@@ -321,7 +321,9 @@ struct HorizontalTabBar: View {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 4) {
                             ForEach(store.tabs) { tab in
-                                TerminalTabButton(
+                                ReorderableTerminalTabButton(
+                                    store: store,
+                                    groupID: store.selectedGroupID,
                                     tab: tab,
                                     selected: tab.id == store.selectedID,
                                     vertical: false,
@@ -401,7 +403,9 @@ struct VerticalTabSidebar: View {
 
                             if !group.isCollapsed {
                                 ForEach(group.tabs) { tab in
-                                    TerminalTabButton(
+                                    ReorderableTerminalTabButton(
+                                        store: store,
+                                        groupID: group.id,
                                         tab: tab,
                                         selected: tab.id == store.selectedID,
                                         vertical: true,
@@ -529,6 +533,45 @@ struct SmallIconButton: View {
         .buttonStyle(.plain)
         .foregroundStyle(TerminalTheme.cyanMuted)
         .help(help)
+    }
+}
+
+struct ReorderableTerminalTabButton: View {
+    @ObservedObject var store: TerminalStore
+    let groupID: UUID?
+    @ObservedObject var tab: TerminalSession
+    let selected: Bool
+    let vertical: Bool
+    let select: () -> Void
+    let close: () -> Void
+    @State private var isDropTarget = false
+
+    var body: some View {
+        TerminalTabButton(
+            tab: tab,
+            selected: selected,
+            vertical: vertical,
+            select: select,
+            close: close
+        )
+        .overlay {
+            if isDropTarget {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(TerminalTheme.cyan, lineWidth: 2)
+                    .padding(.horizontal, vertical ? 6 : 0)
+                    .allowsHitTesting(false)
+            }
+        }
+        .draggable(tab.id.uuidString)
+        .dropDestination(for: String.self) { values, _ in
+            guard let groupID,
+                  let value = values.first,
+                  let sourceID = UUID(uuidString: value)
+            else { return false }
+            return store.moveTab(sourceID, to: tab.id, in: groupID)
+        } isTargeted: { isTargeted in
+            isDropTarget = isTargeted
+        }
     }
 }
 

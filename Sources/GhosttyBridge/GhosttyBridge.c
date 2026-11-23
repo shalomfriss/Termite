@@ -539,6 +539,9 @@ const GTFrame *gt_session_frame(GTSession *s) {
         colors.foreground = fallback_fg(); colors.background = fallback_bg();
     }
     api.render_get(s->render, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cursor);
+    int active_screen = 0;
+    api.terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &active_screen);
+    bool alternate_screen = active_screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE;
 
     size_t needed = (size_t)cols * rows;
     if (needed > s->cell_capacity) {
@@ -558,11 +561,13 @@ const GTFrame *gt_session_frame(GTSession *s) {
     if (api.render_get(s->render, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &s->rows) != GHOSTTY_SUCCESS) return NULL;
     uint16_t y = 0;
     while (y < rows && api.row_next(s->rows)) {
-        GhosttyRowRaw raw_row = 0;
-        if (api.row_get(s->rows, GHOSTTY_RENDER_STATE_ROW_DATA_RAW, &raw_row) == GHOSTTY_SUCCESS) {
-            int semantic = 0;
-            if (api.screen_row_get(raw_row, GHOSTTY_ROW_DATA_SEMANTIC_PROMPT, &semantic) == GHOSTTY_SUCCESS) {
-                s->row_semantics[y] = (uint8_t)semantic;
+        if (!alternate_screen) {
+            GhosttyRowRaw raw_row = 0;
+            if (api.row_get(s->rows, GHOSTTY_RENDER_STATE_ROW_DATA_RAW, &raw_row) == GHOSTTY_SUCCESS) {
+                int semantic = 0;
+                if (api.screen_row_get(raw_row, GHOSTTY_ROW_DATA_SEMANTIC_PROMPT, &semantic) == GHOSTTY_SUCCESS) {
+                    s->row_semantics[y] = (uint8_t)semantic;
+                }
             }
         }
         if (api.row_get(s->rows, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &s->cells) != GHOSTTY_SUCCESS) { y++; continue; }
@@ -575,7 +580,8 @@ const GTFrame *gt_session_frame(GTSession *s) {
             GhosttyCellRaw raw = 0;
             api.cells_get(s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &text);
             api.cells_get(s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style);
-            if (api.cells_get(s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw) == GHOSTTY_SUCCESS) {
+            if (!alternate_screen &&
+                api.cells_get(s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw) == GHOSTTY_SUCCESS) {
                 int semantic = 0;
                 if (api.cell_get(raw, 9, &semantic) == GHOSTTY_SUCCESS) {
                     out->semantic_content = (uint8_t)semantic;
@@ -602,27 +608,28 @@ const GTFrame *gt_session_frame(GTSession *s) {
     } else {
         strcpy(s->title, "Shell");
     }
-    struct proc_vnodepathinfo path_info = {0};
-    int path_info_size = proc_pidinfo(s->child, PROC_PIDVNODEPATHINFO, 0,
-                                     &path_info, sizeof(path_info));
-    if (path_info_size == sizeof(path_info) && path_info.pvi_cdir.vip_path[0]) {
-        snprintf(s->working_directory, sizeof(s->working_directory), "%s",
-                 path_info.pvi_cdir.vip_path);
-    } else {
-        GhosttyString working_directory = {0};
-        if (api.terminal_get(s->terminal, 13, &working_directory) == GHOSTTY_SUCCESS && working_directory.ptr) {
-            size_t count = working_directory.len < sizeof(s->working_directory) - 1
-                ? working_directory.len : sizeof(s->working_directory) - 1;
-            memcpy(s->working_directory, working_directory.ptr, count);
-            s->working_directory[count] = 0;
+    if (!alternate_screen) {
+        struct proc_vnodepathinfo path_info = {0};
+        int path_info_size = proc_pidinfo(s->child, PROC_PIDVNODEPATHINFO, 0,
+                                         &path_info, sizeof(path_info));
+        if (path_info_size == sizeof(path_info) && path_info.pvi_cdir.vip_path[0]) {
+            snprintf(s->working_directory, sizeof(s->working_directory), "%s",
+                     path_info.pvi_cdir.vip_path);
         } else {
-            s->working_directory[0] = 0;
+            GhosttyString working_directory = {0};
+            if (api.terminal_get(s->terminal, 13, &working_directory) == GHOSTTY_SUCCESS && working_directory.ptr) {
+                size_t count = working_directory.len < sizeof(s->working_directory) - 1
+                    ? working_directory.len : sizeof(s->working_directory) - 1;
+                memcpy(s->working_directory, working_directory.ptr, count);
+                s->working_directory[count] = 0;
+            } else {
+                s->working_directory[0] = 0;
+            }
         }
     }
     GhosttyColorRgb cursor_color = colors.cursor_has_value ? colors.cursor : colors.foreground;
     GhosttyTerminalScrollbar scrollbar = {0};
     api.terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &scrollbar);
-    int active_screen = 0;
     bool mouse_reporting = false;
     bool cursor_at_prompt = false;
     GhosttyTerminalModeConfig focus_mode = {
@@ -633,7 +640,6 @@ const GTFrame *gt_session_frame(GTSession *s) {
         .mode = GHOSTTY_MODE_BRACKETED_PASTE,
         .value = false,
     };
-    api.terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &active_screen);
     api.terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &mouse_reporting);
     api.terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_CURSOR_AT_PROMPT, &cursor_at_prompt);
     bool focus_reporting = api.terminal_get(
@@ -659,7 +665,7 @@ const GTFrame *gt_session_frame(GTSession *s) {
         .scroll_total = scrollbar.total,
         .scroll_offset = scrollbar.offset,
         .scroll_length = scrollbar.len,
-        .alternate_screen = active_screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE,
+        .alternate_screen = alternate_screen,
         .mouse_reporting = mouse_reporting,
         .focus_reporting = focus_reporting,
         .cursor_at_prompt = cursor_at_prompt,
@@ -781,8 +787,15 @@ void gt_session_mark_output(GTSession *s) {
        semantic state so the command remains tagged as input. */
     if (s && s->master_fd >= 0) {
         struct pollfd descriptor = {.fd = s->master_fd, .events = POLLIN};
-        if (poll(&descriptor, 1, 12) > 0 && (descriptor.revents & POLLIN)) {
-            gt_session_poll(s);
+        bool drained_input = false;
+        for (int attempt = 0; attempt < 4; attempt++) {
+            descriptor.revents = 0;
+            if (poll(&descriptor, 1, 15) > 0 && (descriptor.revents & POLLIN)) {
+                gt_session_poll(s);
+                drained_input = true;
+            } else if (drained_input) {
+                break;
+            }
         }
     }
     if (s) {
