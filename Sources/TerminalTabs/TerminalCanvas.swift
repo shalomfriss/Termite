@@ -74,6 +74,18 @@ final class TerminalNSView: NSView,
     static let blockCornerRadius: CGFloat = 4
     private static let blockOuterMargin: CGFloat = 8
     private static let terminalContentInset: CGFloat = 10
+    private static let canvasColor = NSColor(
+        srgbRed: 0.035,
+        green: 0.039,
+        blue: 0.045,
+        alpha: 1
+    )
+    private static let blockColor = NSColor(
+        srgbRed: 0.055,
+        green: 0.061,
+        blue: 0.070,
+        alpha: 1
+    )
 
     private struct BlockContents: Equatable {
         let id: TerminalBlockID
@@ -96,6 +108,15 @@ final class TerminalNSView: NSView,
         let block: BlockContents?
         let rect: NSRect
         let isEnabled: Bool
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.action == rhs.action
+                && lhs.blockID == rhs.blockID
+                && lhs.block?.command == rhs.block?.command
+                && lhs.block?.workingDirectory == rhs.block?.workingDirectory
+                && lhs.rect == rhs.rect
+                && lhs.isEnabled == rhs.isEnabled
+        }
     }
 
     private struct ImageHitTarget: Equatable {
@@ -182,18 +203,21 @@ final class TerminalNSView: NSView,
     private var linkHitTargets: [LinkHitTarget] = []
     private var blockActionToolTipTags: [NSView.ToolTipTag] = []
     private var linkToolTipTags: [NSView.ToolTipTag] = []
+    private var textRunBytes: [UInt8] = []
     private var graphicalTrackingArea: NSTrackingArea?
     private var imageCache: [UInt32: CGImage] = [:]
     private var folderBloomCache: [UInt32: CGImage] = [:]
     private var selectionGlowCache: [String: CGImage] = [:]
+    private var blockActionImageCache: [String: NSImage] = [:]
     private var quickLookURL: URL?
     private var sharingPicker: NSSharingServicePicker?
     private var renderState: RenderState
+    private(set) var lastDrawDuration: TimeInterval = 0
     private let ciContext = CIContext(options: [.cacheIntermediates: true])
     private lazy var graphicalBackdropGradient: CGGradient? = {
         let colors = [
-            NSColor(srgbRed: 0.15, green: 0.55, blue: 0.59, alpha: 0.15).cgColor,
-            NSColor(srgbRed: 0.02, green: 0.12, blue: 0.15, alpha: 0).cgColor,
+            NSColor.white.withAlphaComponent(0.035).cgColor,
+            NSColor.white.withAlphaComponent(0).cgColor,
         ] as CFArray
         return CGGradient(
             colorsSpace: CGColorSpaceCreateDeviceRGB(),
@@ -219,7 +243,7 @@ final class TerminalNSView: NSView,
         cellWidth = ceil(("M" as NSString).size(withAttributes: [.font: font]).width)
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.backgroundColor = NSColor(red: 0.024, green: 0.067, blue: 0.094, alpha: 1).cgColor
+        layer?.backgroundColor = Self.canvasColor.cgColor
         registerForDraggedTypes([.fileURL])
     }
 
@@ -972,6 +996,10 @@ final class TerminalNSView: NSView,
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        let drawStart = ProcessInfo.processInfo.systemUptime
+        defer {
+            lastDrawDuration = ProcessInfo.processInfo.systemUptime - drawStart
+        }
         guard let handle = session.handle, let framePointer = gt_session_frame(handle) else {
             drawMessage(session.error ?? "Terminal unavailable")
             return
@@ -982,7 +1010,7 @@ final class TerminalNSView: NSView,
         if session.graphicalMode && !frame.alternate_screen {
             drawGraphicalBackdrop(in: context)
         } else {
-            context?.setFillColor(NSColor(red: 0.024, green: 0.067, blue: 0.094, alpha: 1).cgColor)
+            context?.setFillColor(Self.canvasColor.cgColor)
             context?.fill(bounds)
         }
 
@@ -1003,10 +1031,10 @@ final class TerminalNSView: NSView,
                 rowLeadingOffsets[row] = Self.blockContentLeadingOffset
             }
         }
-        let blockFill = NSColor(red: 0.035, green: 0.094, blue: 0.122, alpha: 1)
-        let blockBorder = NSColor(red: 0.20, green: 0.55, blue: 0.62, alpha: 0.25)
-        let selectedFill = NSColor(red: 0.050, green: 0.135, blue: 0.165, alpha: 1)
-        let selectedBorder = NSColor(red: 0.32, green: 0.84, blue: 0.88, alpha: 0.48)
+        let blockFill = Self.blockColor
+        let blockBorder = NSColor.white.withAlphaComponent(0.085)
+        let selectedFill = NSColor(srgbRed: 0.085, green: 0.093, blue: 0.105, alpha: 1)
+        let selectedBorder = NSColor.white.withAlphaComponent(0.30)
         for (index, range) in ranges.enumerated() {
             let verticalFrame = visualLayout.blockFrames[index]
             let rect = NSRect(
@@ -1057,61 +1085,20 @@ final class TerminalNSView: NSView,
         drawGraphicalItemSurfaces()
 
         for y in 0..<Int(frame.rows) where !visualLayout.hiddenRows.contains(y) {
-            let isInBlock = ranges.contains { $0.contains(y) }
-            for x in 0..<Int(frame.cols) {
-                let cell = cells[y * Int(frame.cols) + x]
-                let rect = NSRect(x: CGFloat(x) * cellWidth + rowLeadingOffsets[y],
-                                  y: CGFloat(y) * cellHeight + rowOffsets[y],
-                                  width: cellWidth + 0.5, height: cellHeight)
-                let hasDefaultBackground = cell.bg_r == 6 && cell.bg_g == 17 && cell.bg_b == 24
-                let shouldDrawBackground = !hasDefaultBackground
-                    || (!session.graphicalMode && !isInBlock)
-                if shouldDrawBackground {
-                    color(cell.bg_r, cell.bg_g, cell.bg_b).setFill()
-                    rect.fill()
-                }
-                let historyRow = frame.scroll_offset + UInt64(y)
-                if textSelection?.contains(
-                    row: historyRow,
-                    column: x,
-                    totalColumns: Int(frame.cols)
-                ) == true {
-                    NSColor(srgbRed: 0.29, green: 0.82, blue: 0.80, alpha: 0.34).setFill()
-                    rect.fill()
-                }
-                guard cell.text_len > 0, cell.style & UInt16(GT_STYLE_INVISIBLE) == 0 else { continue }
-                let text = withUnsafeBytes(of: cell.text) { raw -> String in
-                    String(decoding: raw.prefix(Int(cell.text_len)), as: UTF8.self)
-                }
-                var foreground = color(cell.fg_r, cell.fg_g, cell.fg_b)
-                if cell.style & UInt16(GT_STYLE_FAINT) != 0 { foreground = foreground.withAlphaComponent(0.58) }
-                let chosenFont: NSFont
-                if cell.style & UInt16(GT_STYLE_BOLD) != 0 { chosenFont = boldFont }
-                else if cell.style & UInt16(GT_STYLE_ITALIC) != 0 { chosenFont = italicFont }
-                else { chosenFont = font }
-                let link = linkHitTargets.first {
-                    $0.row == y && $0.columns.contains(x)
-                }
-                if let link {
-                    let isHovered = link == hoveredLink
-                    foreground = NSColor(
-                        srgbRed: isHovered ? 0.48 : 0.38,
-                        green: isHovered ? 0.96 : 0.84,
-                        blue: isHovered ? 0.96 : 0.86,
-                        alpha: 1
-                    )
-                }
-                (text as NSString).draw(at: NSPoint(x: rect.minX, y: rect.minY + 1),
-                                        withAttributes: [.font: chosenFont, .foregroundColor: foreground])
-                if link != nil || cell.style & UInt16(GT_STYLE_UNDERLINE_MASK) != 0 {
-                    foreground.setFill()
-                    NSRect(x: rect.minX, y: rect.maxY - 2, width: rect.width, height: 1).fill()
-                }
-                if cell.style & UInt16(GT_STYLE_STRIKETHROUGH) != 0 {
-                    foreground.setFill()
-                    NSRect(x: rect.minX, y: rect.midY, width: rect.width, height: 1).fill()
-                }
-            }
+            drawTerminalBackgroundRow(
+                frame: frame,
+                cells: cells,
+                row: y,
+                rowOffset: rowOffsets[y],
+                leadingOffset: rowLeadingOffsets[y]
+            )
+            drawTerminalTextRow(
+                frame: frame,
+                cells: cells,
+                row: y,
+                rowOffset: rowOffsets[y],
+                leadingOffset: rowLeadingOffsets[y]
+            )
         }
 
         // Keep labels crisp by painting the item surfaces before terminal text,
@@ -1167,9 +1154,9 @@ final class TerminalNSView: NSView,
         let attributes: [NSAttributedString.Key: Any] = [
             .font: font,
             .foregroundColor: NSColor(
-                srgbRed: 0.50,
-                green: 0.65,
-                blue: 0.71,
+                srgbRed: 0.57,
+                green: 0.59,
+                blue: 0.62,
                 alpha: 0.48
             ),
         ]
@@ -1228,12 +1215,14 @@ final class TerminalNSView: NSView,
             )
         }
 
-        drawImages(
-            frame,
-            rowOffsets: Array(repeating: 0, count: Int(frame.rows)),
-            rowLeadingOffsets: Array(repeating: leadingOffset, count: Int(frame.rows)),
-            hiddenRows: []
-        )
+        if frame.image_count > 0 {
+            drawImages(
+                frame,
+                rowOffsets: Array(repeating: 0, count: Int(frame.rows)),
+                rowLeadingOffsets: Array(repeating: leadingOffset, count: Int(frame.rows)),
+                hiddenRows: []
+            )
+        }
 
         if frame.cursor_visible {
             let cursor = NSRect(
@@ -1247,6 +1236,164 @@ final class TerminalNSView: NSView,
                 .setFill()
             cursor.fill(using: .screen)
         }
+    }
+
+    private func drawTerminalBackgroundRow(
+        frame: GTFrame,
+        cells: UnsafePointer<GTCell>,
+        row: Int,
+        rowOffset: CGFloat,
+        leadingOffset: CGFloat
+    ) {
+        let defaultBackground = ApplicationBackground(red: 6, green: 17, blue: 24)
+        var runStartColumn = 0
+        var runColor: ApplicationBackground?
+        let columns = Int(frame.cols)
+
+        for column in 0...columns {
+            let nextColor: ApplicationBackground?
+            if column < columns {
+                let cell = cells[row * columns + column]
+                let background = ApplicationBackground(
+                    red: cell.bg_r,
+                    green: cell.bg_g,
+                    blue: cell.bg_b
+                )
+                nextColor = background == defaultBackground ? nil : background
+            } else {
+                nextColor = nil
+            }
+            if nextColor == runColor { continue }
+            if let runColor {
+                color(runColor.red, runColor.green, runColor.blue).setFill()
+                NSRect(
+                    x: CGFloat(runStartColumn) * cellWidth + leadingOffset,
+                    y: CGFloat(row) * cellHeight + rowOffset,
+                    width: CGFloat(column - runStartColumn) * cellWidth + 0.5,
+                    height: cellHeight
+                ).fill()
+            }
+            runStartColumn = column
+            runColor = nextColor
+        }
+
+        guard textSelection != nil else { return }
+        let selectionColor = NSColor(
+            white: 0.72,
+            alpha: 0.22
+        )
+        let historyRow = frame.scroll_offset + UInt64(row)
+        for column in 0..<columns where textSelection?.contains(
+            row: historyRow,
+            column: column,
+            totalColumns: columns
+        ) == true {
+            selectionColor.setFill()
+            NSRect(
+                x: CGFloat(column) * cellWidth + leadingOffset,
+                y: CGFloat(row) * cellHeight + rowOffset,
+                width: cellWidth + 0.5,
+                height: cellHeight
+            ).fill()
+        }
+    }
+
+    private func drawTerminalTextRow(
+        frame: GTFrame,
+        cells: UnsafePointer<GTCell>,
+        row: Int,
+        rowOffset: CGFloat,
+        leadingOffset: CGFloat
+    ) {
+        textRunBytes.removeAll(keepingCapacity: true)
+        textRunBytes.reserveCapacity(Int(frame.cols))
+        var runStartColumn = 0
+        var runStyle: ApplicationTextStyle?
+        let columns = Int(frame.cols)
+        let rowLinks = linkHitTargets.filter { $0.row == row }
+
+        func flushRun() {
+            guard !textRunBytes.isEmpty, let style = runStyle else { return }
+            drawApplicationText(
+                String(decoding: textRunBytes, as: UTF8.self),
+                column: runStartColumn,
+                row: row,
+                rowOffset: rowOffset,
+                leadingOffset: leadingOffset,
+                style: style,
+                appliesCellKern: true
+            )
+            textRunBytes.removeAll(keepingCapacity: true)
+            runStyle = nil
+        }
+
+        for column in 0..<columns {
+            let cell = cells[row * columns + column]
+            guard cell.text_len > 0,
+                  cell.style & UInt16(GT_STYLE_INVISIBLE) == 0 else {
+                flushRun()
+                continue
+            }
+            let link = rowLinks.first { $0.columns.contains(column) }
+            let firstByte = withUnsafeBytes(of: cell.text) { $0[0] }
+            let hasLineDecoration = cell.style
+                & UInt16(GT_STYLE_UNDERLINE_MASK | GT_STYLE_STRIKETHROUGH) != 0
+            let canJoinRun = link == nil
+                && cell.text_len == 1
+                && firstByte >= 0x20
+                && firstByte <= 0x7E
+                && !hasLineDecoration
+            let style = ApplicationTextStyle(cell: cell)
+
+            if canJoinRun {
+                if firstByte == 0x20, textRunBytes.isEmpty { continue }
+                if let runStyle, runStyle != style { flushRun() }
+                if textRunBytes.isEmpty {
+                    runStartColumn = column
+                    runStyle = style
+                }
+                textRunBytes.append(firstByte)
+                continue
+            }
+
+            flushRun()
+            let text = withUnsafeBytes(of: cell.text) { raw -> String in
+                String(decoding: raw.prefix(Int(cell.text_len)), as: UTF8.self)
+            }
+            var foreground = applicationForeground(for: style)
+            if let link {
+                let isHovered = link == hoveredLink
+                foreground = NSColor(
+                    srgbRed: isHovered ? 0.48 : 0.38,
+                    green: isHovered ? 0.96 : 0.84,
+                    blue: isHovered ? 0.96 : 0.86,
+                    alpha: 1
+                )
+            }
+            let chosenFont: NSFont
+            if cell.style & UInt16(GT_STYLE_BOLD) != 0 { chosenFont = boldFont }
+            else if cell.style & UInt16(GT_STYLE_ITALIC) != 0 { chosenFont = italicFont }
+            else { chosenFont = font }
+            let rect = NSRect(
+                x: CGFloat(column) * cellWidth + leadingOffset,
+                y: CGFloat(row) * cellHeight + rowOffset,
+                width: cellWidth + 0.5,
+                height: cellHeight
+            )
+            (text as NSString).draw(
+                at: NSPoint(x: rect.minX, y: rect.minY + 1),
+                withAttributes: [.font: chosenFont, .foregroundColor: foreground]
+            )
+            if link != nil || cell.style & UInt16(GT_STYLE_UNDERLINE_MASK) != 0 {
+                foreground.setFill()
+                NSRect(x: rect.minX, y: rect.maxY - 2, width: rect.width, height: 1).fill()
+            }
+            if cell.style & UInt16(GT_STYLE_STRIKETHROUGH) != 0 {
+                foreground.setFill()
+                NSRect(x: rect.minX, y: rect.midY, width: rect.width, height: 1).fill()
+            }
+        }
+        flushRun()
     }
 
     private func drawApplicationBackgroundRow(
@@ -1293,10 +1440,8 @@ final class TerminalNSView: NSView,
 
         guard textSelection != nil else { return }
         let selectionColor = NSColor(
-            srgbRed: 0.29,
-            green: 0.82,
-            blue: 0.80,
-            alpha: 0.34
+            white: 0.72,
+            alpha: 0.22
         )
         let historyRow = frame.scroll_offset + UInt64(row)
         for column in 0..<Int(frame.cols) where textSelection?.contains(
@@ -1320,22 +1465,22 @@ final class TerminalNSView: NSView,
         row: Int,
         leadingOffset: CGFloat
     ) {
-        var runBytes: [UInt8] = []
-        runBytes.reserveCapacity(Int(frame.cols))
+        textRunBytes.removeAll(keepingCapacity: true)
+        textRunBytes.reserveCapacity(Int(frame.cols))
         var runStartColumn = 0
         var runStyle: ApplicationTextStyle?
 
         func flushRun() {
-            guard !runBytes.isEmpty, let style = runStyle else { return }
+            guard !textRunBytes.isEmpty, let style = runStyle else { return }
             drawApplicationText(
-                String(decoding: runBytes, as: UTF8.self),
+                String(decoding: textRunBytes, as: UTF8.self),
                 column: runStartColumn,
                 row: row,
                 leadingOffset: leadingOffset,
                 style: style,
                 appliesCellKern: true
             )
-            runBytes.removeAll(keepingCapacity: true)
+            textRunBytes.removeAll(keepingCapacity: true)
             runStyle = nil
         }
 
@@ -1357,13 +1502,13 @@ final class TerminalNSView: NSView,
             let style = ApplicationTextStyle(cell: cell)
 
             if canJoinRun {
-                if firstByte == 0x20, runBytes.isEmpty { continue }
+                if firstByte == 0x20, textRunBytes.isEmpty { continue }
                 if let runStyle, runStyle != style { flushRun() }
-                if runBytes.isEmpty {
+                if textRunBytes.isEmpty {
                     runStartColumn = column
                     runStyle = style
                 }
-                runBytes.append(firstByte)
+                textRunBytes.append(firstByte)
                 continue
             }
 
@@ -1406,6 +1551,7 @@ final class TerminalNSView: NSView,
         _ text: String,
         column: Int,
         row: Int,
+        rowOffset: CGFloat = 0,
         leadingOffset: CGFloat,
         style: ApplicationTextStyle,
         appliesCellKern: Bool
@@ -1430,7 +1576,7 @@ final class TerminalNSView: NSView,
         (text as NSString).draw(
             at: NSPoint(
                 x: CGFloat(column) * cellWidth + leadingOffset,
-                y: CGFloat(row) * cellHeight + 1
+                y: CGFloat(row) * cellHeight + rowOffset + 1
             ),
             withAttributes: attributes
         )
@@ -1571,8 +1717,7 @@ final class TerminalNSView: NSView,
 
     private func drawGraphicalBackdrop(in context: CGContext?) {
         guard let context else { return }
-        let base = NSColor(srgbRed: 0.020, green: 0.052, blue: 0.069, alpha: 1)
-        context.setFillColor(base.cgColor)
+        context.setFillColor(Self.canvasColor.cgColor)
         context.fill(bounds)
 
         guard let graphicalBackdropGradient else { return }
@@ -1681,7 +1826,7 @@ final class TerminalNSView: NSView,
             if isHovered, target.isEnabled {
                 NSColor.white.withAlphaComponent(0.11).setFill()
             } else if isAttached || isBookmarked {
-                NSColor(srgbRed: 0.27, green: 0.83, blue: 0.81, alpha: 0.12).setFill()
+                NSColor.white.withAlphaComponent(0.09).setFill()
             } else {
                 NSColor.white.withAlphaComponent(0.045).setFill()
             }
@@ -1705,18 +1850,26 @@ final class TerminalNSView: NSView,
             case .attach:
                 symbolName = isAttached ? "checkmark.circle.fill" : "paperclip"
             }
-            guard let image = NSImage(
-                systemSymbolName: symbolName,
-                accessibilityDescription: blockActionHelp(for: target)
-            ) else {
-                continue
-            }
             let tint = isAttached || isBookmarked
-                ? NSColor(srgbRed: 0.43, green: 0.95, blue: 0.91, alpha: 0.92)
+                ? NSColor.white.withAlphaComponent(0.90)
                 : NSColor.white.withAlphaComponent(target.isEnabled ? 0.72 : 0.30)
-            let configuration = NSImage.SymbolConfiguration(pointSize: 11, weight: .medium)
-                .applying(.init(hierarchicalColor: tint))
-            let configuredImage = image.withSymbolConfiguration(configuration) ?? image
+            let imageState = isAttached || isBookmarked
+                ? "accent"
+                : (target.isEnabled ? "enabled" : "disabled")
+            let imageCacheKey = "\(symbolName)-\(imageState)"
+            let configuredImage: NSImage
+            if let cachedImage = blockActionImageCache[imageCacheKey] {
+                configuredImage = cachedImage
+            } else {
+                guard let image = NSImage(
+                    systemSymbolName: symbolName,
+                    accessibilityDescription: blockActionHelp(for: target)
+                ) else { continue }
+                let configuration = NSImage.SymbolConfiguration(pointSize: 11, weight: .medium)
+                    .applying(.init(hierarchicalColor: tint))
+                configuredImage = image.withSymbolConfiguration(configuration) ?? image
+                blockActionImageCache[imageCacheKey] = configuredImage
+            }
             let iconRect = NSRect(
                 x: buttonRect.midX - 6,
                 y: buttonRect.midY - 6,
@@ -2007,7 +2160,7 @@ final class TerminalNSView: NSView,
             )
         }
 
-        let fill = NSColor(srgbRed: 0.24, green: 0.78, blue: 0.78, alpha: 0.14)
+        let fill = NSColor.white.withAlphaComponent(0.10)
         fill.setFill()
         NSBezierPath(
             roundedRect: highlight,
@@ -2015,8 +2168,7 @@ final class TerminalNSView: NSView,
             yRadius: 8
         ).fill()
 
-        let turquoise = NSColor(srgbRed: 0.43, green: 0.95, blue: 0.91, alpha: 0.94)
-        turquoise.setStroke()
+        NSColor.white.withAlphaComponent(0.72).setStroke()
         let border = NSBezierPath(
             roundedRect: highlight.insetBy(dx: 0.5, dy: 0.5),
             xRadius: 7.5,
@@ -2029,9 +2181,9 @@ final class TerminalNSView: NSView,
     private func drawGraphicalDropTarget(in rect: NSRect) {
         let highlight = rect.insetBy(dx: 2, dy: 1)
         let path = NSBezierPath(roundedRect: highlight, xRadius: 8, yRadius: 8)
-        NSColor(srgbRed: 0.22, green: 0.82, blue: 0.78, alpha: 0.24).setFill()
+        NSColor.white.withAlphaComponent(0.14).setFill()
         path.fill()
-        NSColor(srgbRed: 0.48, green: 1.0, blue: 0.93, alpha: 0.98).setStroke()
+        NSColor.white.withAlphaComponent(0.82).setStroke()
         path.lineWidth = 2
         path.stroke()
     }
@@ -2055,7 +2207,7 @@ final class TerminalNSView: NSView,
         roundedRectangle.setValue(CIVector(cgRect: innerExtent), forKey: "inputExtent")
         roundedRectangle.setValue(6 * scale, forKey: "inputRadius")
         roundedRectangle.setValue(
-            CIColor(red: 0.38, green: 0.96, blue: 0.90, alpha: 0.20),
+            CIColor(red: 0.86, green: 0.88, blue: 0.90, alpha: 0.14),
             forKey: "inputColor"
         )
         guard let baseImage = roundedRectangle.outputImage else { return nil }
@@ -2875,7 +3027,7 @@ final class TerminalNSView: NSView,
     }
 
     private func drawMessage(_ message: String) {
-        NSColor(red: 0.024, green: 0.067, blue: 0.094, alpha: 1).setFill()
+        Self.canvasColor.setFill()
         bounds.fill()
         let paragraph = NSMutableParagraphStyle(); paragraph.alignment = .center
         (message as NSString).draw(in: bounds.insetBy(dx: 40, dy: 80), withAttributes: [
@@ -2893,7 +3045,7 @@ final class TerminalNSView: NSView,
         let size = (message as NSString).size(withAttributes: attributes)
         let rect = NSRect(x: bounds.maxX - size.width - 28, y: bounds.maxY - size.height - 20,
                           width: size.width + 16, height: size.height + 8)
-        NSColor(red: 0.035, green: 0.094, blue: 0.122, alpha: 0.96).setFill()
+        Self.blockColor.withAlphaComponent(0.96).setFill()
         NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
         (message as NSString).draw(at: NSPoint(x: rect.minX + 8, y: rect.minY + 4), withAttributes: attributes)
     }

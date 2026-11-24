@@ -121,6 +121,9 @@ void gt_session_destroy(GTSession *session);
 /** Read pending PTY output into Ghostty. Returns true when the screen changed. */
 bool gt_session_poll(GTSession *session);
 
+/** Read at most max_bytes of pending PTY output, keeping a UI frame bounded. */
+bool gt_session_poll_budgeted(GTSession *session, size_t max_bytes);
+
 /** Return a borrowed frame, valid until the next call for this session. */
 const GTFrame *gt_session_frame(GTSession *session);
 

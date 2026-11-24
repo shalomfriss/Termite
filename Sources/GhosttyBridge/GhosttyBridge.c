@@ -416,12 +416,15 @@ void gt_session_destroy(GTSession *s) {
     free(s);
 }
 
-bool gt_session_poll(GTSession *s) {
+static bool poll_session(GTSession *s, size_t max_bytes) {
     if (!s) return false;
     uint8_t buffer[32768];
     bool changed = false;
-    for (;;) {
-        ssize_t count = read(s->master_fd, buffer, sizeof(buffer));
+    size_t bytes_read = 0;
+    while (bytes_read < max_bytes) {
+        size_t remaining = max_bytes - bytes_read;
+        size_t requested = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+        ssize_t count = read(s->master_fd, buffer, requested);
         if (count > 0) {
             api.terminal_write(s->terminal, buffer, (size_t)count);
             int active_screen = 0;
@@ -430,10 +433,12 @@ bool gt_session_poll(GTSession *s) {
                 active_screen != GHOSTTY_TERMINAL_SCREEN_ALTERNATE) {
                 capture_command_output(s, buffer, (size_t)count);
             }
+            bytes_read += (size_t)count;
             changed = true;
             continue;
         }
-        if (count == 0 || (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+        if (count < 0 && errno == EINTR) continue;
+        if (count == 0 || (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
             s->running = false;
         }
         break;
@@ -450,6 +455,15 @@ bool gt_session_poll(GTSession *s) {
     }
     s->dirty |= changed;
     return changed;
+}
+
+bool gt_session_poll(GTSession *s) {
+    return poll_session(s, SIZE_MAX);
+}
+
+bool gt_session_poll_budgeted(GTSession *s, size_t max_bytes) {
+    if (max_bytes == 0) return false;
+    return poll_session(s, max_bytes);
 }
 
 static GhosttyColorRgb fallback_fg(void) { return (GhosttyColorRgb){210, 225, 234}; }

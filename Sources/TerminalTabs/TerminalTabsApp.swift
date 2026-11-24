@@ -8,7 +8,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        DispatchQueue.main.async {
+        Task { @MainActor in
+            await Task.yield()
             NSRunningApplication.current.activate(options: .activateAllWindows)
             NSApplication.shared.windows.first?.makeKeyAndOrderFront(nil)
         }
@@ -189,35 +190,26 @@ struct VerticalPanelHeader: View {
     @ObservedObject var store: TerminalStore
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 10) {
             Button {
                 store.isTabBarVisible.toggle()
             } label: {
-                Image(systemName: store.tabOrientation.panelSystemImage)
-                    .font(.system(size: 13, weight: .semibold))
-                    .frame(width: 28, height: 26)
-                    .contentShape(Rectangle())
+                Label(store.selected?.title ?? "Shell", systemImage: "terminal")
             }
             .buttonStyle(.plain)
-            .foregroundStyle(store.isTabBarVisible ? TerminalTheme.cyan : TerminalTheme.mutedText)
-            .background(
-                store.isTabBarVisible ? TerminalTheme.cyan.opacity(0.12) : .clear,
-                in: .rect(cornerRadius: 6)
-            )
+            .font(.callout)
+            .bold()
+            .foregroundStyle(TerminalTheme.text)
             .help(store.tabPanelVisibilityActionTitle)
-
-            Text(store.selected?.title ?? "Terminal")
-                .font(.caption)
-                .foregroundStyle(TerminalTheme.mutedText)
-                .lineLimit(1)
+            .accessibilityLabel(store.tabPanelVisibilityActionTitle)
             Spacer()
-            Spacer().frame(width: 8)
         }
-        .padding(.leading, 8)
-        .frame(height: 38)
+        .padding(.leading, 72)
+        .padding(.trailing, 14)
+        .frame(height: 60)
         .background(TerminalTheme.surface)
         .overlay(alignment: .bottom) {
-            Rectangle().fill(.white.opacity(0.055)).frame(height: 1)
+            Rectangle().fill(TerminalTheme.border).frame(height: 1)
         }
     }
 }
@@ -360,8 +352,11 @@ struct VerticalTabSidebar: View {
                 TabSettingsMenu(store: store)
                 Spacer()
             }
-            .padding(.horizontal, 8)
-            .frame(height: 42)
+            .padding(.horizontal, 12)
+            .frame(height: 46)
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(TerminalTheme.border).frame(height: 1)
+            }
 
             ScrollView {
                 LazyVStack(spacing: 12) {
@@ -425,7 +420,7 @@ struct VerticalTabSidebar: View {
         }
         .background(TerminalTheme.surface)
         .overlay(alignment: .trailing) {
-            Rectangle().fill(TerminalTheme.cyan.opacity(0.22)).frame(width: 1)
+            Rectangle().fill(TerminalTheme.border).frame(width: 1)
         }
     }
 }

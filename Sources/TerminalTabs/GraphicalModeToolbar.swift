@@ -15,22 +15,22 @@ struct GraphicalModeToolbar: View {
     var body: some View {
         HStack(spacing: 10) {
             Toggle(isOn: $isEnabled) {
-                Label("Graphical", systemImage: "sparkles.rectangle.stack.fill")
+                Label("Graphical", systemImage: "square.grid.2x2")
                     .font(.callout)
                     .bold()
             }
             .toggleStyle(.button)
             .buttonStyle(.plain)
-            .foregroundStyle(isEnabled ? TerminalTheme.canvas : TerminalTheme.text)
+            .foregroundStyle(TerminalTheme.text)
             .padding(.horizontal, 11)
             .frame(height: 30)
             .background(
-                isEnabled ? TerminalTheme.cyan : TerminalTheme.raised,
+                isEnabled ? TerminalTheme.raised : TerminalTheme.subtleFill,
                 in: .rect(cornerRadius: 8)
             )
             .overlay {
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(.white.opacity(isEnabled ? 0.24 : 0.08), lineWidth: 1)
+                    .stroke(TerminalTheme.border, lineWidth: 1)
             }
             .help(isEnabled ? "Turn off graphical mode" : "Browse directories graphically")
 
@@ -41,7 +41,7 @@ struct GraphicalModeToolbar: View {
 
                 Image(systemName: "folder.fill")
                     .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(TerminalTheme.cyan)
+                    .foregroundStyle(TerminalTheme.text)
 
                 VStack(alignment: .leading, spacing: 1) {
                     Text(directoryName)
@@ -160,13 +160,12 @@ struct GraphicalModeToolbar: View {
             }
         }
         .padding(.horizontal, 9)
-        .frame(minHeight: 42)
-        .background(.thinMaterial, in: .rect(cornerRadius: 12))
+        .frame(minHeight: 46)
+        .background(TerminalTheme.surface, in: .rect(cornerRadius: 10))
         .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(.white.opacity(0.075), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(TerminalTheme.border, lineWidth: 1)
         }
-        .shadow(color: TerminalTheme.canvas.opacity(0.42), radius: 14, y: 7)
         .animation(reduceMotion ? nil : .smooth(duration: 0.22), value: isEnabled)
         .alert(item: $session.graphicalOperationIssue) { issue in
             Alert(

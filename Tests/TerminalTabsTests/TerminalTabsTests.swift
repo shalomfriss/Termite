@@ -47,6 +47,10 @@ final class AirTests: XCTestCase {
         XCTAssertFalse(session.isBracketedPasteEnabled)
     }
 
+    func testTerminalDisplayLinkTargetsSixtyFramesPerSecond() {
+        XCTAssertEqual(TerminalDisplayLink.framesPerSecond, 60)
+    }
+
     @MainActor
     func testMicroRunsAsInteractiveFullScreenBlock() async throws {
         let microPath = "/opt/homebrew/bin/micro"
@@ -85,13 +89,29 @@ final class AirTests: XCTestCase {
         XCTAssertNotNil(bitmap.cgImage)
 
         let capturedBeforeRepaints = gt_session_command_output(handle, nil, 0)
+        var frameDurations: [TimeInterval] = []
         for _ in 0..<20 {
             session.sendUserInput(Data("\u{1B}[B".utf8))
             try await Task.sleep(for: .milliseconds(10))
+            let pollStart = ProcessInfo.processInfo.systemUptime
             session.poll()
+            let pollDuration = ProcessInfo.processInfo.systemUptime - pollStart
+            canvas.needsDisplay = true
+            canvas.cacheDisplay(in: canvas.bounds, to: bitmap)
+            frameDurations.append(pollDuration + canvas.lastDrawDuration)
         }
         let capturedAfterRepaints = gt_session_command_output(handle, nil, 0)
         XCTAssertLessThanOrEqual(capturedAfterRepaints, capturedBeforeRepaints + 1_024)
+        let sortedFrameDurations = frameDurations.sorted()
+        let percentile95 = sortedFrameDurations[min(
+            sortedFrameDurations.count - 1,
+            Int(Double(sortedFrameDurations.count) * 0.95)
+        )]
+        XCTAssertLessThan(
+            percentile95,
+            1.0 / 60.0,
+            "micro frame p95 was \(percentile95 * 1_000) ms"
+        )
 
         session.sendUserInput(Data([0x11])) // micro: Ctrl-Q
         for _ in 0..<150 where session.isAlternateScreen {
@@ -100,6 +120,183 @@ final class AirTests: XCTestCase {
         }
 
         XCTAssertFalse(session.isAlternateScreen)
+    }
+
+    @MainActor
+    func testProgressOutputStaysInOneBlockAndMeetsFrameBudget() async throws {
+        if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
+        let session = TerminalSession(cols: 160, rows: 24)
+        let handle = try XCTUnwrap(session.handle)
+        for _ in 0..<100 where !session.isCursorAtPrompt {
+            try await Task.sleep(for: .milliseconds(10))
+            session.poll()
+        }
+
+        let canvas = TerminalNSView(session: session)
+        canvas.frame = NSRect(x: 0, y: 0, width: 1_420, height: 480)
+        canvas.layoutSubtreeIfNeeded()
+        let bitmap = try XCTUnwrap(canvas.bitmapImageRepForCachingDisplay(in: canvas.bounds))
+        let command = "i=0; while ((i<120)); do printf '\\rdownloading %03d%%' $i; sleep .005; ((i++)); done; printf '\\n%s\\n' '__AIR_'PROGRESS'_DONE__'"
+        let blockCountBeforeCommand = session.commandBlocks.count
+        session.sendUserInput(Data(command.utf8))
+        session.sendUserInput(Data([0x0D]))
+
+        var sawProgress = false
+        var pollsAfterCompletion = 0
+        var frameDurations: [TimeInterval] = []
+        for _ in 0..<300 {
+            try await Task.sleep(for: .milliseconds(5))
+            let pollStart = ProcessInfo.processInfo.systemUptime
+            session.poll()
+            let pollDuration = ProcessInfo.processInfo.systemUptime - pollStart
+            canvas.needsDisplay = true
+            canvas.cacheDisplay(in: canvas.bounds, to: bitmap)
+            frameDurations.append(pollDuration + canvas.lastDrawDuration)
+
+            XCTAssertEqual(session.commandBlocks.count, blockCountBeforeCommand + 1)
+            let frame = try XCTUnwrap(gt_session_frame(handle)).pointee
+            let rowSemantics = frame.row_semantics.map { pointer in
+                (0..<Int(frame.rows)).map { pointer[$0] }
+            } ?? []
+            let inputRows = semanticInputRows(in: frame)
+            let normalized = TerminalBlockRangeResolver.normalizedSemantics(
+                rowSemantics: rowSemantics,
+                inputRows: inputRows
+            )
+            XCTAssertLessThanOrEqual(
+                normalized.filter { $0 == 1 }.count,
+                1,
+                "progress output created an extra semantic block"
+            )
+
+            let capturedOutput = capturedCommandOutput(handle)
+            sawProgress = sawProgress || capturedOutput.contains("downloading")
+            if sawProgress, capturedOutput.contains("__AIR_PROGRESS_DONE__") {
+                pollsAfterCompletion += 1
+                if session.isCursorAtPrompt || pollsAfterCompletion >= 10 { break }
+            }
+        }
+
+        XCTAssertTrue(sawProgress)
+        XCTAssertEqual(session.commandBlocks.last?.command, command)
+        let measuredFrames = frameDurations.dropFirst(min(3, frameDurations.count))
+        let sortedFrameDurations = measuredFrames.sorted()
+        let percentile95 = sortedFrameDurations[min(
+            sortedFrameDurations.count - 1,
+            Int(Double(sortedFrameDurations.count) * 0.95)
+        )]
+        XCTAssertLessThan(
+            percentile95,
+            1.0 / 60.0,
+            "progress frame p95 was \(percentile95 * 1_000) ms"
+        )
+    }
+
+    @MainActor
+    func testUvSyncAndPipInstallEachStayInOneBlock() async throws {
+        guard let uvPath = executableInPath("uv"), let pipPath = executableInPath("pip3") else {
+            throw XCTSkip("uv and pip3 are required for the workflow integration test")
+        }
+        let root = FileManager.default.temporaryDirectory.appending(
+            path: "air-package-workflow-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data(
+            """
+            [project]
+            name = "air-workflow-probe"
+            version = "0.0.0"
+            requires-python = ">=3.11"
+
+            [tool.setuptools]
+            py-modules = ["air_workflow_probe"]
+            """.utf8
+        ).write(to: root.appending(path: "pyproject.toml"))
+        try Data("value = 1\n".utf8).write(to: root.appending(path: "air_workflow_probe.py"))
+        let wheelSource = root.appending(path: "wheel-source", directoryHint: .isDirectory)
+        let distInfo = wheelSource.appending(
+            path: "air_workflow_probe-0.0.0.dist-info",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: distInfo, withIntermediateDirectories: true)
+        try Data("value = 1\n".utf8).write(
+            to: wheelSource.appending(path: "air_workflow_probe.py")
+        )
+        try Data(
+            """
+            Metadata-Version: 2.1
+            Name: air-workflow-probe
+            Version: 0.0.0
+            """.utf8
+        ).write(to: distInfo.appending(path: "METADATA"))
+        try Data(
+            """
+            Wheel-Version: 1.0
+            Generator: AirTests
+            Root-Is-Purelib: true
+            Tag: py3-none-any
+            """.utf8
+        ).write(to: distInfo.appending(path: "WHEEL"))
+        try Data().write(to: distInfo.appending(path: "RECORD"))
+        let wheel = root.appending(path: "air_workflow_probe-0.0.0-py3-none-any.whl")
+        let zip = Process()
+        zip.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+        zip.arguments = ["-q", "-r", wheel.path, "."]
+        zip.currentDirectoryURL = wheelSource
+        try zip.run()
+        zip.waitUntilExit()
+        XCTAssertEqual(zip.terminationStatus, 0)
+
+        let session = TerminalSession(cols: 160, rows: 30, workingDirectory: root.path)
+        let handle = try XCTUnwrap(session.handle)
+        for _ in 0..<150 where !session.isCursorAtPrompt {
+            try await Task.sleep(for: .milliseconds(10))
+            session.poll()
+        }
+
+        func runWorkflow(_ command: String, sentinel: String) async throws {
+            let blockCount = session.commandBlocks.count
+            session.sendUserInput(Data(command.utf8))
+            session.sendUserInput(Data([0x0D]))
+            var sawSentinel = false
+            var pollsAfterSentinel = 0
+            var capturedOutput = ""
+            for _ in 0..<1_000 {
+                try await Task.sleep(for: .milliseconds(10))
+                session.poll()
+                XCTAssertEqual(
+                    session.commandBlocks.count,
+                    blockCount + 1,
+                    "workflow output created an extra command block"
+                )
+                _ = try XCTUnwrap(gt_session_frame(handle))
+                capturedOutput = capturedCommandOutput(handle)
+                sawSentinel = sawSentinel || capturedOutput.contains(sentinel)
+                if sawSentinel {
+                    pollsAfterSentinel += 1
+                    if session.isCursorAtPrompt || pollsAfterSentinel >= 10 { break }
+                }
+            }
+            XCTAssertTrue(
+                sawSentinel,
+                "workflow did not complete: \(command)\nCaptured output:\n\(capturedOutput)"
+            )
+        }
+
+        let uvCommand = "\(TerminalSession.shellQuoted(uvPath)) sync --offline --no-cache && printf '\\n%s\\n' '__AIR_'UV'_DONE__'"
+        try await runWorkflow(uvCommand, sentinel: "__AIR_UV_DONE__")
+
+        let installDirectory = root.appending(path: "installed", directoryHint: .isDirectory)
+        let pipCommand = "\(TerminalSession.shellQuoted(pipPath)) install --no-index --no-deps --target \(TerminalSession.shellQuoted(installDirectory.path)) \(TerminalSession.shellQuoted(wheel.path)) && printf '\\n%s\\n' '__AIR_'PIP'_DONE__'"
+        try await runWorkflow(pipCommand, sentinel: "__AIR_PIP_DONE__")
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: installDirectory.appending(path: "air_workflow_probe.py").path
+            )
+        )
     }
 
     @MainActor
@@ -1139,7 +1336,11 @@ final class AirTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(20))
             session.poll()
             guard let candidate = gt_session_frame(try XCTUnwrap(session.handle))?.pointee,
-                  candidate.image_count > 0 else { continue }
+                  candidate.image_count > 0,
+                  candidate.cursor_visible,
+                  TerminalSession.looksLikeShellPrompt(
+                      rowText(frame: candidate, row: Int(candidate.cursor_y))
+                  ) else { continue }
             frame = candidate
             break
         }
@@ -1827,6 +2028,53 @@ final class AirTests: XCTestCase {
         XCTAssertEqual(TerminalSession.gitBranchName(at: nested.path), "1234567")
     }
 
+    func testRepositoryContextDetectsNodeAndPythonFromNestedDirectory() throws {
+        let root = FileManager.default.temporaryDirectory.appending(
+            path: "air-repository-context-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        let nested = root.appending(path: "Sources/App", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(
+            at: root.appending(path: ".git", directoryHint: .isDirectory),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data(
+            """
+            {"name":"fixture","engines":{"node":">=20"}}
+            """.utf8
+        ).write(to: root.appending(path: "package.json"))
+        try Data("3.12.2\n".utf8).write(to: nested.appending(path: ".python-version"))
+
+        let context = try XCTUnwrap(RepositoryContextScanner.scanRepository(at: nested.path))
+
+        XCTAssertEqual(context.rootPath, root.path)
+        XCTAssertEqual(context.displayName, root.lastPathComponent)
+        XCTAssertEqual(context.node?.declaredVersion, ">=20")
+        XCTAssertEqual(context.node?.declarationSource, "package.json")
+        XCTAssertEqual(context.python?.declaredVersion, "3.12.2")
+        XCTAssertEqual(context.python?.declarationSource, ".python-version")
+    }
+
+    func testRepositoryRuntimeSwitchCommandQuotesPathAndVerifiesVersion() {
+        XCTAssertEqual(
+            TerminalSession.repositoryRuntimeSwitchCommand(
+                binPath: "/tmp/Node User's/bin",
+                kind: .node
+            ),
+            "export PATH='/tmp/Node User'\\''s/bin':\"$PATH\"; hash -r; node --version"
+        )
+        XCTAssertEqual(
+            TerminalSession.repositoryRuntimeSwitchCommand(
+                binPath: "/tmp/python/bin",
+                kind: .python
+            ),
+            "export PATH='/tmp/python/bin':\"$PATH\"; hash -r; "
+                + "python --version 2>&1 || python3 --version"
+        )
+    }
+
     @MainActor
     func testTerminalSessionStartsInRequestedDirectory() throws {
         if let error = gt_runtime_error() { throw XCTSkip(String(cString: error)) }
@@ -2457,6 +2705,24 @@ final class AirTests: XCTestCase {
 
         session.paste("printf 'paste_block_probe\\n'")
         XCTAssertEqual(session.pendingCommandInput, "printf 'paste_block_probe\\n'")
+    }
+
+    private func executableInPath(_ name: String) -> String? {
+        let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
+        return path.split(separator: ":").lazy
+            .map { URL(fileURLWithPath: String($0), isDirectory: true).appending(path: name).path }
+            .first(where: FileManager.default.isExecutableFile(atPath:))
+    }
+
+    private func capturedCommandOutput(_ handle: OpaquePointer) -> String {
+        let count = gt_session_command_output(handle, nil, 0)
+        guard count > 0 else { return "" }
+        var data = Data(count: count)
+        data.withUnsafeMutableBytes { bytes in
+            guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return }
+            _ = gt_session_command_output(handle, base, count)
+        }
+        return String(decoding: data, as: UTF8.self)
     }
 
     private func rowText(frame: GTFrame, row: Int) -> String {

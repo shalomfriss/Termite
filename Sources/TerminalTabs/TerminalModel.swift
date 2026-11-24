@@ -153,6 +153,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published var tabAccentColor: NSColor?
     @Published private(set) var gitBranch: String? = nil
     @Published private(set) var gitBranches: [String] = []
+    @Published private(set) var repositoryContext: RepositoryContext?
+    @Published private(set) var activeRepositoryRuntimePaths: [RepositoryContext.RuntimeKind: String] = [:]
     var graphicalViewMode: GraphicalViewMode = .icons
     var graphicalShowsHiddenFiles = false
     var graphicalSortOption: GraphicalSortOption = .name
@@ -171,6 +173,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var commandLine = CommandLineTracker()
     private let commandHistoryStore: CommandHistoryStore
     private var isMarkingInput = false
+    private var capturedCommandBlockIndex: Int?
+    private var observedCommandOutputByteCount = 0
+    private var processedCommandOutputByteCount = 0
+    private var commandOutputLastChangedAt: TimeInterval?
     private var terminalColumns = 100
     private var nextGraphicalImageID: UInt32 = 10_000
     private var nextGraphicalPlacementID: UInt32 = 1
@@ -183,6 +189,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var graphicalStartupTask: Task<Void, Never>?
     private var graphicalNavigationGeneration: UInt = 0
     private var gitBranchDirectory: String?
+    private let repositoryContextScanner = RepositoryContextScanner()
+    private var repositoryContextTask: Task<Void, Never>?
+    private var repositoryContextDirectory: String?
 
     init(
         cols: UInt16 = 100,
@@ -235,16 +244,21 @@ final class TerminalSession: ObservableObject, Identifiable {
     isolated deinit {
         graphicalNavigationTask?.cancel()
         graphicalStartupTask?.cancel()
+        repositoryContextTask?.cancel()
         if let handle { gt_session_destroy(handle) }
     }
 
     func poll() {
         guard let handle else { return }
-        if gt_session_poll(handle) {
+        // The navigation task owns PTY reads while it is concealing its internal
+        // `cd` command. A second poller can publish the echo between conceal and
+        // clear operations, briefly exposing an implementation detail.
+        if !isGraphicalNavigationInProgress,
+           gt_session_poll_budgeted(handle, 32 * 1024) {
             revision &+= 1
             refreshFrame()
-            if !isAlternateScreen { refreshCapturedCommandOutput() }
         }
+        if !isAlternateScreen { refreshCapturedCommandOutputIfSettled() }
         let running = gt_session_is_running(handle)
         if isRunning != running { isRunning = running }
     }
@@ -261,6 +275,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         if isFocusReporting != frame.pointee.focus_reporting {
             isFocusReporting = frame.pointee.focus_reporting
         }
+        let promptBecameVisible = !isCursorAtPrompt && frame.pointee.cursor_at_prompt
         if isCursorAtPrompt != frame.pointee.cursor_at_prompt {
             isCursorAtPrompt = frame.pointee.cursor_at_prompt
         }
@@ -277,6 +292,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             terminalTitle = nextTitle
             if customTitle == nil, title != nextTitle { title = nextTitle }
         }
+        var workingDirectoryChanged = false
         if let pointer = frame.pointee.working_directory {
             let value = String(cString: pointer)
             if !value.isEmpty {
@@ -290,32 +306,86 @@ final class TerminalSession: ObservableObject, Identifiable {
                 shellWorkingDirectory = nextDirectory
                 if workingDirectory != nextDirectory {
                     workingDirectory = nextDirectory
+                    workingDirectoryChanged = true
                 }
             }
         }
-        if !isAlternateScreen { refreshGitBranch() }
+        if !isAlternateScreen, workingDirectoryChanged || promptBecameVisible {
+            refreshGitBranch()
+        }
     }
 
     private func refreshGitBranch(forceBranches: Bool = false) {
         let branch = Self.gitBranchName(at: workingDirectory)
+        let directoryChanged = gitBranchDirectory != workingDirectory
         let shouldRefreshBranches = forceBranches
-            || gitBranchDirectory != workingDirectory
+            || directoryChanged
             || branch != gitBranch
         if branch != gitBranch { gitBranch = branch }
-        guard shouldRefreshBranches else { return }
-        let branches = Self.gitLocalBranchNames(at: workingDirectory)
-        if branches != gitBranches { gitBranches = branches }
-        gitBranchDirectory = workingDirectory
+        if shouldRefreshBranches {
+            let branches = Self.gitLocalBranchNames(at: workingDirectory)
+            if branches != gitBranches { gitBranches = branches }
+            gitBranchDirectory = workingDirectory
+        }
+        if directoryChanged || forceBranches {
+            refreshRepositoryContext(force: forceBranches)
+        }
     }
 
     func refreshGitBranches() {
         refreshGitBranch(forceBranches: true)
     }
 
+    func refreshRepositoryContext() {
+        refreshGitBranch(forceBranches: true)
+    }
+
+    private func refreshRepositoryContext(force: Bool) {
+        let requestedDirectory = workingDirectory
+        guard force || repositoryContextDirectory != requestedDirectory else { return }
+        repositoryContextDirectory = requestedDirectory
+        repositoryContextTask?.cancel()
+        if repositoryContext?.rootPath != requestedDirectory {
+            repositoryContext = nil
+        }
+        let scanner = repositoryContextScanner
+        repositoryContextTask = Task { [weak self] in
+            let context = await scanner.scan(at: requestedDirectory)
+            guard !Task.isCancelled,
+                  let self,
+                  self.workingDirectory == requestedDirectory else { return }
+            self.repositoryContext = context
+            if context == nil { self.activeRepositoryRuntimePaths.removeAll() }
+        }
+    }
+
     func switchGitBranch(to branch: String) {
         guard branch != gitBranch, gitBranches.contains(branch) else { return }
         sendUserInput(Data(Self.gitSwitchCommand(for: branch).utf8))
         sendUserInput(Data([0x0D]))
+    }
+
+    func switchRepositoryRuntime(
+        _ installation: RepositoryContext.RuntimeInstallation,
+        kind: RepositoryContext.RuntimeKind
+    ) {
+        guard repositoryContext?.runtimes
+            .first(where: { $0.kind == kind })?
+            .installations.contains(installation) == true else { return }
+        let command = Self.repositoryRuntimeSwitchCommand(
+            binPath: installation.binPath,
+            kind: kind
+        )
+        sendUserInput(Data(command.utf8))
+        sendUserInput(Data([0x0D]))
+        activeRepositoryRuntimePaths[kind] = installation.binPath
+    }
+
+    nonisolated static func repositoryRuntimeSwitchCommand(
+        binPath: String,
+        kind: RepositoryContext.RuntimeKind
+    ) -> String {
+        "export PATH=\(shellQuoted(binPath)):\"$PATH\"; hash -r; \(kind.verificationCommand)"
     }
 
     nonisolated static func gitSwitchCommand(for branch: String) -> String {
@@ -547,6 +617,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func beginCommandInputIfNeeded(handle: OpaquePointer) {
         guard !isMarkingInput else { return }
+        refreshCapturedCommandOutput(force: true)
         gt_session_mark_input(handle)
         isMarkingInput = true
         revision &+= 1
@@ -571,6 +642,9 @@ final class TerminalSession: ObservableObject, Identifiable {
             }
             refreshCommandPrediction()
             gt_session_mark_output(handle)
+            resetCapturedCommandOutputTracking(
+                blockIndex: command.isEmpty ? nil : commandBlocks.count - 1
+            )
             revision &+= 1
             if let request = Self.fileListingRequest(
                 for: command,
@@ -1092,23 +1166,34 @@ final class TerminalSession: ObservableObject, Identifiable {
         feedTerminalOutput("\r\u{1B}[2J\u{1B}[H", handle: handle)
         feedTerminalOutput(Self.graphicalNavigationConcealSequence, handle: handle)
         write(Data(("cd -- \(Self.shellQuoted(target))\r").utf8))
-        var reachedTarget = false
+        var capturedPrompt: String?
         for _ in 0..<200 {
             try Task.checkCancellation()
             try await Task.sleep(for: .milliseconds(20))
             if gt_session_poll(handle) { refreshFrame() }
-            if URL(fileURLWithPath: shellWorkingDirectory).standardizedFileURL.path == target {
-                reachedTarget = true
+            let reachedTarget = URL(fileURLWithPath: shellWorkingDirectory)
+                .standardizedFileURL.path == target
+            if reachedTarget,
+               let prompt = visiblePromptText(handle: handle, includesInvisibleCells: true),
+               Self.looksLikeShellPrompt(prompt) {
+                capturedPrompt = prompt
+                feedTerminalOutput("\r\u{1B}[2J\u{1B}[H", handle: handle)
+                feedTerminalOutput(Self.graphicalNavigationConcealSequence, handle: handle)
                 break
             }
+
+            // Do not leave the shell's transient command or prompt visible
+            // between task turns while the graphical navigation is in flight.
+            feedTerminalOutput("\r\u{1B}[2J\u{1B}[H", handle: handle)
+            feedTerminalOutput(Self.graphicalNavigationConcealSequence, handle: handle)
         }
-        guard reachedTarget else { throw GraphicalOperationError.navigationTimedOut(target) }
-        try await drainShellOutput(handle: handle)
+        guard let prompt = capturedPrompt else {
+            throw GraphicalOperationError.navigationTimedOut(target)
+        }
         if shouldRestoreEcho {
             _ = gt_session_set_echo(handle, true)
             shouldRestoreEcho = false
         }
-        let prompt = try await waitForVisiblePrompt(handle: handle)
         try Task.checkCancellation()
 
         // Clear the concealed cd and prompt, then restore ordinary rendering.
@@ -1125,6 +1210,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             handle: handle
         )
         gt_session_mark_output(handle)
+        resetCapturedCommandOutputTracking(blockIndex: nil)
         revision &+= 1
         let request = FileListingRequest(
             path: target,
@@ -2343,20 +2429,46 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func fullOutput(for command: String) -> String? {
+        refreshCapturedCommandOutput(force: true)
         let normalized = command.trimmingCharacters(in: .whitespacesAndNewlines)
         return commandBlocks.last(where: { $0.command == normalized && !$0.output.isEmpty })?.output
     }
 
-    private func refreshCapturedCommandOutput() {
-        guard let handle, !commandBlocks.isEmpty else { return }
+    private func resetCapturedCommandOutputTracking(blockIndex: Int?) {
+        capturedCommandBlockIndex = blockIndex
+        observedCommandOutputByteCount = 0
+        processedCommandOutputByteCount = 0
+        commandOutputLastChangedAt = nil
+    }
+
+    private func refreshCapturedCommandOutputIfSettled() {
+        refreshCapturedCommandOutput(force: false)
+    }
+
+    private func refreshCapturedCommandOutput(force: Bool) {
+        guard
+            let handle,
+            let blockIndex = capturedCommandBlockIndex,
+            commandBlocks.indices.contains(blockIndex)
+        else { return }
         let count = gt_session_command_output(handle, nil, 0)
         guard count > 0 else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if count != observedCommandOutputByteCount {
+            observedCommandOutputByteCount = count
+            commandOutputLastChangedAt = now
+        }
+        guard count != processedCommandOutputByteCount else { return }
+        if !force {
+            guard let lastChange = commandOutputLastChangedAt, now - lastChange >= 0.12 else { return }
+        }
         var data = Data(count: count)
         data.withUnsafeMutableBytes { bytes in
             guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return }
             _ = gt_session_command_output(handle, base, count)
         }
-        commandBlocks[commandBlocks.count - 1].output = Self.cleanTerminalOutput(data)
+        commandBlocks[blockIndex].output = Self.cleanTerminalOutput(data)
+        processedCommandOutputByteCount = count
     }
 
     static func cleanTerminalOutput(_ data: Data) -> String {
@@ -2704,7 +2816,7 @@ final class TerminalStore: ObservableObject {
             }
         }
     }
-    private var timer: Timer?
+    private var displayLink: TerminalDisplayLink?
     private var lastAutomaticTabColorIndex: Int?
 
     init(scheduledJobs: ScheduledJobStore? = nil) {
@@ -2759,12 +2871,16 @@ final class TerminalStore: ObservableObject {
             rawValue: UserDefaults.standard.string(forKey: Self.listingBackendKey) ?? ""
         ) ?? .eza
         newGroup()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.poll() }
+        displayLink = TerminalDisplayLink { [weak self] in
+            self?.poll()
         }
         self.scheduledJobs.setExecutor { [weak self] job in
             self?.launchScheduledJob(job)
         }
+    }
+
+    isolated deinit {
+        displayLink?.stop()
     }
 
     var selectedGroup: TerminalTabGroup? {
