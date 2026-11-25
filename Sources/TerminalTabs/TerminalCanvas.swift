@@ -171,11 +171,11 @@ final class TerminalNSView: NSView,
     var session: TerminalSession
     var openDirectoryInNewTab: (URL) -> Void
     var openURL: (URL) -> Void
-    private let font = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
-    private let boldFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .semibold)
+    private let font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+    private let boldFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .semibold)
     private let italicFont: NSFont
     private let cellWidth: CGFloat
-    private let cellHeight: CGFloat = 20
+    private let cellHeight: CGFloat = 18
     private lazy var regularCellKern = cellWidth
         - ("M" as NSString).size(withAttributes: [.font: font]).width
     private lazy var boldCellKern = cellWidth
@@ -197,12 +197,14 @@ final class TerminalNSView: NSView,
     private var hoveredLink: LinkHitTarget?
     private var linkActivationCandidate: LinkHitTarget?
     private var textSelectionAnchor: TerminalTextPosition?
+    private var textSelectionMouseDownPoint: NSPoint?
     private var textSelection: TerminalTextSelection?
     private var imageHitTargets: [ImageHitTarget] = []
     private var blockActionHitTargets: [BlockActionHitTarget] = []
     private var linkHitTargets: [LinkHitTarget] = []
     private var blockActionToolTipTags: [NSView.ToolTipTag] = []
     private var linkToolTipTags: [NSView.ToolTipTag] = []
+    private var graphicalItemToolTipTags: [NSView.ToolTipTag] = []
     private var textRunBytes: [UInt8] = []
     private var graphicalTrackingArea: NSTrackingArea?
     private var imageCache: [UInt32: CGImage] = [:]
@@ -237,9 +239,9 @@ final class TerminalNSView: NSView,
         self.openDirectoryInNewTab = openDirectoryInNewTab
         self.openURL = openURL
         renderState = RenderState(session: session)
-        let descriptor = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular).fontDescriptor
+        let descriptor = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular).fontDescriptor
             .withSymbolicTraits(.italic)
-        italicFont = NSFont(descriptor: descriptor, size: 14) ?? font
+        italicFont = NSFont(descriptor: descriptor, size: 13) ?? font
         cellWidth = ceil(("M" as NSString).size(withAttributes: [.font: font]).width)
         super.init(frame: .zero)
         wantsLayer = true
@@ -411,6 +413,7 @@ final class TerminalNSView: NSView,
         textSelection = nil
         graphicalDragCandidate = nil
         linkActivationCandidate = nil
+        textSelectionMouseDownPoint = point
         textSelectionAnchor = terminalPosition(at: point)
         selectedGraphicalPlacementID = nil
         session.setGraphicalPreviewItem(nil)
@@ -451,6 +454,10 @@ final class TerminalNSView: NSView,
         }
         guard let anchor = textSelectionAnchor else { return }
         let point = convert(event.locationInWindow, from: nil)
+        if let downPoint = textSelectionMouseDownPoint {
+            guard hypot(point.x - downPoint.x, point.y - downPoint.y) >= 4 else { return }
+            textSelectionMouseDownPoint = nil
+        }
         guard let extent = terminalPosition(at: point), extent != anchor else { return }
         textSelection = TerminalTextSelection(anchor: anchor, extent: extent)
         selectedBlockHistoryRows.removeAll()
@@ -471,6 +478,7 @@ final class TerminalNSView: NSView,
         }
         graphicalDragCandidate = nil
         textSelectionAnchor = nil
+        textSelectionMouseDownPoint = nil
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -1712,6 +1720,7 @@ final class TerminalNSView: NSView,
         guard textSelection != nil || textSelectionAnchor != nil else { return }
         textSelection = nil
         textSelectionAnchor = nil
+        textSelectionMouseDownPoint = nil
         needsDisplay = true
     }
 
@@ -2009,6 +2018,15 @@ final class TerminalNSView: NSView,
         }
     }
 
+    private func refreshGraphicalItemToolTips() {
+        for tag in graphicalItemToolTipTags { removeToolTip(tag) }
+        graphicalItemToolTipTags = imageHitTargets.compactMap { target in
+            guard let item = session.graphicalItem(for: target.placementID) else { return nil }
+            let label = item.name.isEmpty ? item.path : "\(item.name)\n\(item.path)"
+            return addToolTip(target.rect, owner: label as NSString, userData: nil)
+        }
+    }
+
     private func updateGraphicalHitTargets(
         _ frame: GTFrame,
         rowOffsets: [CGFloat],
@@ -2022,6 +2040,7 @@ final class TerminalNSView: NSView,
             selectedGraphicalPlacementID = nil
             hoveredGraphicalPlacementID = nil
             dropTargetGraphicalPlacementID = nil
+            if previousTargets != imageHitTargets { refreshGraphicalItemToolTips() }
             invalidateCursorRectsIfChanged(from: previousTargets)
             return
         }
@@ -2064,6 +2083,7 @@ final class TerminalNSView: NSView,
            !imageHitTargets.contains(where: { $0.placementID == dropTargetGraphicalPlacementID }) {
             self.dropTargetGraphicalPlacementID = nil
         }
+        if previousTargets != imageHitTargets { refreshGraphicalItemToolTips() }
         invalidateCursorRectsIfChanged(from: previousTargets)
     }
 
@@ -2113,20 +2133,32 @@ final class TerminalNSView: NSView,
             let placement = images[index]
             guard !hiddenRows.contains(Int(placement.viewport_row)) else { continue }
             guard let cgImage = cachedImage(for: placement) else { continue }
-            let displayedImage = folderBloomImage(for: placement, baseImage: cgImage) ?? cgImage
             let rect = imageRect(
                 for: placement,
                 rowOffsets: rowOffsets,
                 rowLeadingOffsets: rowLeadingOffsets
             )
-            NSImage(cgImage: displayedImage, size: rect.size).draw(
-                in: rect,
-                from: .zero,
-                operation: .sourceOver,
-                fraction: 1,
-                respectFlipped: true,
-                hints: [.interpolation: NSImageInterpolation.high]
-            )
+            if let bloomImage = folderBloomImage(for: placement, baseImage: cgImage) {
+                let bleed: CGFloat = 5
+                let bloomRect = rect.insetBy(dx: -bleed, dy: -bleed)
+                NSImage(cgImage: bloomImage, size: bloomRect.size).draw(
+                    in: bloomRect,
+                    from: .zero,
+                    operation: .sourceOver,
+                    fraction: 1,
+                    respectFlipped: true,
+                    hints: [.interpolation: NSImageInterpolation.high]
+                )
+            } else {
+                NSImage(cgImage: cgImage, size: rect.size).draw(
+                    in: rect,
+                    from: .zero,
+                    operation: .sourceOver,
+                    fraction: 1,
+                    respectFlipped: true,
+                    hints: [.interpolation: NSImageInterpolation.high]
+                )
+            }
         }
     }
 
@@ -2259,11 +2291,13 @@ final class TerminalNSView: NSView,
         if let cached = folderBloomCache[placement.image_id] { return cached }
         guard let filter = CIFilter(name: "CIBloom") else { return nil }
         let input = CIImage(cgImage: baseImage)
+        let bleed: CGFloat = 5
+        let expandedExtent = input.extent.insetBy(dx: -bleed, dy: -bleed)
         filter.setValue(input, forKey: kCIInputImageKey)
-        filter.setValue(1.4, forKey: kCIInputRadiusKey)
-        filter.setValue(0.34, forKey: kCIInputIntensityKey)
-        guard let output = filter.outputImage?.cropped(to: input.extent),
-              let image = ciContext.createCGImage(output, from: input.extent) else { return nil }
+        filter.setValue(3.5, forKey: kCIInputRadiusKey)
+        filter.setValue(0.55, forKey: kCIInputIntensityKey)
+        guard let output = filter.outputImage?.cropped(to: expandedExtent),
+              let image = ciContext.createCGImage(output, from: expandedExtent) else { return nil }
         folderBloomCache[placement.image_id] = image
         return image
     }

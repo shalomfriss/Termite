@@ -78,7 +78,7 @@ enum GraphicalFileIcon {
     ) -> (symbol: String, color: NSColor, accessibilityDescription: String) {
         switch kind {
         case .directory:
-            ("folder.fill", NSColor(srgbRed: 0.31, green: 0.86, blue: 0.88, alpha: 1), "Folder")
+            ("folder.fill", NSColor(srgbRed: 0.96, green: 0.70, blue: 0.18, alpha: 1), "Folder")
         case .file:
             ("doc.fill", NSColor(srgbRed: 0.73, green: 0.80, blue: 0.84, alpha: 1), "File")
         case .executable:
