@@ -71,6 +71,13 @@ struct TerminalSurface: View {
         .onChange(of: store.graphicalMode) { _, isEnabled in
             if !isEnabled { isGraphicalPreviewPresented = false }
         }
+        .onChange(of: isGraphicalPreviewPresented) { _, presented in
+            guard !presented, store.graphicalPreviewLayoutMode == .resizeContent else { return }
+            Task {
+                try? await Task.sleep(for: .milliseconds(260))
+                session.showCurrentDirectoryGraphically()
+            }
+        }
     }
 
     private func collapseGraphicalPreview() {
