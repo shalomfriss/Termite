@@ -10,6 +10,8 @@ struct GraphicalModeToolbar: View {
     @Binding var sortDirection: GraphicalSortDirection
     @Binding var foldersFirst: Bool
     @State private var isNewFolderPopoverPresented = false
+    @State private var isToggleHovering = false
+    @State private var isSortMenuHovering = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -21,17 +23,21 @@ struct GraphicalModeToolbar: View {
             }
             .toggleStyle(.button)
             .buttonStyle(.plain)
-            .foregroundStyle(TerminalTheme.text)
+            .foregroundStyle(isEnabled ? TerminalTheme.canvas : TerminalTheme.text)
             .padding(.horizontal, 11)
             .frame(height: 30)
             .background(
-                isEnabled ? TerminalTheme.raised : TerminalTheme.subtleFill,
+                isEnabled
+                    ? TerminalTheme.cyan
+                    : (isToggleHovering ? TerminalTheme.hoverFill : TerminalTheme.subtleFill),
                 in: .rect(cornerRadius: 8)
             )
             .overlay {
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(TerminalTheme.border, lineWidth: 1)
+                    .stroke(isEnabled ? TerminalTheme.cyan.opacity(0.6) : TerminalTheme.border, lineWidth: 1)
             }
+            .onHover { isToggleHovering = $0 }
+            .animation(.easeOut(duration: 0.10), value: isToggleHovering)
             .help(isEnabled ? "Turn off graphical mode" : "Browse directories graphically")
 
             if isEnabled {
@@ -76,10 +82,7 @@ struct GraphicalModeToolbar: View {
                     session.attachGraphicalOutputToAI()
                 }
                 .labelStyle(.iconOnly)
-                .buttonStyle(.plain)
-                .foregroundStyle(TerminalTheme.mutedText)
-                .frame(width: 28, height: 28)
-                .background(.white.opacity(0.045), in: .rect(cornerRadius: 7))
+                .buttonStyle(.toolbarIcon)
                 .disabled(!session.canAttachGraphicalOutputToAI)
                 .help("Attach directory listing to AI Chat")
 
@@ -87,10 +90,7 @@ struct GraphicalModeToolbar: View {
                     session.showCurrentDirectoryGraphically()
                 }
                 .labelStyle(.iconOnly)
-                .buttonStyle(.plain)
-                .foregroundStyle(TerminalTheme.mutedText)
-                .frame(width: 28, height: 28)
-                .background(.white.opacity(0.045), in: .rect(cornerRadius: 7))
+                .buttonStyle(.toolbarIcon)
                 .disabled(session.isGraphicalNavigationInProgress)
                 .help("Refresh directory")
 
@@ -98,10 +98,7 @@ struct GraphicalModeToolbar: View {
                     isNewFolderPopoverPresented = true
                 }
                 .labelStyle(.iconOnly)
-                .buttonStyle(.plain)
-                .foregroundStyle(TerminalTheme.mutedText)
-                .frame(width: 28, height: 28)
-                .background(.white.opacity(0.045), in: .rect(cornerRadius: 7))
+                .buttonStyle(.toolbarIcon)
                 .disabled(session.isGraphicalNavigationInProgress)
                 .keyboardShortcut("n", modifiers: [.command, .shift])
                 .help("New folder (Shift-Command-N)")
@@ -132,6 +129,7 @@ struct GraphicalModeToolbar: View {
                     Toggle("Keep Folders on Top", isOn: $foldersFirst)
                 } label: {
                     Image(systemName: "square.grid.3x3.square")
+                        .foregroundStyle(isSortMenuHovering ? TerminalTheme.text : TerminalTheme.cyanMuted)
                         .frame(width: 28, height: 28)
                         .contentShape(Rectangle())
                 }
@@ -139,8 +137,12 @@ struct GraphicalModeToolbar: View {
                 .menuIndicator(.hidden)
                 .frame(width: 28, height: 28)
                 .fixedSize()
-                .foregroundStyle(TerminalTheme.mutedText)
-                .background(.white.opacity(0.045), in: .rect(cornerRadius: 7))
+                .background(
+                    isSortMenuHovering ? .white.opacity(0.08) : .white.opacity(0.04),
+                    in: .rect(cornerRadius: 6)
+                )
+                .onHover { isSortMenuHovering = $0 }
+                .animation(.easeOut(duration: 0.10), value: isSortMenuHovering)
                 .help("Arrange and group items")
 
                 Toggle("Show hidden files", isOn: $showsHiddenFiles)

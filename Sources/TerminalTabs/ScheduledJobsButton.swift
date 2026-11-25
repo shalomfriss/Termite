@@ -8,10 +8,7 @@ struct ScheduledJobsButton: View {
             store.isScheduledJobsVisible = true
         }
         .labelStyle(.iconOnly)
-        .buttonStyle(.plain)
-        .frame(width: 28, height: 28)
-        .contentShape(Rectangle())
-        .foregroundStyle(TerminalTheme.cyanMuted)
+        .buttonStyle(.toolbarIcon)
         .overlay(alignment: .topTrailing) {
             if store.scheduledJobs.scheduledCount > 0 {
                 Circle()

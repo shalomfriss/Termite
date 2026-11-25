@@ -26,11 +26,11 @@ struct AIConversationPanel: View {
                 Spacer()
                 Button("Clear conversation", systemImage: "trash", action: session.clearAIConversation)
                 .labelStyle(.iconOnly)
-                .buttonStyle(.plain)
+                .buttonStyle(.toolbarIcon)
                 .help("Clear conversation")
                 Button("Close AI chat", systemImage: "xmark") { session.isAIChatVisible = false }
                 .labelStyle(.iconOnly)
-                .buttonStyle(.plain)
+                .buttonStyle(.toolbarIcon)
                 .help("Close AI chat")
             }
             .foregroundStyle(.secondary)
@@ -179,15 +179,6 @@ struct AppSettingsView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     GroupBox("Tabs") {
                         VStack(alignment: .leading, spacing: 10) {
-                            LabeledContent("Orientation") {
-                                AirMenuPicker(
-                                    "Orientation",
-                                    selection: $store.tabOrientation,
-                                    options: TabOrientation.allCases,
-                                    minimumWidth: 150,
-                                    optionTitle: { $0.title }
-                                )
-                            }
                             Toggle(
                                 "Show \(store.tabOrientation.panelName)",
                                 isOn: $store.isTabBarVisible

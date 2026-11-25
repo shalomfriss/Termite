@@ -507,9 +507,7 @@ struct TabSettingsMenu: View {
             store.isSettingsVisible = true
         }
         .labelStyle(.iconOnly)
-        .buttonStyle(.plain)
-        .frame(width: 28, height: 28)
-        .foregroundStyle(TerminalTheme.cyanMuted)
+        .buttonStyle(.toolbarIcon)
         .help("Settings")
     }
 }
@@ -523,10 +521,7 @@ struct SmallIconButton: View {
         Button(help, systemImage: systemName, action: action)
         .labelStyle(.iconOnly)
         .font(.system(size: 12, weight: .semibold))
-        .frame(width: 28, height: 28)
-        .contentShape(Rectangle())
-        .buttonStyle(.plain)
-        .foregroundStyle(TerminalTheme.cyanMuted)
+        .buttonStyle(.toolbarIcon)
         .help(help)
     }
 }

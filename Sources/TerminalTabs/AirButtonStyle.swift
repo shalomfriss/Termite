@@ -85,3 +85,39 @@ extension ButtonStyle where Self == AirButtonStyle {
     static var airSecondary: AirButtonStyle { AirButtonStyle(emphasis: .secondary) }
     static var airDestructive: AirButtonStyle { AirButtonStyle(emphasis: .destructive) }
 }
+
+struct ToolbarIconButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        ToolbarIconButtonBody(label: configuration.label, isPressed: configuration.isPressed)
+    }
+}
+
+private struct ToolbarIconButtonBody<Label: View>: View {
+    let label: Label
+    let isPressed: Bool
+    @State private var isHovering = false
+    @Environment(\.isEnabled) private var isEnabled
+
+    var body: some View {
+        label
+            .foregroundStyle(isHovering || isPressed ? TerminalTheme.text : TerminalTheme.cyanMuted)
+            .frame(width: 28, height: 28)
+            .background(background, in: .rect(cornerRadius: 6))
+            .contentShape(.rect)
+            .scaleEffect(isPressed ? 0.93 : 1)
+            .opacity(isEnabled ? 1 : 0.38)
+            .onHover { isHovering = $0 }
+            .animation(.easeOut(duration: 0.10), value: isHovering)
+            .animation(.easeOut(duration: 0.07), value: isPressed)
+    }
+
+    private var background: Color {
+        if isPressed { return .white.opacity(0.13) }
+        if isHovering { return .white.opacity(0.08) }
+        return .white.opacity(0.04)
+    }
+}
+
+extension ButtonStyle where Self == ToolbarIconButtonStyle {
+    static var toolbarIcon: ToolbarIconButtonStyle { ToolbarIconButtonStyle() }
+}
