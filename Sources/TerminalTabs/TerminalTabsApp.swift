@@ -109,7 +109,7 @@ struct TerminalWindow: View {
         Group {
             if store.tabOrientation == .vertical {
                 VStack(spacing: 0) {
-                    VerticalPanelHeader(store: store)
+                    VerticalPanelHeader()
                     HStack(spacing: 0) {
                         if store.isTabBarVisible {
                             VerticalTabSidebar(store: store, rename: beginRename)
@@ -187,30 +187,10 @@ struct TerminalWindow: View {
 }
 
 struct VerticalPanelHeader: View {
-    @ObservedObject var store: TerminalStore
-
     var body: some View {
-        HStack(spacing: 10) {
-            Button {
-                store.isTabBarVisible.toggle()
-            } label: {
-                Label(store.selected?.title ?? "Shell", systemImage: "terminal")
-            }
-            .buttonStyle(.plain)
-            .font(.callout)
-            .bold()
-            .foregroundStyle(TerminalTheme.text)
-            .help(store.tabPanelVisibilityActionTitle)
-            .accessibilityLabel(store.tabPanelVisibilityActionTitle)
-            Spacer()
-        }
-        .padding(.leading, 72)
-        .padding(.trailing, 14)
-        .frame(height: 60)
-        .background(TerminalTheme.surface)
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(TerminalTheme.border).frame(height: 1)
-        }
+        Color.clear
+            .frame(height: 52)
+            .background(TerminalTheme.surface)
     }
 }
 
@@ -351,6 +331,12 @@ struct VerticalTabSidebar: View {
                 ScheduledJobsButton(store: store)
                 TabSettingsMenu(store: store)
                 Spacer()
+                SmallIconButton(
+                    systemName: "sidebar.left",
+                    help: store.tabPanelVisibilityActionTitle
+                ) {
+                    store.isTabBarVisible = false
+                }
             }
             .padding(.horizontal, 12)
             .frame(height: 46)
