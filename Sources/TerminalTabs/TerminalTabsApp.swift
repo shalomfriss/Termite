@@ -194,7 +194,7 @@ struct VerticalPanelHeader: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            Spacer().frame(width: 20)
+            Spacer().frame(width: 10)
             SmallIconButton(
                 systemName: "sidebar.left",
                 help: store.tabPanelVisibilityActionTitle
