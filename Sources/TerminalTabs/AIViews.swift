@@ -105,6 +105,7 @@ struct AIConversationPanel: View {
                         RoundedRectangle(cornerRadius: 7)
                             .stroke(isDropTargeted ? TerminalTheme.cyan : Color.clear, lineWidth: 1)
                     }
+                    .onSubmit { session.sendAIMessage(using: settings) }
                 Button("Send", systemImage: "arrow.up") { session.sendAIMessage(using: settings) }
                 .labelStyle(.iconOnly)
                 .font(.system(size: 12, weight: .bold))
@@ -115,8 +116,8 @@ struct AIConversationPanel: View {
                         && session.aiAttachments.isEmpty
                         || session.isAIResponding
                 )
-                .keyboardShortcut(.return, modifiers: .command)
-                .help("Send (Command-Return)")
+                .keyboardShortcut(.return, modifiers: .shift)
+                .help("Send (Return · Shift-Return for new line)")
             }
             .padding(10)
         }
