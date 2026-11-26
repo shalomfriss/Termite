@@ -109,7 +109,7 @@ struct TerminalWindow: View {
         Group {
             if store.tabOrientation == .vertical {
                 VStack(spacing: 0) {
-                    VerticalPanelHeader()
+                    VerticalPanelHeader(store: store)
                     HStack(spacing: 0) {
                         if store.isTabBarVisible {
                             VerticalTabSidebar(store: store, rename: beginRename)
@@ -187,10 +187,23 @@ struct TerminalWindow: View {
 }
 
 struct VerticalPanelHeader: View {
+    @ObservedObject var store: TerminalStore
+
     var body: some View {
-        Color.clear
-            .frame(height: 52)
-            .background(TerminalTheme.surface)
+        HStack {
+            if !store.isTabBarVisible {
+                SmallIconButton(
+                    systemName: "sidebar.left",
+                    help: store.tabPanelVisibilityActionTitle
+                ) {
+                    store.isTabBarVisible = true
+                }
+                .padding(.leading, 72)
+            }
+            Spacer()
+        }
+        .frame(height: 52)
+        .background(TerminalTheme.surface)
     }
 }
 
