@@ -139,6 +139,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published var aiAttachments: [AIInputAttachment] = []
     @Published var isAIResponding = false
     @Published var aiError: String?
+    private var aiTask: Task<Void, Never>?
     @Published var graphicalMode = false
     @Published private(set) var isGraphicalNavigationInProgress = false
     @Published private(set) var isAlternateScreen = false
@@ -2599,8 +2600,16 @@ final class TerminalSession: ObservableObject, Identifiable {
         isAIResponding = true
         let history = aiMessages
         let model = settings.selectedModel
+        let wd = workingDirectory
+        let systemPrompt = """
+        You are an AI assistant embedded in a macOS terminal emulator. \
+        Help with shell commands, scripting, debugging, and terminal workflows. \
+        Always format shell commands in fenced code blocks with the language tag \
+        (e.g. ```bash). Keep responses concise and practical. \
+        Current working directory: \(wd)
+        """
 
-        Task { [weak self] in
+        aiTask = Task { [weak self] in
             do {
                 let answer = try await AIClient.send(
                     provider: provider,
@@ -2608,20 +2617,30 @@ final class TerminalSession: ObservableObject, Identifiable {
                     model: model,
                     apiKey: apiKey,
                     messages: history,
-                    workingDirectory: self?.workingDirectory ?? FileManager.default.currentDirectoryPath
+                    workingDirectory: wd,
+                    systemPrompt: systemPrompt
                 )
-                guard let self else { return }
+                guard let self, !Task.isCancelled else { return }
                 self.aiMessages.append(AIChatMessage(role: .assistant, text: answer))
                 self.isAIResponding = false
+                self.aiTask = nil
             } catch {
-                guard let self else { return }
+                guard let self, !Task.isCancelled else { return }
                 self.aiError = error.localizedDescription
                 self.isAIResponding = false
+                self.aiTask = nil
             }
         }
     }
 
+    func cancelAIMessage() {
+        aiTask?.cancel()
+        aiTask = nil
+        isAIResponding = false
+    }
+
     func clearAIConversation() {
+        cancelAIMessage()
         aiMessages.removeAll()
         aiAttachments.removeAll()
         aiError = nil

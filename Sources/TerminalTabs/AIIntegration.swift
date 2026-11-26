@@ -190,32 +190,41 @@ enum AIClient {
         model: String,
         apiKey: String,
         messages: [AIChatMessage],
-        workingDirectory: String
+        workingDirectory: String,
+        systemPrompt: String = ""
     ) async throws -> String {
         if connectionMode == .signIn {
             return try await CLIRunner.shared.ask(
                 provider,
                 messages: messages,
-                workingDirectory: workingDirectory
+                workingDirectory: workingDirectory,
+                systemPrompt: systemPrompt
             )
         }
         switch provider {
         case .openAI:
-            return try await sendOpenAI(model: model, apiKey: apiKey, messages: messages)
+            return try await sendOpenAI(model: model, apiKey: apiKey,
+                                        messages: messages, systemPrompt: systemPrompt)
         case .anthropic:
-            return try await sendAnthropic(model: model, apiKey: apiKey, messages: messages)
+            return try await sendAnthropic(model: model, apiKey: apiKey,
+                                           messages: messages, systemPrompt: systemPrompt)
         }
     }
 
-    private static func sendOpenAI(model: String, apiKey: String, messages: [AIChatMessage]) async throws -> String {
+    private static func sendOpenAI(
+        model: String, apiKey: String,
+        messages: [AIChatMessage], systemPrompt: String
+    ) async throws -> String {
         var request = URLRequest(url: URL(string: "https://api.openai.com/v1/responses")!)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
+        var body: [String: Any] = [
             "model": model,
             "input": messages.map { ["role": $0.role.rawValue, "content": $0.requestContent] },
-        ])
+        ]
+        if !systemPrompt.isEmpty { body["instructions"] = systemPrompt }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let data = try await perform(request)
         let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         let output = root?["output"] as? [[String: Any]] ?? []
@@ -225,17 +234,22 @@ enum AIClient {
         return text
     }
 
-    private static func sendAnthropic(model: String, apiKey: String, messages: [AIChatMessage]) async throws -> String {
+    private static func sendAnthropic(
+        model: String, apiKey: String,
+        messages: [AIChatMessage], systemPrompt: String
+    ) async throws -> String {
         var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
         request.httpMethod = "POST"
         request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
+        var body: [String: Any] = [
             "model": model,
             "max_tokens": 4096,
             "messages": messages.map { ["role": $0.role.rawValue, "content": $0.requestContent] },
-        ])
+        ]
+        if !systemPrompt.isEmpty { body["system"] = systemPrompt }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let data = try await perform(request)
         let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         let content = root?["content"] as? [[String: Any]] ?? []
@@ -296,7 +310,8 @@ actor CLIRunner {
     func ask(
         _ provider: AIProvider,
         messages: [AIChatMessage],
-        workingDirectory: String
+        workingDirectory: String,
+        systemPrompt: String = ""
     ) throws -> String {
         guard let executable = executable(for: provider) else {
             throw AIError.api("Install the official \(provider == .openAI ? "Codex" : "Claude Code") CLI first.")
@@ -304,7 +319,10 @@ actor CLIRunner {
         let transcript = messages.map { message in
             "\(message.role == .user ? "User" : "Assistant"): \(message.requestContent)"
         }.joined(separator: "\n\n")
-        let prompt = "Answer the final user question. Use attached terminal context when present.\n\n" + transcript
+        let header = systemPrompt.isEmpty
+            ? "Answer the final user question. Use attached terminal context when present."
+            : systemPrompt
+        let prompt = header + "\n\n" + transcript
         let arguments: [String]
         if provider == .openAI {
             arguments = ["exec", "--sandbox", "read-only", "--skip-git-repo-check", prompt]

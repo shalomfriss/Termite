@@ -1,15 +1,226 @@
+import AppKit
 import SwiftUI
+
+// MARK: - Response segment parsing
+
+private enum AIResponseSegment: Equatable {
+    case text(String)
+    case code(language: String?, body: String)
+
+    static func parse(_ raw: String) -> [AIResponseSegment] {
+        var segments: [AIResponseSegment] = []
+        var remaining = raw
+
+        while !remaining.isEmpty {
+            guard let fenceRange = remaining.range(of: "```") else {
+                segments.append(.text(remaining))
+                break
+            }
+            let before = String(remaining[..<fenceRange.lowerBound])
+            if !before.isEmpty { segments.append(.text(before)) }
+            remaining = String(remaining[fenceRange.upperBound...])
+
+            // Extract optional language tag on the same line as opening fence
+            let langEnd = remaining.firstIndex(of: "\n") ?? remaining.endIndex
+            let lang = String(remaining[..<langEnd]).trimmingCharacters(in: .whitespaces)
+            remaining = langEnd < remaining.endIndex
+                ? String(remaining[remaining.index(after: langEnd)...])
+                : ""
+
+            // Find closing fence
+            if let closeRange = remaining.range(of: "```") {
+                let body = String(remaining[..<closeRange.lowerBound])
+                    .trimmingCharacters(in: .newlines)
+                segments.append(.code(language: lang.isEmpty ? nil : lang, body: body))
+                remaining = String(remaining[closeRange.upperBound...])
+                if remaining.hasPrefix("\n") { remaining = String(remaining.dropFirst()) }
+            } else {
+                segments.append(.text(remaining))
+                remaining = ""
+            }
+        }
+
+        return segments.filter {
+            if case .text(let t) = $0 { return !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            return true
+        }
+    }
+}
+
+// MARK: - Code block view
+
+struct AICodeBlockView: View {
+    let language: String?
+    let code: String
+    let runCommand: ((String) -> Void)?
+
+    @State private var copied = false
+
+    private var isShell: Bool {
+        ["bash", "sh", "zsh", "shell", "fish", ""].contains((language ?? "").lowercased())
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header bar
+            HStack(spacing: 6) {
+                Text(language ?? "shell")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(TerminalTheme.cyanMuted)
+                Spacer()
+                Button(copied ? "Copied" : "Copy",
+                       systemImage: copied ? "checkmark" : "doc.on.doc") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(code, forType: .string)
+                    copied = true
+                    Task {
+                        try? await Task.sleep(for: .seconds(2))
+                        copied = false
+                    }
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.toolbarIcon)
+                .help("Copy to clipboard")
+
+                if isShell, let runCommand {
+                    Button("Run", systemImage: "play.fill") {
+                        runCommand(code)
+                    }
+                    .labelStyle(.titleAndIcon)
+                    .font(.system(size: 10, weight: .semibold))
+                    .padding(.horizontal, 8)
+                    .frame(height: 24)
+                    .background(TerminalTheme.cyan.opacity(0.18), in: .rect(cornerRadius: 5))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 5)
+                            .stroke(TerminalTheme.cyan.opacity(0.4), lineWidth: 1)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(TerminalTheme.cyan)
+                    .help("Run in terminal")
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.black.opacity(0.22))
+
+            Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(code)
+                    .font(.system(size: 11.5, design: .monospaced))
+                    .textSelection(.enabled)
+                    .foregroundStyle(TerminalTheme.text)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .background(TerminalTheme.canvas)
+        .clipShape(.rect(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(.white.opacity(0.09), lineWidth: 1)
+        }
+    }
+}
+
+// MARK: - Message view
+
+private struct AIMessageView: View {
+    let message: AIChatMessage
+    let runCommand: ((String) -> Void)?
+
+    var body: some View {
+        if message.role == .user {
+            userBubble
+        } else {
+            assistantBubble
+        }
+    }
+
+    // Right-aligned tinted bubble for user turns
+    private var userBubble: some View {
+        HStack(alignment: .top, spacing: 0) {
+            Spacer(minLength: 48)
+            VStack(alignment: .trailing, spacing: 6) {
+                ForEach(message.attachments) { attachment in
+                    AIAttachmentChip(attachment: attachment)
+                }
+                if !message.text.isEmpty {
+                    Text(message.text)
+                        .font(.system(size: 12))
+                        .textSelection(.enabled)
+                        .foregroundStyle(TerminalTheme.text)
+                        .multilineTextAlignment(.leading)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 8)
+                        .background(TerminalTheme.cyan.opacity(0.14), in: .rect(cornerRadius: 10))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(TerminalTheme.cyan.opacity(0.26), lineWidth: 1)
+                        }
+                }
+            }
+        }
+    }
+
+    // Full-width markdown-parsed response for assistant turns
+    private var assistantBubble: some View {
+        let segments = AIResponseSegment.parse(message.text)
+        return VStack(alignment: .leading, spacing: 10) {
+            Label("AI", systemImage: "sparkles")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(TerminalTheme.cyanMuted)
+
+            ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+                switch segment {
+                case .text(let txt):
+                    Text(txt.trimmingCharacters(in: .newlines))
+                        .font(.system(size: 12))
+                        .textSelection(.enabled)
+                        .foregroundStyle(TerminalTheme.text)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                case .code(let lang, let body):
+                    AICodeBlockView(language: lang, code: body, runCommand: runCommand)
+                }
+            }
+        }
+        .padding(11)
+        .background(Color.white.opacity(0.035), in: .rect(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(.white.opacity(0.07), lineWidth: 1)
+        }
+    }
+}
+
+// MARK: - Conversation panel
 
 struct AIConversationPanel: View {
     @ObservedObject var session: TerminalSession
     @ObservedObject var settings: AISettings
     @State private var isDropTargeted = false
 
+    private var runCommand: (String) -> Void {
+        { code in
+            let trimmed = code.trimmingCharacters(in: .newlines)
+            let lines = trimmed.components(separatedBy: "\n")
+                .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            if lines.count == 1 {
+                session.rerunBlockCommand(lines[0])
+            } else {
+                session.paste(trimmed)
+            }
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
+            // Header
             HStack(spacing: 8) {
                 Image(systemName: "sparkles")
-                Text("Terminal AI").font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(TerminalTheme.cyan)
+                Text("AI").font(.system(size: 12, weight: .semibold))
                 AirMenuPicker(
                     "Provider",
                     selection: $settings.provider,
@@ -18,64 +229,102 @@ struct AIConversationPanel: View {
                     optionTitle: { $0.title }
                 )
                 Text(settings.connectionMode(for: settings.provider) == .signIn
-                     ? "Account login"
+                     ? "Account"
                      : settings.selectedModel)
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
                 Spacer()
-                Button("Clear conversation", systemImage: "trash", action: session.clearAIConversation)
-                .labelStyle(.iconOnly)
-                .buttonStyle(.toolbarIcon)
-                .help("Clear conversation")
-                Button("Close AI chat", systemImage: "xmark") { session.isAIChatVisible = false }
-                .labelStyle(.iconOnly)
-                .buttonStyle(.toolbarIcon)
-                .help("Close AI chat")
+                Button("Clear", systemImage: "trash", action: session.clearAIConversation)
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.toolbarIcon)
+                    .help("Clear conversation")
+                Button("Close", systemImage: "xmark") { session.isAIChatVisible = false }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.toolbarIcon)
+                    .help("Close AI chat")
             }
             .foregroundStyle(.secondary)
             .padding(.horizontal, 12)
-            .frame(height: 34)
+            .frame(height: 36)
 
-            Divider().opacity(0.35)
+            // Current directory context strip
+            HStack(spacing: 5) {
+                Image(systemName: "folder.fill")
+                    .font(.system(size: 9))
+                Text(session.workingDirectory)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(TerminalTheme.cyanMuted)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 6)
 
+            Divider().opacity(0.3)
+
+            // Message list
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
+                    LazyVStack(alignment: .leading, spacing: 12) {
                         if session.aiMessages.isEmpty {
-                            Text("Ask about a command, an error, or what to do next.")
-                                .font(.system(size: 12))
-                                .foregroundStyle(.tertiary)
-                                .frame(maxWidth: .infinity, alignment: .center)
-                                .padding(.vertical, 16)
+                            VStack(spacing: 8) {
+                                Image(systemName: "sparkles")
+                                    .font(.system(size: 24))
+                                    .foregroundStyle(TerminalTheme.cyanMuted)
+                                Text("Ask about a command, an error, or what to do next.")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(.tertiary)
+                                    .multilineTextAlignment(.center)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 24)
                         }
                         ForEach(session.aiMessages) { message in
-                            AIMessageView(message: message)
+                            AIMessageView(message: message, runCommand: runCommand)
                                 .id(message.id)
                         }
                         if session.isAIResponding {
-                            HStack(spacing: 7) {
+                            HStack(spacing: 8) {
                                 ProgressView().controlSize(.small)
-                                Text("Thinking…")
+                                Text("Thinking…").font(.system(size: 11)).foregroundStyle(.secondary)
+                                Spacer()
+                                Button("Stop", systemImage: "stop.fill") {
+                                    session.cancelAIMessage()
+                                }
+                                .labelStyle(.titleAndIcon)
+                                .font(.system(size: 10, weight: .medium))
+                                .buttonStyle(.plain)
+                                .foregroundStyle(TerminalTheme.cyanMuted)
+                                .help("Stop generating")
                             }
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
+                            .padding(.top, 4)
                         }
                     }
                     .padding(12)
                 }
                 .onChange(of: session.aiMessages.count) {
-                    if let last = session.aiMessages.last { proxy.scrollTo(last.id, anchor: .bottom) }
+                    if let last = session.aiMessages.last {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
+                }
+                .onChange(of: session.isAIResponding) {
+                    if let last = session.aiMessages.last {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
                 }
             }
 
             if let error = session.aiError {
-                Text(error)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.red)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 5)
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                    Text(error).foregroundStyle(.red)
+                }
+                .font(.system(size: 10))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 5)
             }
 
             if !session.aiAttachments.isEmpty {
@@ -90,30 +339,43 @@ struct AIConversationPanel: View {
                     .padding(.horizontal, 10)
                 }
                 .frame(height: 42)
-                .padding(.bottom, 6)
+                .padding(.bottom, 4)
             }
 
+            Divider().opacity(0.3)
+
+            // Input bar
             HStack(alignment: .bottom, spacing: 8) {
-                TextField("Ask about the terminal, or drop files and folders here", text: $session.aiDraft, axis: .vertical)
-                    .font(.system(size: 12))
-                    .lineLimit(2...5)
-                    .textFieldStyle(.plain)
-                    .padding(8)
-                    .background(isDropTargeted ? TerminalTheme.cyan.opacity(0.12) : Color.black.opacity(0.2))
-                    .clipShape(.rect(cornerRadius: 7))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 7)
-                            .stroke(isDropTargeted ? TerminalTheme.cyan : Color.clear, lineWidth: 1)
-                    }
-                    .onSubmit { session.sendAIMessage(using: settings) }
-                Button("Send", systemImage: "arrow.up") { session.sendAIMessage(using: settings) }
-                .labelStyle(.iconOnly)
-                .font(.system(size: 12, weight: .bold))
-                .frame(width: 28, height: 28)
+                TextField(
+                    "Ask anything about the terminal…",
+                    text: $session.aiDraft,
+                    axis: .vertical
+                )
+                .font(.system(size: 12))
+                .lineLimit(2...6)
+                .textFieldStyle(.plain)
+                .padding(9)
+                .background(
+                    isDropTargeted ? TerminalTheme.cyan.opacity(0.12) : Color.black.opacity(0.18),
+                    in: .rect(cornerRadius: 8)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(isDropTargeted ? TerminalTheme.cyan : Color.white.opacity(0.08), lineWidth: 1)
+                }
+                .onSubmit { session.sendAIMessage(using: settings) }
+
+                Button {
+                    session.sendAIMessage(using: settings)
+                } label: {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 12, weight: .bold))
+                        .frame(width: 28, height: 28)
+                }
                 .buttonStyle(.borderedProminent)
                 .disabled(
-                    session.aiDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        && session.aiAttachments.isEmpty
+                    (session.aiDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        && session.aiAttachments.isEmpty)
                         || session.isAIResponding
                 )
                 .keyboardShortcut(.return, modifiers: .shift)
@@ -121,11 +383,11 @@ struct AIConversationPanel: View {
             }
             .padding(10)
         }
-        .frame(minHeight: 180, idealHeight: 250)
+        .frame(minHeight: 200, idealHeight: 300)
         .background(TerminalTheme.surface)
-        .clipShape(.rect(cornerRadius: 8))
+        .clipShape(.rect(cornerRadius: 10))
         .overlay {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .stroke(isDropTargeted ? TerminalTheme.cyan.opacity(0.8) : Color.white.opacity(0.1), lineWidth: 1)
         }
         .dropDestination(for: URL.self) { urls, _ in
@@ -134,28 +396,7 @@ struct AIConversationPanel: View {
     }
 }
 
-private struct AIMessageView: View {
-    let message: AIChatMessage
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(message.role == .user ? "You" : "AI")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.secondary)
-            ForEach(message.attachments) { attachment in
-                AIAttachmentChip(attachment: attachment)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            Text(message.text)
-                .font(.system(size: 12))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(9)
-        .background(message.role == .user ? Color.accentColor.opacity(0.12) : Color.white.opacity(0.04))
-        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-    }
-}
+// MARK: - Settings
 
 struct AppSettingsView: View {
     @ObservedObject var store: TerminalStore
