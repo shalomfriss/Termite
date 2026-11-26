@@ -17,7 +17,7 @@ let package = Package(
             name: "Air",
             dependencies: ["GhosttyBridge"],
             path: "Sources/TerminalTabs",
-            resources: [.copy("Resources/ShellIntegration")],
+            resources: [.copy("Resources/ShellIntegration"), .copy("Resources/FolderIcon.png")],
             linkerSettings: [.linkedFramework("Security")]
         ),
         .testTarget(
