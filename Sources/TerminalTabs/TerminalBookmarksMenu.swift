@@ -11,10 +11,22 @@ struct TerminalBookmarksMenu: View {
             } else {
                 Section("Saved Commands") {
                     ForEach(session.terminalBlockBookmarks) { bookmark in
-                        Button(bookmark.title, systemImage: "arrow.forward.circle") {
-                            session.rerunBlockCommand(bookmark.command)
+                        Menu(bookmark.title) {
+                            Button("Run", systemImage: "arrow.forward.circle") {
+                                session.rerunBlockCommand(bookmark.command)
+                            }
+                            .help("Run: \(bookmark.command)")
+                            Divider()
+                            Button("Remove", systemImage: "trash", role: .destructive) {
+                                session.toggleTerminalBlockBookmarked(
+                                    bookmark.id,
+                                    command: bookmark.command,
+                                    output: bookmark.output,
+                                    workingDirectory: bookmark.workingDirectory
+                                )
+                            }
+                            .help("Remove \"\(bookmark.title)\" from saved commands")
                         }
-                        .help("Run: \(bookmark.command)")
                     }
                 }
             }
