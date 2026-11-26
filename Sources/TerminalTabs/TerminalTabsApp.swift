@@ -190,15 +190,13 @@ struct VerticalPanelHeader: View {
     @ObservedObject var store: TerminalStore
 
     var body: some View {
-        HStack {
-            if !store.isTabBarVisible {
-                SmallIconButton(
-                    systemName: "sidebar.left",
-                    help: store.tabPanelVisibilityActionTitle
-                ) {
-                    store.isTabBarVisible = true
-                }
-                .padding(.leading, 72)
+        HStack(spacing: 0) {
+            Spacer().frame(width: 76)
+            SmallIconButton(
+                systemName: "sidebar.left",
+                help: store.tabPanelVisibilityActionTitle
+            ) {
+                store.isTabBarVisible.toggle()
             }
             Spacer()
         }
@@ -344,12 +342,6 @@ struct VerticalTabSidebar: View {
                 ScheduledJobsButton(store: store)
                 TabSettingsMenu(store: store)
                 Spacer()
-                SmallIconButton(
-                    systemName: "sidebar.left",
-                    help: store.tabPanelVisibilityActionTitle
-                ) {
-                    store.isTabBarVisible = false
-                }
             }
             .padding(.horizontal, 12)
             .frame(height: 46)
