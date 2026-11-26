@@ -103,7 +103,6 @@ struct TerminalWindow: View {
     @State private var renameGroupID: UUID?
     @State private var groupNameDraft = ""
     @State private var verticalPanelWidth: CGFloat = 238
-    @State private var verticalPanelDragStartWidth: CGFloat?
 
     var body: some View {
         Group {
@@ -115,8 +114,7 @@ struct TerminalWindow: View {
                             VerticalTabSidebar(store: store, rename: beginRename)
                                 .frame(width: verticalPanelWidth)
                                 .transition(.move(edge: .leading).combined(with: .opacity))
-                            VerticalPanelResizeHandle()
-                                .gesture(verticalPanelResizeGesture)
+                            VerticalPanelResizeHandle(width: $verticalPanelWidth)
                                 .transition(.opacity)
                         }
                         terminal
@@ -169,24 +167,6 @@ struct TerminalWindow: View {
         isRenamingGroup = true
     }
 
-    private var verticalPanelResizeGesture: some Gesture {
-        DragGesture(minimumDistance: 1)
-            .onChanged { value in
-                if verticalPanelDragStartWidth == nil {
-                    verticalPanelDragStartWidth = verticalPanelWidth
-                }
-                let newWidth = min(
-                    420,
-                    max(180, (verticalPanelDragStartWidth ?? verticalPanelWidth) + value.translation.width)
-                )
-                var tx = Transaction()
-                tx.disablesAnimations = true
-                withTransaction(tx) { verticalPanelWidth = newWidth }
-            }
-            .onEnded { _ in
-                verticalPanelDragStartWidth = nil
-            }
-    }
 }
 
 struct VerticalPanelHeader: View {
@@ -209,16 +189,53 @@ struct VerticalPanelHeader: View {
 }
 
 struct VerticalPanelResizeHandle: View {
+    @Binding var width: CGFloat
+    private let minWidth: CGFloat = 180
+    private let maxWidth: CGFloat = 420
+
+    @State private var dragStartWidth: CGFloat?
     @State private var isHovering = false
+    @State private var isDragging = false
 
     var body: some View {
         Rectangle()
-            .fill(isHovering ? TerminalTheme.cyan.opacity(0.42) : TerminalTheme.cyan.opacity(0.16))
+            .fill(isActive ? TerminalTheme.cyan.opacity(0.42) : TerminalTheme.cyan.opacity(0.16))
             .frame(width: 4)
             .contentShape(Rectangle().inset(by: -3))
-            .onHover { isHovering = $0 }
+            .onContinuousHover { phase in
+                switch phase {
+                case .active:
+                    isHovering = true
+                    NSCursor.resizeLeftRight.set()
+                case .ended:
+                    isHovering = false
+                    if !isDragging { NSCursor.arrow.set() }
+                }
+            }
+            .onDisappear { NSCursor.arrow.set() }
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                    .onChanged { value in
+                        isDragging = true
+                        NSCursor.resizeLeftRight.set()
+                        let start = dragStartWidth ?? width
+                        dragStartWidth = start
+                        var tx = Transaction()
+                        tx.disablesAnimations = true
+                        withTransaction(tx) {
+                            width = min(maxWidth, max(minWidth, start + value.translation.width))
+                        }
+                    }
+                    .onEnded { _ in
+                        dragStartWidth = nil
+                        isDragging = false
+                        if !isHovering { NSCursor.arrow.set() }
+                    }
+            )
             .help("Resize side panel")
     }
+
+    private var isActive: Bool { isHovering || isDragging }
 }
 
 struct TerminalWorkspace: View {
