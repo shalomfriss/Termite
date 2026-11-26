@@ -36,6 +36,7 @@ struct GraphicalModeToolbar: View {
                 RoundedRectangle(cornerRadius: 8)
                     .stroke(isEnabled ? TerminalTheme.cyan.opacity(0.6) : TerminalTheme.border, lineWidth: 1)
             }
+            .contentShape(.rect)
             .onHover { isToggleHovering = $0 }
             .animation(.easeOut(duration: 0.10), value: isToggleHovering)
             .help(isEnabled ? "Turn off graphical mode" : "Browse directories graphically")
