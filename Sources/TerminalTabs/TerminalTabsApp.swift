@@ -175,10 +175,13 @@ struct TerminalWindow: View {
                 if verticalPanelDragStartWidth == nil {
                     verticalPanelDragStartWidth = verticalPanelWidth
                 }
-                verticalPanelWidth = min(
+                let newWidth = min(
                     420,
                     max(180, (verticalPanelDragStartWidth ?? verticalPanelWidth) + value.translation.width)
                 )
+                var tx = Transaction()
+                tx.disablesAnimations = true
+                withTransaction(tx) { verticalPanelWidth = newWidth }
             }
             .onEnded { _ in
                 verticalPanelDragStartWidth = nil
@@ -191,7 +194,7 @@ struct VerticalPanelHeader: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            Spacer().frame(width: 76)
+            Spacer().frame(width: 20)
             SmallIconButton(
                 systemName: "sidebar.left",
                 help: store.tabPanelVisibilityActionTitle
