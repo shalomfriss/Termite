@@ -71,6 +71,9 @@ final class TerminalNSView: NSView,
     static let blockContentPadding: CGFloat = 20
     static let blockSpacing: CGFloat = 10
     static let blockTopInset: CGFloat = 10
+    private static let foldButtonSize: CGFloat = 16
+    private static let foldButtonMargin: CGFloat = 5
+    private static let collapsedBlockHeight: CGFloat = foldButtonSize + foldButtonMargin * 2
     static let blockCornerRadius: CGFloat = 4
     private static let blockOuterMargin: CGFloat = 8
     private static let terminalContentInset: CGFloat = 10
@@ -1044,6 +1047,8 @@ final class TerminalNSView: NSView,
         let selectedFill = NSColor(srgbRed: 0.085, green: 0.093, blue: 0.105, alpha: 1)
         let selectedBorder = NSColor.white.withAlphaComponent(0.30)
         for (index, range) in ranges.enumerated() {
+            // Fully collapsed blocks show only the fold button — no background rect.
+            if visualLayout.fullyCollapsedRangeStarts.contains(range.lowerBound) { continue }
             let verticalFrame = visualLayout.blockFrames[index]
             let rect = NSRect(
                 x: Self.blockOuterMargin,
@@ -1693,7 +1698,8 @@ final class TerminalNSView: NSView,
             ),
             contentPadding: Self.blockContentPadding,
             blockSpacing: Self.blockSpacing,
-            topInset: Self.blockTopInset
+            topInset: Self.blockTopInset,
+            collapsedBlockHeight: Self.collapsedBlockHeight
         )
     }
 
@@ -1759,12 +1765,11 @@ final class TerminalNSView: NSView,
             )
             let block = blockContents(for: range, frame: frame, cells: cells)
             if range.count > 1 {
-                let foldSize: CGFloat = 16
                 let foldRect = CGRect(
-                    x: Self.blockOuterMargin + 5,
-                    y: blockFrame.minY + 5,
-                    width: foldSize,
-                    height: foldSize
+                    x: Self.blockOuterMargin + Self.foldButtonMargin,
+                    y: blockFrame.minY + Self.foldButtonMargin,
+                    width: Self.foldButtonSize,
+                    height: Self.foldButtonSize
                 )
                 targets.append(BlockActionHitTarget(
                     action: .toggleFold,

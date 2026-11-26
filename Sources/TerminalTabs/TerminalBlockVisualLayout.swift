@@ -6,6 +6,7 @@ struct TerminalBlockVisualLayout {
     let blockFrames: [CGRect]
     let hiddenRows: Set<Int>
     let collapsedVisibleRows: [Int: Int]
+    let fullyCollapsedRangeStarts: Set<Int>
 
     static func make(
         ranges: [Range<Int>],
@@ -17,7 +18,8 @@ struct TerminalBlockVisualLayout {
         collapsedVisibleRows: [Int: Int] = [:],
         contentPadding: CGFloat = 20,
         blockSpacing: CGFloat = 10,
-        topInset: CGFloat = 0
+        topInset: CGFloat = 0,
+        collapsedBlockHeight: CGFloat = 26
     ) -> TerminalBlockVisualLayout {
         guard rowCount > 0 else {
             return TerminalBlockVisualLayout(
@@ -25,15 +27,23 @@ struct TerminalBlockVisualLayout {
                 rowOffsets: [],
                 blockFrames: [],
                 hiddenRows: [],
-                collapsedVisibleRows: [:]
+                collapsedVisibleRows: [:],
+                fullyCollapsedRangeStarts: []
             )
         }
 
+        // All collapsed blocks are fully collapsed — hide everything, show only the fold button.
+        let fullyCollapsedRangeStarts = Set(ranges.compactMap { range -> Int? in
+            guard collapsedRangeStarts.contains(range.lowerBound), range.count > 1 else { return nil }
+            return range.lowerBound
+        })
+
+        // For non-fully-collapsed blocks, keep the existing 1-visible-row behaviour.
         let resolvedCollapsedVisibleRows = Dictionary(uniqueKeysWithValues: ranges.compactMap {
             range -> (Int, Int)? in
-            guard collapsedRangeStarts.contains(range.lowerBound), range.count > 1 else {
-                return nil
-            }
+            guard collapsedRangeStarts.contains(range.lowerBound),
+                  range.count > 1,
+                  !fullyCollapsedRangeStarts.contains(range.lowerBound) else { return nil }
             let preferredRow = collapsedVisibleRows[range.lowerBound]
                 .flatMap { range.contains($0) ? $0 : nil }
                 ?? range.lowerBound
@@ -54,37 +64,53 @@ struct TerminalBlockVisualLayout {
                         accumulatedOffset -= CGFloat(gap.count) * cellHeight
                     }
                 }
-                accumulatedOffset += contentPadding
+                let isFullyCollapsed = fullyCollapsedRangeStarts.contains(ranges[rangeIndex].lowerBound)
+                if !isFullyCollapsed {
+                    accumulatedOffset += contentPadding
+                }
             }
+
             let range = rangeIndex < ranges.count ? ranges[rangeIndex] : nil
-            let collapsedVisibleRow = range.flatMap {
-                resolvedCollapsedVisibleRows[$0.lowerBound]
-            }
+            let isFullyCollapsed = range.map { fullyCollapsedRangeStarts.contains($0.lowerBound) } ?? false
+            let collapsedVisibleRow = range.flatMap { resolvedCollapsedVisibleRows[$0.lowerBound] }
             let isCollapsed = collapsedVisibleRow != nil
-            if let range, let collapsedVisibleRow, range.contains(row) {
-                if row != collapsedVisibleRow { hiddenRows.insert(row) }
+
+            if isFullyCollapsed, let range, range.contains(row) {
+                hiddenRows.insert(row)
                 rowOffsets[row] = accumulatedOffset
-                    - CGFloat(row - range.lowerBound) * cellHeight
+            } else if let range, let collapsedVisibleRow, range.contains(row) {
+                if row != collapsedVisibleRow { hiddenRows.insert(row) }
+                rowOffsets[row] = accumulatedOffset - CGFloat(row - range.lowerBound) * cellHeight
             } else {
                 rowOffsets[row] = accumulatedOffset
             }
+
             if rangeIndex < ranges.count, row + 1 == ranges[rangeIndex].upperBound {
-                if isCollapsed {
+                if isFullyCollapsed {
+                    // Subtract all rows' natural heights, then add the fixed collapsed visual space.
+                    accumulatedOffset -= CGFloat(ranges[rangeIndex].count) * cellHeight
+                    accumulatedOffset += collapsedBlockHeight + blockSpacing
+                } else if isCollapsed {
                     accumulatedOffset -= CGFloat(ranges[rangeIndex].count - 1) * cellHeight
+                    accumulatedOffset += contentPadding + blockSpacing
+                } else {
+                    accumulatedOffset += contentPadding + blockSpacing
                 }
-                accumulatedOffset += contentPadding + blockSpacing
                 rangeIndex += 1
             }
         }
 
-        var blockFrames = ranges.map { range in
+        var blockFrames = ranges.map { range -> CGRect in
+            if fullyCollapsedRangeStarts.contains(range.lowerBound) {
+                let startVisualY = rowOffsets.indices.contains(range.lowerBound)
+                    ? CGFloat(range.lowerBound) * cellHeight + rowOffsets[range.lowerBound]
+                    : 0
+                return CGRect(x: 0, y: startVisualY, width: 0, height: collapsedBlockHeight)
+            }
             let visibleRow = resolvedCollapsedVisibleRows[range.lowerBound] ?? range.lowerBound
-            let firstOffset = rowOffsets.indices.contains(visibleRow)
-                ? rowOffsets[visibleRow]
-                : 0
+            let firstOffset = rowOffsets.indices.contains(visibleRow) ? rowOffsets[visibleRow] : 0
             let visibleRowCount = resolvedCollapsedVisibleRows[range.lowerBound] != nil
-                ? 1
-                : range.count
+                ? 1 : range.count
             return CGRect(
                 x: 0,
                 y: CGFloat(visibleRow) * cellHeight + firstOffset - contentPadding,
@@ -109,7 +135,8 @@ struct TerminalBlockVisualLayout {
             rowOffsets: rowOffsets,
             blockFrames: blockFrames,
             hiddenRows: hiddenRows,
-            collapsedVisibleRows: resolvedCollapsedVisibleRows
+            collapsedVisibleRows: resolvedCollapsedVisibleRows,
+            fullyCollapsedRangeStarts: fullyCollapsedRangeStarts
         )
     }
 
