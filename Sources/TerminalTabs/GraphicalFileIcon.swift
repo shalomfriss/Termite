@@ -14,8 +14,10 @@ enum GraphicalFileIcon {
 
     @MainActor
     private static func directoryPixels() -> Data {
-        // Load PNG directly via CGDataProvider to avoid NSImage's coordinate-system flip,
-        // which would cause renderCGImage's own flip to double-invert the image.
+        // Load PNG via CGDataProvider so row-0 is the top of the image (standard PNG format).
+        // renderCGImage applies a CG coordinate-system flip that is designed for NSImage-sourced
+        // CGImages (where row-0 is at the bottom due to NSImage's flipped coordinate space).
+        // A raw PNG CGImage must NOT be flipped a second time, so we pass flip: false.
         guard let url = Bundle.module.url(forResource: "FolderIcon", withExtension: "png"),
               let provider = CGDataProvider(url: url as CFURL),
               let source = CGImage(
@@ -26,7 +28,7 @@ enum GraphicalFileIcon {
               ) else {
             return symbolPixels(for: .directory)
         }
-        return renderCGImage(source)
+        return renderCGImage(source, inset: 0, flip: false)
     }
 
     @MainActor
@@ -48,10 +50,14 @@ enum GraphicalFileIcon {
         ) else {
             return Data(repeating: 0, count: pixelSize * pixelSize * 4)
         }
-        return renderCGImage(source, inset: 3)
+        return renderCGImage(source, inset: 3, flip: true)
     }
 
-    private static func renderCGImage(_ source: CGImage, inset: CGFloat = 0) -> Data {
+    // flip: true  — NSImage-sourced CGImages have row-0 at the bottom (NSImage's flipped
+    //               coordinate space), so the transform is needed to put row-0 at the top
+    //               for the Kitty protocol.
+    // flip: false — CGImages loaded directly from PNG have row-0 at the top already.
+    private static func renderCGImage(_ source: CGImage, inset: CGFloat = 0, flip: Bool = true) -> Data {
         var pixels = [UInt8](repeating: 0, count: pixelSize * pixelSize * 4)
         let bitmapInfo = CGBitmapInfo.byteOrder32Big.union(
             CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
@@ -68,8 +74,10 @@ enum GraphicalFileIcon {
                     bitmapInfo: bitmapInfo.rawValue
                   ) else { return }
             context.interpolationQuality = .high
-            context.translateBy(x: 0, y: CGFloat(pixelSize))
-            context.scaleBy(x: 1, y: -1)
+            if flip {
+                context.translateBy(x: 0, y: CGFloat(pixelSize))
+                context.scaleBy(x: 1, y: -1)
+            }
             if inset > 0 {
                 context.setShadow(
                     offset: CGSize(width: 0, height: 1.5),
