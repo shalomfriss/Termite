@@ -14,11 +14,15 @@ enum GraphicalFileIcon {
 
     @MainActor
     private static func directoryPixels() -> Data {
+        // Load PNG directly via CGDataProvider to avoid NSImage's coordinate-system flip,
+        // which would cause renderCGImage's own flip to double-invert the image.
         guard let url = Bundle.module.url(forResource: "FolderIcon", withExtension: "png"),
-              let nsImage = NSImage(contentsOf: url),
-              let source = nsImage.cgImage(
-                forProposedRect: nil, context: nil,
-                hints: [.interpolation: NSImageInterpolation.high]
+              let provider = CGDataProvider(url: url as CFURL),
+              let source = CGImage(
+                pngDataProviderSource: provider,
+                decode: nil,
+                shouldInterpolate: true,
+                intent: .defaultIntent
               ) else {
             return symbolPixels(for: .directory)
         }
