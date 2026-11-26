@@ -6,45 +6,27 @@ struct TerminalBookmarksMenu: View {
     var body: some View {
         Menu {
             if session.terminalBlockBookmarks.isEmpty {
-                Button("No bookmarked blocks") {}
+                Button("No saved commands") {}
                     .disabled(true)
             } else {
-                Section("Bookmarked Blocks") {
+                Section("Saved Commands") {
                     ForEach(session.terminalBlockBookmarks) { bookmark in
-                        Button(
-                            bookmark.title,
-                            systemImage: "arrowshape.turn.up.left.fill"
-                        ) {
-                            session.revealTerminalBlock(bookmark)
+                        Button(bookmark.title, systemImage: "arrow.forward.circle") {
+                            session.rerunBlockCommand(bookmark.command)
                         }
-                        .help("Open in \(bookmark.workingDirectory)")
+                        .help("Run: \(bookmark.command)")
                     }
                 }
             }
         } label: {
-            HStack(spacing: 5) {
-                Image(systemName: session.terminalBlockBookmarks.isEmpty
-                      ? "bookmark"
-                      : "bookmark.fill")
-                Text(session.terminalBlockBookmarks.count, format: .number)
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 7, weight: .bold))
-                    .foregroundStyle(TerminalTheme.cyanMuted)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(TerminalTheme.cyan.opacity(0.08), in: .capsule)
-            .overlay {
-                Capsule().stroke(TerminalTheme.cyan.opacity(0.15), lineWidth: 1)
-            }
-            .contentShape(.capsule)
+            Image(systemName: session.terminalBlockBookmarks.isEmpty ? "bookmark" : "bookmark.fill")
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
+        .buttonStyle(.toolbarIcon)
         .fixedSize()
-        .help("Open bookmarked terminal blocks")
-        .accessibilityLabel("Terminal block bookmarks")
-        .accessibilityValue("\(session.terminalBlockBookmarks.count) bookmarks")
-        .accessibilityHint("Opens a menu of bookmarked terminal blocks")
+        .help("Saved commands")
+        .accessibilityLabel("Saved commands")
+        .accessibilityValue("\(session.terminalBlockBookmarks.count) saved")
     }
 }

@@ -1758,18 +1758,27 @@ final class TerminalNSView: NSView,
                 historyRow: frame.scroll_offset + UInt64(range.lowerBound)
             )
             let block = blockContents(for: range, frame: frame, cells: cells)
+            if range.count > 1 {
+                let foldSize: CGFloat = 16
+                let foldRect = CGRect(
+                    x: Self.blockOuterMargin + 5,
+                    y: blockFrame.minY + 5,
+                    width: foldSize,
+                    height: foldSize
+                )
+                targets.append(BlockActionHitTarget(
+                    action: .toggleFold,
+                    blockID: blockID,
+                    block: nil,
+                    rect: foldRect,
+                    isEnabled: true
+                ))
+            }
             var descriptors: [(
                 action: BlockAction,
                 block: BlockContents?,
                 isEnabled: Bool
             )] = []
-            if range.count > 1 {
-                descriptors.append((
-                    action: .toggleFold,
-                    block: nil,
-                    isEnabled: true
-                ))
-            }
             descriptors.append((
                 action: .toggleBookmark,
                 block: block,
@@ -1826,12 +1835,14 @@ final class TerminalNSView: NSView,
             let isAttached = target.action == .attach && !target.isEnabled
             let isBookmarked = target.action == .toggleBookmark
                 && session.isTerminalBlockBookmarked(target.blockID)
+
+            if target.action == .toggleFold {
+                drawFoldButton(target: target, isHovered: isHovered)
+                continue
+            }
+
             let buttonRect = target.rect.insetBy(dx: 2, dy: 2)
-            let background = NSBezierPath(
-                roundedRect: buttonRect,
-                xRadius: 5,
-                yRadius: 5
-            )
+            let background = NSBezierPath(roundedRect: buttonRect, xRadius: 5, yRadius: 5)
             if isHovered, target.isEnabled {
                 NSColor.white.withAlphaComponent(0.11).setFill()
             } else if isAttached || isBookmarked {
@@ -1846,25 +1857,17 @@ final class TerminalNSView: NSView,
 
             let symbolName: String
             switch target.action {
-            case .toggleFold:
-                symbolName = session.isTerminalBlockCollapsed(target.blockID)
-                    ? "chevron.right"
-                    : "chevron.down"
-            case .toggleBookmark:
-                symbolName = isBookmarked ? "bookmark.fill" : "bookmark"
-            case .rerun:
-                symbolName = "arrow.clockwise"
-            case .copy:
-                symbolName = "doc.on.doc"
-            case .attach:
-                symbolName = isAttached ? "checkmark.circle.fill" : "paperclip"
+            case .toggleFold: symbolName = "minus"
+            case .toggleBookmark: symbolName = isBookmarked ? "bookmark.fill" : "bookmark"
+            case .rerun: symbolName = "arrow.clockwise"
+            case .copy: symbolName = "doc.on.doc"
+            case .attach: symbolName = isAttached ? "checkmark.circle.fill" : "paperclip"
             }
             let tint = isAttached || isBookmarked
                 ? NSColor.white.withAlphaComponent(0.90)
                 : NSColor.white.withAlphaComponent(target.isEnabled ? 0.72 : 0.30)
             let imageState = isAttached || isBookmarked
-                ? "accent"
-                : (target.isEnabled ? "enabled" : "disabled")
+                ? "accent" : (target.isEnabled ? "enabled" : "disabled")
             let imageCacheKey = "\(symbolName)-\(imageState)"
             let configuredImage: NSImage
             if let cachedImage = blockActionImageCache[imageCacheKey] {
@@ -1879,21 +1882,37 @@ final class TerminalNSView: NSView,
                 configuredImage = image.withSymbolConfiguration(configuration) ?? image
                 blockActionImageCache[imageCacheKey] = configuredImage
             }
-            let iconRect = NSRect(
-                x: buttonRect.midX - 6,
-                y: buttonRect.midY - 6,
-                width: 12,
-                height: 12
-            )
+            let iconRect = NSRect(x: buttonRect.midX - 6, y: buttonRect.midY - 6, width: 12, height: 12)
             configuredImage.draw(
-                in: iconRect,
-                from: .zero,
-                operation: .sourceOver,
-                fraction: 1,
-                respectFlipped: true,
-                hints: [.interpolation: NSImageInterpolation.high]
+                in: iconRect, from: .zero, operation: .sourceOver,
+                fraction: 1, respectFlipped: true, hints: [.interpolation: NSImageInterpolation.high]
             )
         }
+    }
+
+    private func drawFoldButton(target: BlockActionHitTarget, isHovered: Bool) {
+        let isCollapsed = session.isTerminalBlockCollapsed(target.blockID)
+        let r = target.rect.insetBy(dx: 1, dy: 1)
+        let path = NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4)
+        NSColor.white.withAlphaComponent(isHovered ? 0.11 : 0.055).setFill()
+        path.fill()
+        NSColor.white.withAlphaComponent(isHovered ? 0.20 : 0.10).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+
+        let cx = r.midX, cy = r.midY
+        let arm: CGFloat = 4
+        let symbol = NSBezierPath()
+        symbol.lineWidth = 1.5
+        symbol.lineCapStyle = .round
+        symbol.move(to: NSPoint(x: cx - arm, y: cy))
+        symbol.line(to: NSPoint(x: cx + arm, y: cy))
+        if isCollapsed {
+            symbol.move(to: NSPoint(x: cx, y: cy - arm))
+            symbol.line(to: NSPoint(x: cx, y: cy + arm))
+        }
+        NSColor.white.withAlphaComponent(0.72).setStroke()
+        symbol.stroke()
     }
 
     private func refreshBlockActionToolTips() {
@@ -1930,11 +1949,13 @@ final class TerminalNSView: NSView,
         case .toggleFold:
             session.toggleTerminalBlockCollapsed(target.blockID)
         case .toggleBookmark:
+            guard let block = target.block, !block.command.isEmpty,
+                  !session.isTerminalBlockBookmarked(target.blockID) else { break }
             session.toggleTerminalBlockBookmarked(
                 target.blockID,
-                command: target.block?.command ?? "",
-                output: target.block?.output ?? "",
-                workingDirectory: target.block?.workingDirectory
+                command: block.command,
+                output: block.output,
+                workingDirectory: block.workingDirectory
             )
         case .rerun:
             guard let block = target.block else { return }
