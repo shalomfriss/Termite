@@ -12,28 +12,13 @@ struct TerminalSurface: View {
         VStack(spacing: 0) {
             GeometryReader { geometry in
                 ZStack(alignment: .trailing) {
-                    HStack(spacing: 0) {
-                        TerminalCanvas(
-                            session: session,
-                            openDirectoryInNewTab: openDirectoryInNewTab
-                        )
-                        .id(session.id)
-
-                        if store.graphicalMode,
-                           store.graphicalPreviewLayoutMode == .resizeContent,
-                           isGraphicalPreviewPresented,
-                           let item = session.graphicalPreviewItem {
-                            GraphicalPreviewContainer(
-                                width: $graphicalPreviewWidth,
-                                containerWidth: geometry.size.width,
-                                item: item,
-                                collapse: collapseGraphicalPreview
-                            )
-                        }
-                    }
+                    TerminalCanvas(
+                        session: session,
+                        openDirectoryInNewTab: openDirectoryInNewTab
+                    )
+                    .id(session.id)
 
                     if store.graphicalMode,
-                       store.graphicalPreviewLayoutMode == .overlay,
                        isGraphicalPreviewPresented,
                        let item = session.graphicalPreviewItem {
                         GraphicalPreviewContainer(
@@ -42,7 +27,9 @@ struct TerminalSurface: View {
                             item: item,
                             collapse: collapseGraphicalPreview
                         )
+                        .opacity(store.graphicalPreviewOpacity)
                         .shadow(color: .black.opacity(0.32), radius: 16, x: -6)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
                     }
 
                     if store.graphicalMode,
@@ -55,10 +42,7 @@ struct TerminalSurface: View {
                         }
                     }
                 }
-                .animation(
-                    .smooth(duration: 0.2),
-                    value: isGraphicalPreviewPresented
-                )
+                .animation(.smooth(duration: 0.2), value: isGraphicalPreviewPresented)
             }
 
             statusBar
@@ -69,10 +53,13 @@ struct TerminalSurface: View {
                 .stroke(TerminalTheme.border, lineWidth: 1)
         }
         .onChange(of: store.graphicalMode) { _, isEnabled in
-            if !isEnabled { isGraphicalPreviewPresented = false }
+            if !isEnabled {
+                isGraphicalPreviewPresented = false
+                session.sendUserInput(Data("clear && ls\n".utf8))
+            }
         }
         .onChange(of: isGraphicalPreviewPresented) { _, presented in
-            guard !presented, store.graphicalPreviewLayoutMode == .resizeContent else { return }
+            guard !presented else { return }
             Task {
                 try? await Task.sleep(for: .milliseconds(260))
                 session.showCurrentDirectoryGraphically()

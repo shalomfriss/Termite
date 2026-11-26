@@ -210,16 +210,21 @@ struct AppSettingsView: View {
 
                     GroupBox("File preview") {
                         VStack(alignment: .leading, spacing: 8) {
-                            LabeledContent("Panel behavior") {
-                                AirMenuPicker(
-                                    "File preview panel behavior",
-                                    selection: $store.graphicalPreviewLayoutMode,
-                                    options: GraphicalPreviewLayoutMode.allCases,
-                                    minimumWidth: 170,
-                                    optionTitle: { $0.title }
-                                )
+                            LabeledContent("Opacity") {
+                                HStack(spacing: 8) {
+                                    Slider(
+                                        value: $store.graphicalPreviewOpacity,
+                                        in: 0.4...1.0,
+                                        step: 0.05
+                                    )
+                                    .frame(width: 130)
+                                    Text("\(Int(store.graphicalPreviewOpacity * 100))%")
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 36, alignment: .trailing)
+                                }
                             }
-                            Text(store.graphicalPreviewLayoutMode.detail)
+                            Text("Opacity of the preview pane when shown over the file listing.")
                                 .font(.system(size: 10))
                                 .foregroundStyle(.secondary)
                         }
